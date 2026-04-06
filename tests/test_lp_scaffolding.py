@@ -1,0 +1,411 @@
+"""Sanity checks for the LP scaffolding.
+
+These are end-to-end smoke tests: build a problem from synthetic data,
+solve it, verify basic properties (status, SOC bounds, energy balance).
+The LP isn't executing in production yet — this proves the formulation
+is well-posed and the solver is callable.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from optimiser.config import BatteryConfig, ManagedLoadConfig
+from optimiser.lp.constants import HORIZON_HOURS, SLOT_MINUTES
+from optimiser.lp.loads import (
+    BinarySignalDrivenLoad,
+    ObservableLoad,
+    build_lp_loads,
+)
+from optimiser.lp.result import SolveStatus
+from optimiser.lp.solver import solve
+from optimiser.types import (
+    LoadCategory,
+    LoadProfile,
+    ManagedLoadStatus,
+    PriceInterval,
+    PVForecast,
+    SystemState,
+)
+
+UTC = UTC
+NOW = datetime(2026, 4, 2, 22, 0, 0, tzinfo=UTC)  # 09:00 Canberra Apr 3
+
+
+def _state(soc: float = 50.0) -> SystemState:
+    return SystemState(
+        timestamp=NOW,
+        soc_pct=soc,
+        battery_power_kw=0.0,
+        pv_power_kw=0.0,
+        grid_power_kw=1.0,
+        house_load_kw=1.0,
+        ems_mode=2,
+        outdoor_temp_c=20.0,
+        occupied=True,
+    )
+
+
+def _flat_prices(import_c: float = 20.0, export_c: float = 5.0) -> list[PriceInterval]:
+    """Build prices_planning covering the full LP horizon at 30-min cadence."""
+    n_intervals = HORIZON_HOURS * 2  # 30-min
+    return [
+        PriceInterval(
+            start=NOW + timedelta(minutes=30 * i),
+            end=NOW + timedelta(minutes=30 * (i + 1)),
+            import_per_kwh=import_c,
+            export_per_kwh=export_c,
+            spot_per_kwh=import_c * 0.3,
+            renewables_pct=40.0,
+            spike_status="none",
+            descriptor="neutral",
+        )
+        for i in range(n_intervals)
+    ]
+
+
+def _flat_profile(kw: float = 1.0) -> LoadProfile:
+    return LoadProfile(slots=[kw] * 48, maturity_level=0, context="lp-test")
+
+
+def _hw_cfg() -> ManagedLoadConfig:
+    return ManagedLoadConfig(
+        load_id="hot_water",
+        category=LoadCategory.SIGNAL_DRIVEN,
+        shelly_host="test",
+        has_relay=True,
+        daily_target_kwh=4.0,
+        draw_kw=1.0,
+        deadline_hour_local=22,
+    )
+
+
+def _hw_status(energy_today: float = 0.0) -> ManagedLoadStatus:
+    return ManagedLoadStatus(
+        load_id="hot_water",
+        category=LoadCategory.SIGNAL_DRIVEN,
+        power_kw=0.0,
+        energy_today_kwh=energy_today,
+        relay_on=False,
+        cycle_state=None,
+    )
+
+
+# ── Smoke: it solves ─────────────────────────────────────────────
+
+
+class TestLPSolves:
+    def test_minimal_problem_solves(self) -> None:
+        """No loads, flat prices — LP is trivially feasible.
+
+        With flat prices and SOC > floor, the LP correctly discharges the
+        battery (1c/kWh wear) over importing grid (20c/kWh), so the
+        meaningful assertion is just that house load is met somehow.
+        """
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        assert sol.slot_0 is not None
+        # House gets its 1 kW from somewhere — battery, grid, or PV
+        slot_0 = sol.slot_0
+        supplied = (
+            slot_0.pv_to_house_kw
+            + slot_0.grid_import_kw
+            + max(0.0, -slot_0.battery_kw)  # discharge contribution
+        )
+        assert supplied == pytest.approx(1.0, abs=0.05)
+
+    def test_solves_with_signal_driven_load(self) -> None:
+        """HW load present — LP must schedule enough relay-on time to
+        meet the 4 kWh daily target.
+        """
+        cfg = _hw_cfg()
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        # Sum of HW power × slot_hours across the trajectory should hit ~4 kWh
+        slot_hours = SLOT_MINUTES / 60.0
+        hw_total = sum(
+            d.load_kw.get("hot_water", 0.0) * slot_hours
+            for d in sol.forward_trajectory
+            if d.slot_start < NOW + timedelta(hours=13)  # before 22:00 deadline
+        )
+        assert hw_total >= 4.0 - 0.01, f"HW only delivered {hw_total:.2f} kWh"
+
+
+# ── Properties: SOC bounds ───────────────────────────────────────
+
+
+class TestSOCBounds:
+    def test_soc_stays_within_bounds(self) -> None:
+        cfg = BatteryConfig(soc_floor_pct=10.0, soc_ceiling_pct=95.0)
+        sol = solve(
+            state=_state(soc=50.0),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        for d in sol.forward_trajectory:
+            assert cfg.soc_floor_pct - 0.1 <= d.soc_pct_end <= cfg.soc_ceiling_pct + 0.1
+
+
+# ── Properties: economic behaviour ───────────────────────────────
+
+
+class TestEconomicBehaviour:
+    def test_charges_during_cheap_window(self) -> None:
+        """Sharp price valley (5c) inside an otherwise expensive day (30c).
+        LP should charge the battery during the cheap window.
+        """
+        # 24 intervals of 30c, then 4 intervals (2h) of 5c, then 24h of 30c
+        prices = _flat_prices(import_c=30.0)
+        for i in range(24, 28):
+            old = prices[i]
+            prices[i] = PriceInterval(
+                start=old.start,
+                end=old.end,
+                import_per_kwh=5.0,
+                export_per_kwh=5.0,
+                spot_per_kwh=1.5,
+                renewables_pct=80.0,
+                spike_status="none",
+                descriptor="low",
+            )
+        sol = solve(
+            state=_state(soc=30.0),  # plenty of headroom to charge
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        # Total grid charging over the cheap window (slots covering 12h–14h)
+        slot_hours = SLOT_MINUTES / 60.0
+        cheap_charge = sum(
+            d.battery_kw * slot_hours
+            for d in sol.forward_trajectory
+            if (NOW + timedelta(hours=12) <= d.slot_start < NOW + timedelta(hours=14))
+            and d.battery_kw > 0
+        )
+        # Should have charged at least a few kWh during the cheap window
+        assert cheap_charge > 5.0, f"only charged {cheap_charge:.1f} kWh in cheap window"
+
+    def test_negative_export_drives_pv_to_battery(self) -> None:
+        """Negative export price + PV available → LP should soak PV into
+        battery rather than export it.
+        """
+        prices = _flat_prices(import_c=20.0, export_c=-3.0)  # negative export
+        # Provide some PV
+        pv_forecast = [
+            PVForecast(
+                start=NOW,
+                end=NOW + timedelta(hours=4),
+                pv_estimate_kw=5.0,
+                pv_estimate10_kw=4.0,
+                pv_estimate90_kw=6.0,
+            ),
+        ]
+        sol = solve(
+            state=_state(soc=40.0),
+            prices_planning=prices,
+            pv_forecast=pv_forecast,
+            load_profile=_flat_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        # During the PV window: export should be tiny, pv_to_battery should be high
+        slot_hours = SLOT_MINUTES / 60.0
+        pv_to_bat = sum(
+            d.pv_to_battery_kw * slot_hours
+            for d in sol.forward_trajectory
+            if NOW <= d.slot_start < NOW + timedelta(hours=4)
+        )
+        pv_to_export = sum(
+            d.pv_to_export_kw * slot_hours
+            for d in sol.forward_trajectory
+            if NOW <= d.slot_start < NOW + timedelta(hours=4)
+        )
+        assert pv_to_bat > pv_to_export, (
+            f"with negative export, expected pv→battery ({pv_to_bat:.1f}) > "
+            f"pv→export ({pv_to_export:.1f})"
+        )
+
+
+# ── Factory ──────────────────────────────────────────────────────
+
+
+class TestLoadFactory:
+    def test_build_lp_loads_signal_driven(self) -> None:
+        loads = build_lp_loads([_hw_cfg()])
+        assert len(loads) == 1
+        assert isinstance(loads[0], BinarySignalDrivenLoad)
+        assert loads[0].load_id == "hot_water"
+
+    def test_build_lp_loads_observable(self) -> None:
+        cfg = ManagedLoadConfig(
+            load_id="mains",
+            category=LoadCategory.OBSERVABLE,
+            shelly_host="test",
+        )
+        loads = build_lp_loads([cfg])
+        assert len(loads) == 1
+        assert isinstance(loads[0], ObservableLoad)
+
+    def test_unknown_category_skipped(self) -> None:
+        cfg = ManagedLoadConfig(
+            load_id="oven",
+            category=LoadCategory.PRECONDITIONABLE,
+            shelly_host="test",
+        )
+        loads = build_lp_loads([cfg])
+        assert loads == []
+
+
+# ── Horizon truncation + terminal SOC ────────────────────────────
+
+
+class TestHorizonTruncationAndTerminalSOC:
+    """S1 fixes: LP horizon follows priced coverage, terminal SOC backstop."""
+
+    def test_horizon_truncates_to_priced_coverage(self) -> None:
+        """LP is given 12h of prices; horizon must shrink from 48h → 12h
+        rather than extrapolating the last price."""
+        from optimiser.lp.formulation import build_lp
+
+        short_prices = _flat_prices()[:24]  # 12h of 30-min intervals
+        prob, lpvars = build_lp(
+            state=_state(soc=50.0),
+            prices_planning=short_prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+        )
+        # 12h / 5min = 144 slots
+        assert len(lpvars.slots) == 144
+        # Last slot must fall strictly before the last price interval's end
+        assert lpvars.slots[-1] < short_prices[-1].end
+
+    def test_terminal_soc_floor_respected_when_discharge_is_cheap(self) -> None:
+        """Cheap evening peak across the whole horizon + high SOC start —
+        LP wants to discharge aggressively, but must hold terminal floor."""
+        from optimiser.lp.constants import TERMINAL_SOC_FLOOR_PCT
+
+        sol = solve(
+            state=_state(soc=80.0),
+            prices_planning=_flat_prices(
+                import_c=100.0, export_c=80.0
+            ),  # always lucrative to export
+            pv_forecast=None,
+            load_profile=_flat_profile(kw=0.0),  # no house load to buffer against
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(soc_floor_pct=10.0),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        terminal_soc = sol.forward_trajectory[-1].soc_pct_end
+        # Allow a small solver tolerance below the floor
+        assert terminal_soc >= TERMINAL_SOC_FLOOR_PCT - 0.1, (
+            f"terminal SOC {terminal_soc:.2f} below floor {TERMINAL_SOC_FLOOR_PCT}"
+        )
+
+    def test_build_lp_rejects_empty_prices(self) -> None:
+        """Empty prices must raise — the caller handles 'no prices' by
+        routing to SELF_CONSUME, never by calling build_lp."""
+        from optimiser.lp.formulation import build_lp
+
+        with pytest.raises(ValueError, match="non-empty prices_planning"):
+            build_lp(
+                state=_state(),
+                prices_planning=[],
+                pv_forecast=None,
+                load_profile=_flat_profile(),
+                managed_loads=[],
+                lp_loads=[],
+                battery_config=BatteryConfig(),
+            )
+
+    def test_price_at_raises_out_of_range(self) -> None:
+        """Direct probe of the helper: slots past the forecast must raise,
+        not silently return prices[-1]."""
+        from optimiser.lp.formulation import _price_at
+
+        prices = _flat_prices()[:4]  # 2h coverage
+        # 3h past NOW is past coverage
+        with pytest.raises(ValueError, match="No price interval covers"):
+            _price_at(prices, NOW + timedelta(hours=3))
+
+    def test_house_load_at_raises_on_misshaped_profile(self) -> None:
+        """B1: the 48-slot contract is enforced. A bad profile raises
+        rather than silently returning a magic default."""
+        from optimiser.lp.formulation import _house_load_at
+
+        # NOW → slot index 36 (18:00 local). Use a 10-slot profile so
+        # slot 36 is out of range.
+        bad = LoadProfile(slots=[1.0] * 10, maturity_level=0, context="bad")
+        with pytest.raises(ValueError, match="expected 48"):
+            _house_load_at(bad, NOW)
+
+    def test_lp_uses_forecast_predicted_over_perkwh(self) -> None:
+        """When Amber supplies advancedPrice.predicted, the LP should
+        prefer it over `perKwh` for the cost objective. Amber explicitly
+        recommends `predicted` for forecasting.
+
+        Scenario: slot 0 has perKwh=100c but predicted=5c — predicted is
+        dramatically cheaper. The LP should charge aggressively at slot 0
+        despite the high perKwh, because the cost term is driven by
+        predicted."""
+        prices = _flat_prices(import_c=30.0)
+        # Override slot 0: perKwh stays 30, but predicted is 2 (very cheap)
+        prices[0] = PriceInterval(
+            start=prices[0].start, end=prices[0].end,
+            import_per_kwh=30.0, export_per_kwh=5.0,
+            spot_per_kwh=9.0, renewables_pct=40.0,
+            spike_status="none", descriptor="neutral",
+            forecast_predicted=2.0,
+        )
+        sol = solve(
+            state=_state(soc=30.0),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[], lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        # Should charge heavily at slot 0 because it's "really" 2c
+        assert sol.slot_0.battery_kw > 2.0, (
+            f"expected strong charge at slot 0 (predicted=2c), got {sol.slot_0.battery_kw:.2f}"
+        )

@@ -1,0 +1,19 @@
+services:
+  optimiser:
+    build: .
+    container_name: energy-optimiser
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/etc/energy-optimiser/config.toml:ro
+      - optimiser-data:/var/lib/energy-optimiser
+    # Network: needs access to Sigenergy (Modbus), Shelly (HTTP),
+    # UniFi (HTTPS), and external APIs (Amber, Solcast, BOM)
+    network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  optimiser-data:

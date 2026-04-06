@@ -1,0 +1,112 @@
+# Energy Optimiser Configuration
+# Copy to /etc/energy-optimiser/config.toml and fill in secrets.
+
+[amber]
+api_key = "AMBER_API_KEY"
+site_id = "AMBER_SITE_ID"                # From GET /sites
+poll_5min_interval_s = 60                 # 5-min price refresh (drives tick)
+poll_30min_interval_s = 300               # 30-min planning forecast refresh
+forecast_intervals_30min = 72             # Amber returns up to ~72 (36h coverage)
+forecast_intervals_5min = 12              # ~1h of 5-min lookahead
+previous_intervals_5min = 2
+
+[solcast]
+enabled = true
+api_key = "SOLCAST_API_KEY"
+resource_id = "b250-711b-7b8e-5c23"
+base_url = "https://api.solcast.com.au"
+poll_interval_s = 8640                 # 10 calls/day ≈ every 2.4h
+forecast_hours = 48
+
+[sigenergy]
+host = "192.168.1.100"                 # Inverter IP
+port = 502
+slave_id = 1
+
+[battery]
+capacity_kwh = 40.0
+soc_floor_pct = 10.0
+soc_ceiling_pct = 95.0
+max_ac_charge_kw = 10.0                # Grid import limit (AC-coupled inverter)
+max_dc_charge_kw = 13.0                # Solar charge limit (DC-coupled, matches PV array)
+max_discharge_kw = 10.0                # Verify against inverter spec
+round_trip_efficiency = 0.90
+export_limit_kw = 5.0
+pv_array_kw = 13.0                     # Nameplate PV array capacity
+
+# ── Managed Loads ────────────────────────────────────────────────
+# Each [[managed_load]] is a Shelly-monitored circuit.
+# Shelly Pro EM has 2 CT channels — use shelly_channel to specify.
+
+[[managed_load]]
+load_id = "hot_water"
+category = "signal_driven"               # Haier HP330M1-U1 in PV mode (LP=03, LA=ON, Lb=75, LC=03)
+shelly_host = "192.168.1.101"
+shelly_channel = 0
+has_relay = true                          # Dry contact wired to HP PV-mode input
+daily_target_kwh = 4.0                    # ~one full tank reheat from 35°C → 75°C
+draw_kw = 0.9                             # Inverter compressor average — measure & tune from CT data
+deadline_hour_local = 22                  # Local hour by which daily target should be met.
+                                          # If the deadline passes unmet, the shortfall rolls forward
+                                          # into tomorrow's target, capped at 2× daily_target_kwh.
+hysteresis_buffer = 2                     # Extra slots in K beyond strict need
+hysteresis_extra = 4                      # Extra slots above K to keep an asserted relay closed
+pv_surplus_threshold_kw = 0.5             # Headroom above draw_kw before scoring as PV-fed
+power_zero_threshold_kw = 0.3             # HP standby ~0.1–0.2 kW; below 0.3 kW = compressor off
+element_warning_threshold_kw = 2.5        # Above this → resistive element on (LC misconfigured)
+
+[[managed_load]]
+load_id = "mains"
+category = "observable"
+shelly_host = "192.168.1.101"          # Same Shelly, channel 2
+shelly_channel = 1
+has_relay = false
+
+# Uncomment when additional Shelly devices are installed:
+#
+# [[managed_load]]
+# load_id = "aircon"
+# category = "preconditionable"
+# shelly_host = "192.168.1.102"
+# shelly_channel = 0
+# has_relay = true
+# precondition_strategy = "pre_cool"
+#
+# [[managed_load]]
+# load_id = "oven"
+# category = "observable"
+# shelly_host = "192.168.1.103"
+# shelly_channel = 0
+# has_relay = false
+
+[weather]
+bom_url = "http://www.bom.gov.au/fwo/IDN60801/IDN60801.94926.json"
+poll_interval_s = 1800
+
+[occupancy]
+unifi_host = "192.168.1.1"
+unifi_port = 443
+unifi_username = "UNIFI_USER"
+unifi_password = "UNIFI_PASSWORD"
+unifi_site = "default"
+poll_interval_s = 300
+tracked_macs = [
+    "aa:bb:cc:dd:ee:01",
+    "aa:bb:cc:dd:ee:02",
+]
+away_threshold_min = 30
+
+[storage]
+db_path = "/var/lib/energy-optimiser/telemetry.duckdb"
+snapshot_dir = "/var/lib/energy-optimiser/snapshots"
+
+[planner]
+tick_interval_s = 60                        # LP re-solves every 60s; Modbus reads + apply
+telemetry_write_interval_s = 300            # Telemetry row flushed on 5-min boundary
+lp_wall_clock_timeout_s = 12.0              # Outer timeout on the LP solve thread
+# Stochastic PV scenario weights — must sum to 1.0. Heaviest-weighted is
+# used as the "base" from which the dispatch decomposition is read, so
+# its PV assumption drives the grid-first vs PV-first charge choice.
+lp_scenario_weight_p10 = 0.20
+lp_scenario_weight_p50 = 0.60
+lp_scenario_weight_p90 = 0.20

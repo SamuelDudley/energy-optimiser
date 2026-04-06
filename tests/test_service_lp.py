@@ -1,0 +1,337 @@
+"""Tests for `Service._run_lp` — the LP execution wrapper.
+
+Coverage strategy: bypass the heavyweight `Service.__init__` (which wires up
+real Modbus/HTTP clients) by constructing the instance via `__new__` and
+hand-injecting only the attributes the LP path touches: `_sigenergy`,
+`_loads`, `_lp_runtime`, `_lp_loads`, `_config`. The solver is patched at
+the import site inside `service` so we can drive every branch (OPTIMAL,
+INFEASIBLE, TIMEOUT, ERROR, slot_0=None, exception during solve, wall-clock
+timeout via `asyncio.wait_for`).
+
+This isn't end-to-end — it doesn't exercise the breaker decision tree in
+`_tick`, only the LP execution wrapper. End-to-end `_tick` tests are
+deferred per the agreed scope; the breaker logic itself is covered by
+`test_lp_integration.py`.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from optimiser.config import BatteryConfig
+from optimiser.lp.dispatch import DispatchKind
+from optimiser.lp.result import LPSolution, SlotDecision, SolveStatus
+from optimiser.lp.runtime import FallbackReason, LPRuntime
+from optimiser.service import Service
+from optimiser.types import EventType
+
+UTC = UTC
+NOW = datetime(2026, 4, 15, 12, 0, 0, tzinfo=UTC)
+
+
+# ── Test scaffolding ─────────────────────────────────────────────
+
+
+def _make_slot(*, battery_kw: float = -2.0) -> SlotDecision:
+    return SlotDecision(
+        slot_start=NOW,
+        battery_kw=battery_kw,
+        grid_import_kw=0.0,
+        grid_export_kw=2.0,
+        pv_to_house_kw=0.0,
+        pv_to_battery_kw=0.0,
+        pv_to_export_kw=0.0,
+        soc_pct_end=60.0,
+    )
+
+
+def _make_solution(
+    *,
+    status: SolveStatus = SolveStatus.OPTIMAL,
+    slot_0: SlotDecision | None = None,
+    reason: str | None = None,
+) -> LPSolution:
+    if slot_0 is None and status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE):
+        slot_0 = _make_slot()
+    return LPSolution(
+        status=status,
+        slot_0=slot_0,
+        forward_trajectory=[],
+        load_commands=[],
+        grid_export_limit_kw=None,
+        expected_total_cost_cents=100.0,
+        solve_time_ms=42,
+        reason=reason,
+    )
+
+
+def _make_service() -> Service:
+    """Build a Service with only the attributes the LP path needs.
+
+    Uses `Service.__new__` to skip the real `__init__` (which would try to
+    connect to Modbus, fetch Amber, etc.). Each attribute is set explicitly
+    so a missing one fails loudly rather than reaching for a real client.
+    """
+    svc = Service.__new__(Service)
+
+    # LP wiring
+    svc._lp_runtime = LPRuntime()
+    svc._lp_loads = []  # No managed loads → simpler LP, no LoadCommand churn
+
+    # Config — `battery` and `planner` are read by `_run_lp`
+    svc._config = MagicMock()
+    svc._config.battery = BatteryConfig()
+    svc._config.planner.lp_wall_clock_timeout_s = 12.0
+    svc._config.planner.lp_scenario_weights = {
+        "p10": 0.20,
+        "p50": 0.60,
+        "p90": 0.20,
+    }
+
+    # Sigenergy mock — `_lp_fallback` calls `set_fallback`
+    svc._sigenergy = MagicMock()
+    svc._sigenergy.set_fallback = AsyncMock(return_value=True)
+
+    # Loads mock — `_lp_fallback` reads `controllers` (list of relay ctrls)
+    svc._loads = MagicMock()
+    svc._loads.controllers = []  # No managed loads → no relays to open
+
+    return svc
+
+
+def _solver_args() -> dict:
+    """Minimal kwargs for `_run_lp`. Solver is mocked so the actual
+    contents of state/prices/etc. don't drive any logic — they're just
+    forwarded to the patched `solve_stochastic`."""
+    return {
+        "state": MagicMock(),
+        "prices_planning": [MagicMock()],
+        "pv_forecast": None,
+        "load_profile": MagicMock(),
+        "managed_loads": [],
+    }
+
+
+# ── Happy path ───────────────────────────────────────────────────
+
+
+class TestRunLPSuccess:
+    @pytest.mark.asyncio
+    async def test_optimal_returns_solution_and_dispatch(self) -> None:
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.OPTIMAL)
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            result_sol, result_dispatch = await svc._run_lp(**_solver_args())
+
+        assert result_sol is solution
+        assert result_dispatch is not None
+        # battery_kw = -2.0 → DISCHARGE_ESS_FIRST
+        assert result_dispatch.kind == DispatchKind.DISCHARGE
+        assert result_dispatch.cap_kw == 2.0
+        # No fallback triggered
+        svc._sigenergy.set_fallback.assert_not_awaited()
+        assert not svc._lp_runtime.breaker.latched
+
+    @pytest.mark.asyncio
+    async def test_feasible_treated_same_as_optimal(self) -> None:
+        # FEASIBLE means the solver hit its time limit but found a usable
+        # solution — we still apply it. Only INFEASIBLE/TIMEOUT/ERROR fall back.
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.FEASIBLE)
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            result_sol, result_dispatch = await svc._run_lp(**_solver_args())
+
+        assert result_sol is solution
+        assert result_dispatch is not None
+        assert not svc._lp_runtime.breaker.latched
+
+    @pytest.mark.asyncio
+    async def test_emits_lp_solve_complete_with_metadata(self) -> None:
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.OPTIMAL, reason="all good")
+
+        with (
+            patch("optimiser.service.solve_stochastic", return_value=solution),
+            patch("optimiser.service.emit") as mock_emit,
+        ):
+            await svc._run_lp(**_solver_args())
+
+        # Find the LP_SOLVE_COMPLETE call
+        complete_calls = [
+            c for c in mock_emit.call_args_list if c.args[0] == EventType.LP_SOLVE_COMPLETE
+        ]
+        assert len(complete_calls) == 1
+        payload = complete_calls[0].args[1]
+        assert payload["status"] == "optimal"
+        assert payload["cost_cents"] == 100.0
+        assert payload["solve_ms"] == 42
+        assert payload["reason"] == "all good"
+
+
+# ── Failure paths ────────────────────────────────────────────────
+
+
+class TestRunLPFailures:
+    @pytest.mark.asyncio
+    async def test_solver_raises_triggers_lp_error_fallback(self) -> None:
+        svc = _make_service()
+
+        with patch(
+            "optimiser.service.solve_stochastic",
+            side_effect=RuntimeError("HiGHS exploded"),
+        ):
+            result_sol, result_dispatch = await svc._run_lp(**_solver_args())
+
+        assert result_sol is None
+        assert result_dispatch is None
+        svc._sigenergy.set_fallback.assert_awaited_once()
+        assert svc._lp_runtime.breaker.latched
+        assert svc._lp_runtime.breaker.last_fallback_reason == FallbackReason.LP_ERROR
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_timeout_triggers_lp_timeout_fallback(self) -> None:
+        """If solve_stochastic takes longer than the configured wall-clock
+        timeout, `asyncio.wait_for` raises and we fall back."""
+        svc = _make_service()
+        svc._config.planner.lp_wall_clock_timeout_s = 0.05  # 50ms
+
+        def slow_solve(**_kwargs):
+            import time
+
+            time.sleep(0.5)  # 10× the timeout — definitely fires
+            return _make_solution()
+
+        with patch("optimiser.service.solve_stochastic", side_effect=slow_solve):
+            result_sol, result_dispatch = await svc._run_lp(**_solver_args())
+
+        assert result_sol is None
+        assert result_dispatch is None
+        assert svc._lp_runtime.breaker.last_fallback_reason == FallbackReason.LP_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_infeasible_status_triggers_fallback(self) -> None:
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.INFEASIBLE, slot_0=None)
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            result_sol, result_dispatch = await svc._run_lp(**_solver_args())
+
+        assert result_sol is None
+        assert result_dispatch is None
+        assert svc._lp_runtime.breaker.last_fallback_reason == FallbackReason.LP_INFEASIBLE
+
+    @pytest.mark.asyncio
+    async def test_unbounded_maps_to_infeasible_fallback(self) -> None:
+        # UNBOUNDED is logically a misspecified problem — same fallback class
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.UNBOUNDED, slot_0=None)
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            await svc._run_lp(**_solver_args())
+
+        assert svc._lp_runtime.breaker.last_fallback_reason == FallbackReason.LP_INFEASIBLE
+
+    @pytest.mark.asyncio
+    async def test_solver_internal_timeout_status_triggers_timeout_fallback(self) -> None:
+        # SolveStatus.TIMEOUT is the solver returning "I gave up" cleanly,
+        # distinct from the wall-clock timeout that raises. Both map to the
+        # same FallbackReason but via different code paths.
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.TIMEOUT, slot_0=None)
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            await svc._run_lp(**_solver_args())
+
+        assert svc._lp_runtime.breaker.last_fallback_reason == FallbackReason.LP_TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_error_status_triggers_lp_error_fallback(self) -> None:
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.ERROR, slot_0=None)
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            await svc._run_lp(**_solver_args())
+
+        assert svc._lp_runtime.breaker.last_fallback_reason == FallbackReason.LP_ERROR
+
+    @pytest.mark.asyncio
+    async def test_optimal_with_no_slot_0_triggers_error_fallback(self) -> None:
+        """Defensive: status says OK but slot_0 is None. Treat as ERROR
+        rather than crashing — the inverter still gets put into a safe state."""
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.OPTIMAL, slot_0=None)
+        # _make_solution default-sets slot_0 for OPTIMAL; explicit None here
+        solution = LPSolution(
+            status=SolveStatus.OPTIMAL,
+            slot_0=None,
+            forward_trajectory=[],
+            load_commands=[],
+            grid_export_limit_kw=None,
+            expected_total_cost_cents=0.0,
+            solve_time_ms=10,
+            reason=None,
+        )
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            result_sol, result_dispatch = await svc._run_lp(**_solver_args())
+
+        assert result_sol is None
+        assert result_dispatch is None
+        assert svc._lp_runtime.breaker.last_fallback_reason == FallbackReason.LP_ERROR
+
+
+# ── Side effects on fallback ─────────────────────────────────────
+
+
+class TestRunLPFallbackSideEffects:
+    """All failure paths share `_lp_fallback`. These check the side
+    effects happen consistently regardless of which trigger fired."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_emits_breaker_latched_with_reason(self) -> None:
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.INFEASIBLE, slot_0=None)
+
+        with (
+            patch("optimiser.service.solve_stochastic", return_value=solution),
+            patch("optimiser.service.emit") as mock_emit,
+        ):
+            await svc._run_lp(**_solver_args())
+
+        latched_calls = [
+            c for c in mock_emit.call_args_list if c.args[0] == EventType.BREAKER_LATCHED
+        ]
+        assert len(latched_calls) == 1
+        assert latched_calls[0].args[1]["reason"] == "lp_infeasible"
+
+    @pytest.mark.asyncio
+    async def test_fallback_calls_set_fallback_on_inverter(self) -> None:
+        svc = _make_service()
+        solution = _make_solution(status=SolveStatus.ERROR, slot_0=None)
+
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            await svc._run_lp(**_solver_args())
+
+        svc._sigenergy.set_fallback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_clears_commanded_state(self) -> None:
+        """After fallback, runtime.commanded must be None so the watcher
+        idles instead of trying to verify a stale dispatch."""
+        svc = _make_service()
+        # Pretend a previous tick had recorded a command
+        from optimiser.lp.dispatch import dispatch_from_slot
+
+        await svc._lp_runtime.record_command(dispatch_from_slot(_make_slot()))
+        assert svc._lp_runtime.commanded is not None
+
+        solution = _make_solution(status=SolveStatus.INFEASIBLE, slot_0=None)
+        with patch("optimiser.service.solve_stochastic", return_value=solution):
+            await svc._run_lp(**_solver_args())
+
+        assert svc._lp_runtime.commanded is None

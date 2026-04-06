@@ -1,0 +1,276 @@
+"""Core value types for the energy optimiser."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import IntEnum, StrEnum, auto
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .lp.dispatch import LPDispatch
+    from .lp.result import LPSolution
+
+
+# ── Battery ──────────────────────────────────────────────────────
+
+
+class BatteryAction(StrEnum):
+    CHARGE_GRID = auto()
+    CHARGE_PV = auto()
+    DISCHARGE_PV = auto()
+    DISCHARGE_ESS = auto()
+    SELF_CONSUME = auto()
+    STANDBY = auto()
+
+
+class RemoteEMSControlMode(IntEnum):
+    PCS_REMOTE_CONTROL = 0
+    STANDBY = 1
+    MAXIMUM_SELF_CONSUMPTION = 2
+    COMMAND_CHARGING_GRID_FIRST = 3
+    COMMAND_CHARGING_PV_FIRST = 4
+    COMMAND_DISCHARGING_PV_FIRST = 5
+    COMMAND_DISCHARGING_ESS_FIRST = 6
+
+
+BATTERY_ACTION_TO_EMS_MODE: dict[BatteryAction, RemoteEMSControlMode] = {
+    BatteryAction.CHARGE_GRID: RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST,
+    BatteryAction.CHARGE_PV: RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST,
+    BatteryAction.DISCHARGE_PV: RemoteEMSControlMode.COMMAND_DISCHARGING_PV_FIRST,
+    BatteryAction.DISCHARGE_ESS: RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST,
+    BatteryAction.SELF_CONSUME: RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION,
+    BatteryAction.STANDBY: RemoteEMSControlMode.STANDBY,
+}
+
+
+# ── Managed Loads ────────────────────────────────────────────────
+
+
+class LoadCategory(StrEnum):
+    SHIFTABLE = auto()  # Run a complete cycle once (legacy HW model).
+    SIGNAL_DRIVEN = auto()  # Continuous assert/de-assert; appliance manages own cycles
+    # (HP in PV mode, future: EV charging).
+    PRECONDITIONABLE = auto()
+    OBSERVABLE = auto()
+    DEADLINE_BIDIR = auto()
+
+
+class LoadCycleState(StrEnum):
+    IDLE = auto()
+    RUNNING = auto()
+    COMPLETE_TODAY = auto()
+
+
+# ── Operational State Machine ────────────────────────────────────
+
+
+class ServiceState(StrEnum):
+    INITIALISE = auto()
+    ACTIVE = auto()
+    ACTIVE_NO_PRICE = auto()
+    DEGRADED = auto()
+    FALLBACK = auto()
+
+
+# ── Structured Events ────────────────────────────────────────────
+
+
+class EventType(StrEnum):
+    TICK_COMPLETE = auto()
+    TICK_OVERRUN = auto()
+    STATE_TRANSITION = auto()
+    MODBUS_WRITE = auto()
+    MODBUS_ERROR = auto()
+    PRICE_UPDATE = auto()
+    PRICE_STALE = auto()
+    HW_CYCLE_START = auto()
+    HW_CYCLE_COMPLETE = auto()
+    HW_CYCLE_FAULT = auto()
+    VALIDATION_WARNING = auto()
+    VALIDATION_REJECT = auto()
+    OCCUPANCY_CHANGE = auto()
+    PROFILE_REBUILD = auto()
+    PLANNER_FALLBACK = auto()
+    LOAD_CYCLE_START = auto()
+    LOAD_CYCLE_COMPLETE = auto()
+    LOAD_CYCLE_FAULT = auto()
+    FALLBACK_TRIGGERED = auto()  # LP failed or watcher detected deviation
+    LP_SOLVE_COMPLETE = auto()  # Each LP solve emits (status, cost, ms)
+    VERIFY_DEVIATION = auto()  # Single-poll deviation (not yet escalated)
+    BREAKER_LATCHED = auto()  # Circuit breaker entered latched state
+    BREAKER_PROBE = auto()  # Probe LP run after cooldown
+    BREAKER_CLEARED = auto()  # Returned to normal LP control
+
+
+# ── Value Objects ────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class PriceInterval:
+    start: datetime
+    end: datetime
+    import_per_kwh: float              # `perKwh` from Amber; AEMO-derived point estimate
+    export_per_kwh: float
+    spot_per_kwh: float
+    renewables_pct: float
+    spike_status: str
+    descriptor: str                    # Amber enum; see _FORECAST_DESCRIPTORS in amber.py
+    forecast_low: float | None = None
+    forecast_high: float | None = None
+    forecast_predicted: float | None = None  # Amber's own model ("Advanced Price Forecast")
+    is_locked: bool | None = None            # CurrentInterval.estimate inverted: False=estimate, True=locked, None=Actual/Forecast
+
+
+@dataclass(frozen=True, slots=True)
+class PriceForecastLogRow:
+    """One row per price interval, at each fetch. Logged to
+    `price_forecast_log` in DuckDB for later calibration analysis.
+    Not consumed by the LP — this is strictly an observability artefact.
+    """
+    fetched_at: datetime
+    resolution: int                          # 5 or 30 — which Amber endpoint cadence
+    interval_start: datetime
+    interval_end: datetime
+    interval_type: str | None                # ActualInterval / CurrentInterval / ForecastInterval
+    per_kwh: float                           # AEMO point on the general channel
+    export_per_kwh: float                    # feedIn channel perKwh
+    spot_per_kwh: float
+    forecast_predicted: float | None
+    forecast_low: float | None
+    forecast_high: float | None
+    spike_status: str
+    descriptor: str
+    is_locked: bool | None
+    renewables_pct: float
+
+
+@dataclass(frozen=True, slots=True)
+class PVForecast:
+    start: datetime
+    end: datetime
+    pv_estimate_kw: float
+    pv_estimate10_kw: float
+    pv_estimate90_kw: float
+
+
+@dataclass(frozen=True, slots=True)
+class SystemState:
+    timestamp: datetime
+    soc_pct: float
+    battery_power_kw: float
+    pv_power_kw: float
+    grid_power_kw: float | None  # None when grid sensor is offline
+    house_load_kw: float | None  # None when unavailable or derivation is suspect
+    ems_mode: int
+    outdoor_temp_c: float | None
+    occupied: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedLoadStatus:
+    load_id: str
+    category: LoadCategory
+    power_kw: float
+    energy_today_kwh: float
+    relay_on: bool | None = None
+    cycle_state: LoadCycleState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LoadCommand:
+    """A command for a managed load.
+
+    `start_cycle` is the legacy one-shot trigger for SHIFTABLE loads.
+    `desired_relay_on` is the continuous relay state for SIGNAL_DRIVEN loads
+    (None = no change, True = close, False = open).
+    """
+
+    load_id: str
+    start_cycle: bool
+    reason: str
+    desired_relay_on: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerOutput:
+    battery_action: BatteryAction
+    charge_limit_kw: float
+    discharge_limit_kw: float
+    target_soc: float
+    load_commands: list[LoadCommand]
+    grid_export_limit_kw: float | None  # None = don't change, float = set limit
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class LoadProfile:
+    slots: list[float]  # 48 values, 30-min intervals
+    maturity_level: int
+    context: str
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResult:
+    valid: bool
+    warnings: list[str]
+    rejected_fields: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    timestamp: datetime
+    event_type: EventType
+    data: dict[str, Any]
+    tick_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TickSnapshot:
+    tick_id: str
+    timestamp: datetime
+    version: str
+    system_state: SystemState
+    price_forecast: list[PriceInterval]
+    pv_forecast: list[PVForecast] | None
+    load_profile: LoadProfile
+    managed_loads: list[ManagedLoadStatus]
+    maturity_level: int
+    output: PlannerOutput  # Legacy shape — kept for back-compat
+    actual_cost_cents: float | None = None
+    counterfactual_cost_cents: float | None = None
+    lp_solution: LPSolution | None = None  # v0.2.0+: native LP output
+    lp_dispatch: LPDispatch | None = None  # v0.2.0+: mode + cap sent to inverter
+
+
+@dataclass(frozen=True, slots=True)
+class TelemetryRow:
+    ts: datetime
+    soc_pct: float | None
+    battery_kw: float | None
+    pv_kw: float | None
+    grid_kw: float | None
+    grid_kw_shelly: float | None
+    house_load_kw: float | None
+    import_price: float | None
+    export_price: float | None
+    spot_price: float | None
+    renewables_pct: float | None
+    spike_status: str | None
+    pv_forecast_kw: float | None
+    outdoor_temp_c: float | None
+    occupied: bool | None
+    ems_mode: int | None
+    planner_action: str | None
+    planner_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LoadTelemetryRow:
+    ts: datetime
+    load_id: str
+    category: str
+    power_kw: float | None
+    energy_today_kwh: float | None
+    cycle_state: str | None
+    relay_on: bool | None

@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "energy-optimiser"
+version = "0.2.1"
+description = "Amber wholesale energy optimiser for Sigenergy battery + solar"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "pymodbus>=3.6",
+    "duckdb>=1.1",
+    "tenacity>=9.0",
+    "pulp>=2.9",
+    "highspy>=1.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "freezegun>=1.5",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+# Prefer binary wheels; we don't want to build highspy/duckdb from source
+# in a slim container. The hardware target is x86_64 Linux, which all our
+# deps publish manylinux wheels for.
+package = true
+
+[project.scripts]
+energy-optimiser = "optimiser.__main__:main"
+eo-smoke = "optimiser.smoke:main"
+eo-replay = "optimiser.replay_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/optimiser"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# TCH (TC001/TC002/TC003) moves runtime imports into `if TYPE_CHECKING`
+# blocks. The gain — marginal — isn't worth the added maintenance burden
+# and the subtle circular-import risks it introduces. Keep runtime
+# imports straightforward.
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
