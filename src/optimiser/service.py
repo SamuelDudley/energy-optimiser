@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime
+from pathlib import Path
 
 from .clients.amber import AmberClient
 from .clients.bom import BOMClient
@@ -106,10 +108,14 @@ class Service:
                 forecasts, fetched_at = cached
                 self._solcast.seed_cache(forecasts, fetched_at)
                 self._pv_forecast = forecasts
+                age_min = (
+                    datetime.now(fetched_at.tzinfo) - fetched_at
+                ).total_seconds() / 60
                 logger.info(
-                    "Seeded Solcast cache from log (%d intervals, %.0f min old) — skipping initial fetch",
+                    "Seeded Solcast cache from log (%d intervals, %.0f min old)"
+                    " — skipping initial fetch",
                     len(forecasts),
-                    (datetime.now(fetched_at.tzinfo) - fetched_at).total_seconds() / 60,
+                    age_min,
                 )
             else:
                 await self._fetch_solcast()
@@ -451,6 +457,27 @@ class Service:
             },
             tick_id=tick_id,
         )
+
+        # 14. Heartbeat — update the mtime of the file the external watchdog
+        # polls. This is the liveness signal that tells the watchdog "the
+        # tick loop is still running". Touching happens here, at the end of
+        # a successful tick, so an LP failure or Modbus hang earlier in the
+        # pipeline leaves the heartbeat stale and eventually fires the
+        # watchdog. Best-effort: never crash the tick on heartbeat-write
+        # failure — the watchdog itself will fire if we go silent.
+        self._touch_heartbeat()
+
+    def _touch_heartbeat(self) -> None:
+        path = Path(
+            os.environ.get(
+                "EO_HEARTBEAT_PATH", "/var/lib/energy-optimiser/heartbeat"
+            )
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+        except Exception:
+            logger.exception("heartbeat touch failed (path=%s)", path)
 
     # ── LP Execution ─────────────────────────────────────────────
 

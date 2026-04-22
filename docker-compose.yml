@@ -15,5 +15,44 @@ services:
         max-size: "50m"
         max-file: "5"
 
+  # External dead-man: if the main service stops touching its heartbeat
+  # file, the watchdog writes REMOTE_EMS_ENABLE (40029) = 0 to the
+  # inverter so the plant reverts to its local EMS mode. Separate
+  # container so failure modes that take the main service down (OOM
+  # kill, Python deadlock, container-runtime crash) don't also take
+  # the watchdog down. See KNOWN-ISSUES #0d for the protocol audit
+  # that motivates this sidecar.
+  #
+  # Shares only the data volume (read-only heartbeat poll). Reuses the
+  # main image but uses the `eo-watchdog` entrypoint — that entrypoint
+  # imports pymodbus + stdlib only, no DuckDB/HiGHS/httpx.
+  watchdog:
+    build: .
+    container_name: energy-optimiser-watchdog
+    command: ["eo-watchdog"]
+    restart: unless-stopped
+    depends_on:
+      - optimiser
+    volumes:
+      - optimiser-data:/var/lib/energy-optimiser:ro
+    network_mode: host
+    environment:
+      EO_WATCHDOG_HEARTBEAT: /var/lib/energy-optimiser/heartbeat
+      # Source of truth for inverter connection is the main service's
+      # config.toml, but the watchdog deliberately has no TOML parser
+      # (keep its dep surface minimal). Duplicate the two fields that
+      # matter here — review if inverter IP or slave ID changes.
+      EO_WATCHDOG_SIGENERGY_HOST: "192.168.2.220"
+      EO_WATCHDOG_SIGENERGY_PORT: "502"
+      EO_WATCHDOG_SIGENERGY_SLAVE_ID: "247"
+      EO_WATCHDOG_STALE_SECONDS: "90"   # 1.5× tick_interval_s
+      EO_WATCHDOG_POLL_SECONDS: "15"
+      EO_WATCHDOG_GRACE_SECONDS: "180"  # startup can take 60-90s with all fetches
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   optimiser-data:
