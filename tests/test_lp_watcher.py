@@ -16,11 +16,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from optimiser.config import BatteryConfig
 from optimiser.lp.dispatch import (
     DispatchKind,
     LPDispatch,
-    dispatch_from_slot,
 )
+from optimiser.lp.dispatch import dispatch_from_slot as _dispatch_from_slot
 from optimiser.lp.result import SlotDecision
 from optimiser.lp.runtime import (
     CommandedState,
@@ -32,6 +33,13 @@ from optimiser.types import EventType, RemoteEMSControlMode
 
 UTC = UTC
 NOW = datetime(2026, 4, 15, 12, 0, 0, tzinfo=UTC)
+
+_BAT = BatteryConfig()
+
+
+def dispatch_from_slot(slot: SlotDecision) -> LPDispatch:
+    """Test helper: inject the default BatteryConfig."""
+    return _dispatch_from_slot(slot, _BAT)
 
 
 # ── Test scaffolding ─────────────────────────────────────────────
@@ -278,9 +286,10 @@ class TestWatcherDeviation:
 
     @pytest.mark.asyncio
     async def test_over_cap_outcome_triggers_fallback(self, monkeypatch) -> None:
-        # cap is 3.0 × 1.05 = 3.15 tolerance; -5.0 is way over
+        # cap is max_discharge_kw = 10.0 × 1.05 = 10.5 tolerance;
+        # -12 kW is a hardware-level overshoot past the physical limit.
         watcher, runtime, sigenergy = _make_watcher(
-            measured_seq=[-5.0, -5.0, -5.0],
+            measured_seq=[-12.0, -12.0, -12.0],
         )
         await _record(runtime, battery_kw=-3.0, write_age_s=60.0)
         _patch_now(monkeypatch)

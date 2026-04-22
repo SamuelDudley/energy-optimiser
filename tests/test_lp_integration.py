@@ -12,13 +12,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from optimiser.config import BatteryConfig
 from optimiser.lp.dispatch import (
     DEADBAND_KW,
     DeviationKind,
     DispatchKind,
-    dispatch_from_slot,
     verify_battery_response,
 )
+from optimiser.lp.dispatch import dispatch_from_slot as _dispatch_from_slot
 from optimiser.lp.fallback import trigger_fallback
 from optimiser.lp.result import SlotDecision
 from optimiser.lp.runtime import (
@@ -30,6 +31,16 @@ from optimiser.types import RemoteEMSControlMode
 
 UTC = UTC
 NOW = datetime(2026, 4, 15, 12, 0, 0, tzinfo=UTC)
+
+# Default battery config for dispatch tests — 10 kW discharge, 10 kW AC
+# charge, 13 kW DC charge, matching production values.
+_BAT = BatteryConfig()
+
+
+def dispatch_from_slot(slot: SlotDecision) -> object:
+    """Test helper: injects the default BatteryConfig so test bodies stay
+    focused on the (slot → dispatch) mapping."""
+    return _dispatch_from_slot(slot, _BAT)
 
 
 def _slot(
@@ -105,13 +116,24 @@ class TestDispatchFromSlot:
         d = dispatch_from_slot(_slot(battery_kw=-3.0, pv_to_house_kw=1.5))
         assert d.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST
         assert d.kind == DispatchKind.DISCHARGE
-        assert d.cap_kw == 3.0  # magnitude
+        assert d.cap_kw == _BAT.max_discharge_kw  # physical max, not LP's point estimate
         assert d.signed_intent_kw == -3.0
 
     def test_evening_discharge_no_pv(self) -> None:
         d = dispatch_from_slot(_slot(battery_kw=-5.0, pv_to_house_kw=0.0))
         assert d.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST
-        assert d.cap_kw == 5.0
+        assert d.cap_kw == _BAT.max_discharge_kw
+
+    def test_discharge_cap_covers_transient_loads(self) -> None:
+        # Core behaviour: the LP picks -2 kW (its expected load) but the
+        # dispatch cap is the physical max so sudden loads above forecast
+        # (kettle, AC, oven) get covered from battery instead of grid.
+        d = dispatch_from_slot(_slot(battery_kw=-2.0))
+        assert d.cap_kw == _BAT.max_discharge_kw
+        assert d.signed_intent_kw == -2.0
+        # Kettle spike → house load 5 kW → inverter load-follows at 5 kW.
+        # Well under physical cap → no deviation.
+        assert verify_battery_response(d, measured_kw=-5.0) == DeviationKind.OK
 
 
 # ── Verification ─────────────────────────────────────────────────
@@ -170,10 +192,13 @@ class TestVerifyBatteryResponse:
         assert verify_battery_response(d, measured_kw=2.0) == DeviationKind.WRONG_DIRECTION
 
     def test_discharge_over_cap_is_over_cap(self) -> None:
+        # Cap is max_discharge_kw (10 kW) regardless of LP intent; OVER_CAP
+        # now only fires on a hardware-level overshoot past the physical
+        # limit. 10 × 1.05 = 10.5 tolerance.
         d = dispatch_from_slot(_slot(battery_kw=-3.0))
-        # 3.0 × 1.05 = 3.15 cap; -3.5 exceeds, -3.1 doesn't
-        assert verify_battery_response(d, measured_kw=-3.1) == DeviationKind.OK
-        assert verify_battery_response(d, measured_kw=-4.0) == DeviationKind.OVER_CAP
+        assert verify_battery_response(d, measured_kw=-10.0) == DeviationKind.OK
+        assert verify_battery_response(d, measured_kw=-10.4) == DeviationKind.OK
+        assert verify_battery_response(d, measured_kw=-11.0) == DeviationKind.OVER_CAP
 
 
 # ── Runtime state ────────────────────────────────────────────────

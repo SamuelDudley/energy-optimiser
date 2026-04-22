@@ -426,7 +426,7 @@ async def smoke_dry_tick(config: Config) -> bool:
         return False
 
     # 7. Derive dispatch and report what WOULD be written
-    dispatch = dispatch_from_slot(solution.slot_0)
+    dispatch = dispatch_from_slot(solution.slot_0, config.battery)
     _info("")
     _info("Would write to inverter:")
     _info(f"  Register 40031 (mode)    = {dispatch.mode.value} ({dispatch.mode.name})")

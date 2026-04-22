@@ -129,9 +129,12 @@ class TestRunLPSuccess:
 
         assert result_sol is solution
         assert result_dispatch is not None
-        # battery_kw = -2.0 → DISCHARGE_ESS_FIRST
+        # battery_kw = -2.0 → DISCHARGE_ESS_FIRST. Cap is the physical
+        # max_discharge_kw so transient loads above the LP forecast stay
+        # on battery instead of leaking to grid.
         assert result_dispatch.kind == DispatchKind.DISCHARGE
-        assert result_dispatch.cap_kw == 2.0
+        assert result_dispatch.cap_kw == BatteryConfig().max_discharge_kw
+        assert result_dispatch.signed_intent_kw == -2.0
         # No fallback triggered
         svc._sigenergy.set_fallback.assert_not_awaited()
         assert not svc._lp_runtime.breaker.latched
@@ -327,7 +330,7 @@ class TestRunLPFallbackSideEffects:
         # Pretend a previous tick had recorded a command
         from optimiser.lp.dispatch import dispatch_from_slot
 
-        await svc._lp_runtime.record_command(dispatch_from_slot(_make_slot()))
+        await svc._lp_runtime.record_command(dispatch_from_slot(_make_slot(), BatteryConfig()))
         assert svc._lp_runtime.commanded is not None
 
         solution = _make_solution(status=SolveStatus.INFEASIBLE, slot_0=None)

@@ -392,7 +392,7 @@ def _solve_candidate(
             solution.solve_time_ms,
         )
 
-    dispatch = dispatch_from_slot(solution.slot_0)
+    dispatch = dispatch_from_slot(solution.slot_0, battery_config)
     output = lp_solution_to_planner_output(solution, dispatch)
     return (
         output.battery_action,

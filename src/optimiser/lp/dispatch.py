@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum, auto
 
+from ..config import BatteryConfig
 from ..types import RemoteEMSControlMode
 from .result import SlotDecision
 
@@ -54,14 +55,30 @@ class LPDispatch:
     kind: DispatchKind
 
 
-def dispatch_from_slot(slot_0: SlotDecision) -> LPDispatch:
+def dispatch_from_slot(slot_0: SlotDecision, battery_config: BatteryConfig) -> LPDispatch:
     """Turn the LP's slot-0 decision into an inverter-ready dispatch.
 
     Mapping:
       |battery_kw| < DEADBAND_KW    → SELF_CONSUME (mode 2), cap = 0
       battery_kw > 0, grid-dominant → CHARGE_GRID_FIRST (mode 3), cap = battery_kw
       battery_kw > 0, PV-dominant   → CHARGE_PV_FIRST   (mode 4), cap = battery_kw
-      battery_kw < 0                → DISCHARGE_ESS_FIRST (mode 6), cap = |battery_kw|
+      battery_kw < 0                → DISCHARGE_ESS_FIRST (mode 6), cap = max_discharge_kw
+
+    Charge cap uses the LP's intended rate: charging is directly controllable
+    and exceeding the plan wastes money (e.g. charging harder than the cheap
+    window supports, or over-charging from grid when PV was planned to take
+    over soon).
+
+    Discharge cap uses the *physical* max_discharge_kw, NOT the LP's point
+    estimate of house load. The LP plans around an expected load (at L0 that's
+    a 2 kW default, at higher maturities a time-of-day average); if actual
+    load spikes above that (kettle, AC, oven), a tight cap would force the
+    shortfall to grid import at full retail, which is strictly worse than
+    battery wear down to the SOC floor. The inverter's native load-following
+    in mode 6 does the right thing when the cap is the physical limit: it
+    discharges exactly what the house consumes, up to max_discharge_kw, and
+    no more. The LP's signed_intent_kw is preserved for the watcher and the
+    snapshot so we can still verify the inverter's general direction.
 
     "Grid-dominant" means the LP plans to source more of the charge from grid
     than from PV in this slot. We then ask the inverter to prefer that source
@@ -103,10 +120,12 @@ def dispatch_from_slot(slot_0: SlotDecision) -> LPDispatch:
             kind=DispatchKind.CHARGE,
         )
 
-    # Discharging. Always ESS-first per the discussion above.
+    # Discharging. Always ESS-first per the discussion above. Cap is the
+    # physical max so transient loads above the LP's forecast are covered
+    # from battery, not grid import.
     return LPDispatch(
         mode=RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST,
-        cap_kw=-battery_kw,
+        cap_kw=battery_config.max_discharge_kw,
         signed_intent_kw=battery_kw,
         kind=DispatchKind.DISCHARGE,
     )

@@ -511,7 +511,7 @@ class Service:
             await self._lp_fallback(FallbackReason.LP_ERROR)
             return None, None
 
-        dispatch = dispatch_from_slot(solution.slot_0)
+        dispatch = dispatch_from_slot(solution.slot_0, self._config.battery)
         return solution, dispatch
 
     async def _lp_fallback(self, reason: FallbackReason) -> None:
