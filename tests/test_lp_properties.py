@@ -305,6 +305,52 @@ class TestLPExportBehaviour:
         )
         assert sol.slot_0.grid_export_kw <= 5.01  # float tolerance
 
+    def test_positive_export_pins_register_to_dnsp_cap(self) -> None:
+        """When the LP plans any positive export, the register-40038 cap
+        written to the inverter is the DNSP max (battery_config.export_limit_kw),
+        not the LP's point-estimate. Leaving it at the point estimate meant
+        transient PV above the plan was silently throttled by the inverter's
+        MPPT — solar-curtailment-at-midday bug (2026-04-22)."""
+        sol, _ = _solve(
+            soc=80.0,
+            pv_kw=10.0,
+            pv=_pv_forecast(10.0),
+            load_kw=1.0,
+            prices=_prices(slot_0_import=5.0, rest_import=5.0, export=50.0),
+        )
+        # LP planned some positive export in slot 0
+        assert sol.slot_0.grid_export_kw > 0.1
+        # Register write equals the DNSP hard cap, not the plan
+        assert sol.grid_export_limit_kw == BatteryConfig().export_limit_kw
+
+    def test_zero_planned_export_writes_zero_cap(self) -> None:
+        """Symmetric check: when the LP wants zero export (negative price),
+        the register is pinned to 0 so the inverter doesn't export on
+        transient PV windfall we'd pay for."""
+        # Copy of test_negative_export_price_curtails' setup — short PV
+        # window, negative export price — but asserts the register side.
+        pv = []
+        for i in range(N_INTERVALS):
+            kw = 8.0 if i < 6 else 0.0
+            pv.append(
+                PVForecast(
+                    start=NOW + timedelta(minutes=30 * i),
+                    end=NOW + timedelta(minutes=30 * (i + 1)),
+                    pv_estimate_kw=kw,
+                    pv_estimate10_kw=kw * 0.7,
+                    pv_estimate90_kw=kw * 1.3,
+                )
+            )
+        sol, _ = _solve(
+            soc=20.0,
+            pv_kw=8.0,
+            pv=pv,
+            load_kw=1.0,
+            prices=_varying_prices([20.0] * 6 + [50.0] * 10 + [20.0] * 20, export=-5.0),
+        )
+        assert sol.slot_0.grid_export_kw < 0.1
+        assert sol.grid_export_limit_kw == 0.0
+
     def test_negative_export_price_curtails(self) -> None:
         """When export price is negative, the LP should not export. With a
         short PV window and an expensive evening, it should store PV in the

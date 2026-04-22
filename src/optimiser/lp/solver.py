@@ -64,6 +64,7 @@ def solve(
         vars=vars,
         managed_loads=managed_loads,
         lp_loads=lp_loads,
+        battery_config=battery_config,
         timeout_s=timeout_s,
         t0=t0,
     )
@@ -108,6 +109,7 @@ def solve_stochastic(
         vars=svars.base,
         managed_loads=managed_loads,
         lp_loads=lp_loads,
+        battery_config=battery_config,
         timeout_s=timeout_s,
         t0=t0,
         stochastic_meta={
@@ -148,6 +150,7 @@ def _run_and_extract(
     vars: LPVars,
     managed_loads: list[ManagedLoadStatus],
     lp_loads: list[LPLoad],
+    battery_config: BatteryConfig,
     timeout_s: float,
     t0: float,
     stochastic_meta: dict | None = None,
@@ -183,6 +186,7 @@ def _run_and_extract(
         vars=vars,
         managed_loads=managed_loads,
         lp_loads=lp_loads,
+        battery_config=battery_config,
         elapsed_ms=elapsed_ms,
         status=status,
         stochastic_meta=stochastic_meta,
@@ -222,6 +226,7 @@ def _extract_solution(
     vars: LPVars,
     managed_loads: list[ManagedLoadStatus],
     lp_loads: list[LPLoad],
+    battery_config: BatteryConfig,
     elapsed_ms: float,
     status: SolveStatus,
     stochastic_meta: dict | None = None,
@@ -262,9 +267,27 @@ def _extract_solution(
             continue
         load_commands.append(load.extract_command(lv, status_obj, vars.slots[0]))
 
-    export_limit: float | None = None
+    # Grid export cap semantics — what we write to register 40038.
+    #
+    # The LP's `grid_export[0]` is a *plan* bounded at 0..export_limit_kw
+    # (the DNSP cap, e.g. 5 kW). The register is a *ceiling* enforced by
+    # the inverter's MPPT: it caps real PV flow at house_load + battery_in
+    # + export, so a stale low value silently curtails solar whenever the
+    # battery fills up. (With battery full + house 0.5 kW + reg 40038 at
+    # 1 kW, the inverter throttles to 1.5 kW regardless of PV capability.)
+    #
+    # Two cases:
+    #   - LP wants zero export (negative export price, or nowhere to send
+    #     surplus): write 0 and accept the curtailment as the cost of
+    #     avoiding the penalty.
+    #   - LP wants any positive export: pin to the DNSP cap
+    #     (battery_config.export_limit_kw). The LP never plans past this
+    #     bound, so it's strictly safe, and it captures any unplanned
+    #     solar windfall when actual PV beats the p90 forecast.
     if slot_0.grid_export_kw < NUMERIC_EPS:
-        export_limit = 0.0
+        export_limit: float | None = 0.0
+    else:
+        export_limit = battery_config.export_limit_kw
 
     cost = pulp.value(prob.objective) or 0.0
 

@@ -53,7 +53,7 @@ sidecar enforces a safe state if the main service stops ticking.
 │ Amber API│ │Solcast │ │BOM   │ │UniFi │ │Shelly  │
 └────┬─────┘ └────┬───┘ └──┬───┘ └──┬───┘ └────┬───┘
      ▼            ▼        ▼        ▼          │
-┌─────────────────────────────────────────┐   │
+┌──────────────────────────────────────────┐   │
 │  energy-optimiser  (main service)        │   │
 │   stochastic MILP → LPDispatch           │   │
 │   state machine, profiler, replay        │   │
@@ -146,7 +146,7 @@ Manages the service lifecycle. The planner runs inside `ACTIVE` state on each
 tick. All other states handle connectivity and degradation.
 
 ```
-                    ┌──────────┐
+                   ┌──────────┐
          ┌─────────│INITIALISE│
          │         └──────────┘
          │ modbus connected
