@@ -301,6 +301,43 @@ class TelemetryStore:
                 "pv_forecast_log write failed (%d rows dropped)", len(rows),
             )
 
+    def update_pv_actuals(self, actuals: dict[datetime, float]) -> int:
+        """Populate `pv_forecast_log.actual_kw` for every forecast row
+        whose `period_end` matches a Solcast estimated-actual.
+
+        Updates *all* rows for the given `period_end` (across every
+        `fetched_at`), not just the latest. This lets analysts look at
+        either "latest forecast vs actual" (for replay) or "how did the
+        forecast evolve vs the truth" (for calibration) with a single
+        table.
+
+        Returns the number of rows touched. Best-effort: failures are
+        logged and swallowed — this is observability, not critical path.
+        """
+        if not actuals:
+            return 0
+        try:
+            pairs = [(kw, pe) for pe, kw in actuals.items()]
+            # DuckDB's executemany returns None, so we count via a
+            # follow-up query. The update uses period_end as the key;
+            # actual_kw overwrites any prior value, which is intentional
+            # — the freshest actuals estimate wins.
+            self._db.executemany(
+                """UPDATE pv_forecast_log
+                   SET actual_kw = ?
+                   WHERE period_end = ?""",
+                pairs,
+            )
+            touched = self._db.sql(
+                "SELECT COUNT(*) FROM pv_forecast_log WHERE actual_kw IS NOT NULL"
+            ).fetchone()
+            return int(touched[0]) if touched else 0
+        except Exception:
+            logger.exception(
+                "update_pv_actuals failed (%d entries dropped)", len(actuals),
+            )
+            return 0
+
     def read_latest_pv_forecast(
         self, max_age_minutes: int = 60
     ) -> tuple[list[PVForecast], datetime] | None:

@@ -180,6 +180,91 @@ class TestStorePVForecastLog:
         assert store.read_latest_pv_forecast() is None
 
 
+class TestActualsBackfill:
+    async def test_client_parses_actuals_into_period_end_map(
+        self, solcast_config: SolcastConfig,
+    ) -> None:
+        payload = {
+            "estimated_actuals": [
+                {"period_end": "2026-04-22T12:00:00.0000000Z", "pv_estimate": 8.2},
+                {"period_end": "2026-04-22T12:30:00.0000000Z", "pv_estimate": 7.8},
+            ]
+        }
+        client = SolcastClient(solcast_config)
+        client._client = MagicMock()
+        resp = MagicMock()
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        client._client.get = AsyncMock(return_value=resp)
+
+        result = await client.get_actuals_by_period_end()
+        assert result == {
+            datetime(2026, 4, 22, 12, 0, tzinfo=UTC): 8.2,
+            datetime(2026, 4, 22, 12, 30, tzinfo=UTC): 7.8,
+        }
+
+    async def test_client_skips_actuals_when_quota_exhausted(
+        self, solcast_config: SolcastConfig,
+    ) -> None:
+        from optimiser.time_utils import now_utc
+
+        client = SolcastClient(solcast_config)
+        # Burn the quota. Also set _quota_date to today — otherwise the
+        # first _maybe_reset_quota() call resets _call_count_today to 0
+        # (it treats None != today.date() as "new day, reset counter").
+        client._call_count_today = 10
+        client._quota_date = now_utc().date()
+        client._client = MagicMock()
+        client._client.get = AsyncMock()
+        result = await client.get_actuals_by_period_end()
+        assert result == {}
+        client._client.get.assert_not_called()
+
+    def test_store_update_touches_rows(self, store: TelemetryStore) -> None:
+        now = datetime.now(UTC).replace(microsecond=0)
+        pe = now + timedelta(hours=1)
+        # Two forecast rows for the same period_end at different fetched_at —
+        # both should get the actual_kw backfilled (supports calibration
+        # analysis of forecast evolution).
+        store.write_pv_forecast_log([
+            PVForecastLogRow(
+                fetched_at=now - timedelta(hours=2),
+                period_end=pe,
+                pv_estimate_kw=5.0, pv_estimate10_kw=3.5, pv_estimate90_kw=6.5,
+            ),
+            PVForecastLogRow(
+                fetched_at=now - timedelta(hours=1),
+                period_end=pe,
+                pv_estimate_kw=6.0, pv_estimate10_kw=4.0, pv_estimate90_kw=7.5,
+            ),
+        ])
+        n = store.update_pv_actuals({pe: 5.5})
+        assert n == 2
+        # Both rows now carry the actual
+        rows = store._db.sql(
+            "SELECT actual_kw FROM pv_forecast_log ORDER BY fetched_at"
+        ).fetchall()
+        assert all(r[0] == pytest.approx(5.5) for r in rows)
+
+    def test_store_update_ignores_unmatched_periods(
+        self, store: TelemetryStore,
+    ) -> None:
+        now = datetime.now(UTC).replace(microsecond=0)
+        store.write_pv_forecast_log([
+            PVForecastLogRow(
+                fetched_at=now,
+                period_end=now + timedelta(hours=1),
+                pv_estimate_kw=5.0, pv_estimate10_kw=3.5, pv_estimate90_kw=6.5,
+            ),
+        ])
+        # Backfill for a period_end that doesn't exist in the log
+        n = store.update_pv_actuals({now + timedelta(days=30): 4.2})
+        assert n == 0
+
+    def test_store_update_handles_empty_input(self, store: TelemetryStore) -> None:
+        assert store.update_pv_actuals({}) == 0
+
+
 class TestSeedCache:
     async def test_seed_cache_populates_forecast_without_log_rows(
         self, solcast_config: SolcastConfig,

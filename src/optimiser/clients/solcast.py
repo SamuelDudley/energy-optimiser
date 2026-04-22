@@ -209,3 +209,29 @@ class SolcastClient:
                 resp.raise_for_status()
         self._call_count_today += 1
         return resp.json().get("estimated_actuals", [])
+
+    async def get_actuals_by_period_end(self) -> dict[datetime, float]:
+        """Fetch satellite-derived actuals and return a
+        `{period_end (UTC) → kW}` mapping.
+
+        Built on top of `get_estimated_actuals`; same quota cost. Used by
+        the nightly backfill to populate `pv_forecast_log.actual_kw` so
+        analysts can compute `forecast − actual` or `actual − measured`
+        (the second is the curtailment/waste signal).
+
+        Returns `{}` on quota exhaustion or empty responses — callers
+        should treat that as "no update this cycle", not an error.
+        """
+        raw = await self.get_estimated_actuals()
+        out: dict[datetime, float] = {}
+        for item in raw:
+            period_end_str = item.get("period_end")
+            if period_end_str is None:
+                continue
+            try:
+                period_end = parse_iso(period_end_str)
+                kw = float(item.get("pv_estimate", 0))
+            except (TypeError, ValueError):
+                continue
+            out[period_end] = kw
+        return out

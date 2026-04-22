@@ -15,6 +15,7 @@ from .clients.sigenergy import SigenergyController
 from .clients.solcast import SolcastClient
 from .clients.unifi import UniFiOccupancyDetector
 from .config import Config
+from .curtailment import CurtailmentState, evaluate as evaluate_curtailment
 from .logging_utils import SnapshotWriter, emit, new_tick_id
 from .lp.dispatch import dispatch_from_slot
 from .lp.fallback import trigger_fallback
@@ -84,6 +85,8 @@ class Service:
         self._last_solcast_fetch = 0.0
         self._last_bom_fetch = 0.0
         self._last_action: BatteryAction | None = None
+        self._last_export_limit_kw: float | None = None
+        self._curtailment_state = CurtailmentState()
         self._wake_loops: list = []
 
     async def start(self) -> None:
@@ -145,6 +148,16 @@ class Service:
         if self._solcast:
             self._wake_loops.append(
                 WakeLoop("solcast", self._config.solcast.poll_interval_s, self._fetch_solcast)
+            )
+            # Daily actuals backfill — populates pv_forecast_log.actual_kw
+            # so replay can compute "forecast vs reality" and a nightly
+            # curtailment summary. Runs every 24h; first fire happens
+            # one full period after startup, which is fine — the
+            # pv_forecast_log starts accumulating from tick 1 and the
+            # backfill is an analysis-time concern, not real-time.
+            # Costs 1 of 10 daily Solcast quota.
+            self._wake_loops.append(
+                WakeLoop("pv_actuals", 86400, self._backfill_pv_actuals)
             )
 
         logger.info("Spawning %d wake loops", len(self._wake_loops))
@@ -344,6 +357,7 @@ class Service:
             # Apply export limit (independent of battery dispatch).
             if output.grid_export_limit_kw is not None:
                 await self._sigenergy.set_export_limit_kw(output.grid_export_limit_kw)
+                self._last_export_limit_kw = output.grid_export_limit_kw
 
             # Apply load commands.
             for cmd in output.load_commands:
@@ -458,7 +472,11 @@ class Service:
             tick_id=tick_id,
         )
 
-        # 14. Heartbeat — update the mtime of the file the external watchdog
+        # 14. Curtailment signal — flat-top heuristic. See curtailment.py.
+        # Cheap (no network), purely from state we already have in hand.
+        self._check_curtailment(state, tick_id)
+
+        # 15. Heartbeat — update the mtime of the file the external watchdog
         # polls. This is the liveness signal that tells the watchdog "the
         # tick loop is still running". Touching happens here, at the end of
         # a successful tick, so an LP failure or Modbus hang earlier in the
@@ -466,6 +484,21 @@ class Service:
         # watchdog. Best-effort: never crash the tick on heartbeat-write
         # failure — the watchdog itself will fire if we go silent.
         self._touch_heartbeat()
+
+    def _check_curtailment(self, state, tick_id: str) -> None:
+        kind, body = evaluate_curtailment(
+            soc_pct=state.soc_pct,
+            battery_power_kw=state.battery_power_kw,
+            pv_kw=state.pv_power_kw,
+            house_load_kw=state.house_load_kw,
+            grid_export_limit_kw=self._last_export_limit_kw,
+            soc_ceiling_pct=self._config.battery.soc_ceiling_pct,
+            state=self._curtailment_state,
+        )
+        if kind == "suspected":
+            emit(EventType.PV_CURTAILMENT_SUSPECTED, body, tick_id=tick_id)
+        elif kind == "cleared":
+            emit(EventType.PV_CURTAILMENT_CLEARED, body, tick_id=tick_id)
 
     def _touch_heartbeat(self) -> None:
         path = Path(
@@ -635,6 +668,27 @@ class Service:
         rows = self._solcast.drain_log_rows()
         if rows:
             self._store.write_pv_forecast_log(rows)
+
+    async def _backfill_pv_actuals(self) -> None:
+        """Daily wake loop target: fetch Solcast estimated actuals for the
+        recent past, populate `pv_forecast_log.actual_kw`. One Solcast call
+        per run (1/10 daily quota). No-op if Solcast is disabled or quota
+        is already exhausted."""
+        if not self._solcast:
+            return
+        try:
+            actuals = await self._solcast.get_actuals_by_period_end()
+        except Exception:
+            logger.exception("Solcast estimated_actuals fetch failed")
+            return
+        if not actuals:
+            return
+        touched = self._store.update_pv_actuals(actuals)
+        logger.info(
+            "PV actuals backfill: %d Solcast intervals → %d forecast-log rows updated",
+            len(actuals),
+            touched,
+        )
 
     async def _fetch_bom(self) -> None:
         try:

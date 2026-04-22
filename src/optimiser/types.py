@@ -101,6 +101,8 @@ class EventType(StrEnum):
     BREAKER_LATCHED = auto()  # Circuit breaker entered latched state
     BREAKER_PROBE = auto()  # Probe LP run after cooldown
     BREAKER_CLEARED = auto()  # Returned to normal LP control
+    PV_CURTAILMENT_SUSPECTED = auto()  # MPPT appears throttled at sink ceiling
+    PV_CURTAILMENT_CLEARED = auto()  # Throttle signal cleared (back below ceiling)
 
 
 # ── Value Objects ────────────────────────────────────────────────
