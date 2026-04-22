@@ -155,6 +155,23 @@ class PVForecast:
 
 
 @dataclass(frozen=True, slots=True)
+class PVForecastLogRow:
+    """One row per forecast interval, at each Solcast fetch. Logged to
+    `pv_forecast_log` in DuckDB for later calibration analysis (p10/p50/p90
+    calibration, forecast drift, replay engine inputs). Not consumed by the
+    LP — strictly an observability artefact. `actual_kw` is left None at
+    insert time; a backfill job (not yet implemented) would later populate
+    it from the telemetry table's measured `pv_kw`.
+    """
+    fetched_at: datetime
+    period_end: datetime  # forecast intervals are anchored to period_end in Solcast
+    pv_estimate_kw: float
+    pv_estimate10_kw: float
+    pv_estimate90_kw: float
+    actual_kw: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SystemState:
     timestamp: datetime
     soc_pct: float

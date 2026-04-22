@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 
 from .config import StorageConfig
 from .logging_utils import emit
-from .types import EventType, LoadTelemetryRow, PriceForecastLogRow, TelemetryRow
+from .types import (
+    EventType,
+    LoadTelemetryRow,
+    PriceForecastLogRow,
+    PVForecast,
+    PVForecastLogRow,
+    TelemetryRow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +275,79 @@ class TelemetryStore:
                 CURRENT_SCHEMA_VERSION,
             ],
         )
+
+    def write_pv_forecast_log(self, rows: list[PVForecastLogRow]) -> None:
+        """Append PV forecast rows. Best-effort: failures are logged and
+        swallowed — this is observability, not critical path."""
+        if not rows:
+            return
+        try:
+            self._db.executemany(
+                """INSERT INTO pv_forecast_log VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    [
+                        r.fetched_at,
+                        r.period_end,
+                        r.pv_estimate_kw,
+                        r.pv_estimate10_kw,
+                        r.pv_estimate90_kw,
+                        r.actual_kw,
+                    ]
+                    for r in rows
+                ],
+            )
+        except Exception:
+            logger.exception(
+                "pv_forecast_log write failed (%d rows dropped)", len(rows),
+            )
+
+    def read_latest_pv_forecast(
+        self, max_age_minutes: int = 60
+    ) -> tuple[list[PVForecast], datetime] | None:
+        """Load the most recent Solcast forecast from the log, if fresh.
+
+        Returns (forecasts, fetched_at) for the most recent `fetched_at`
+        batch if that batch is within `max_age_minutes` of now, else None.
+        Used by the service on startup to seed the Solcast cache and
+        skip the initial API call (Solcast has a hard 10/day quota).
+        """
+        try:
+            latest_fetch = self._db.sql(
+                "SELECT MAX(fetched_at) FROM pv_forecast_log"
+            ).fetchone()
+        except Exception:
+            logger.exception("read_latest_pv_forecast failed")
+            return None
+        if not latest_fetch or latest_fetch[0] is None:
+            return None
+        fetched_at: datetime = latest_fetch[0]
+        age_minutes = (datetime.now(fetched_at.tzinfo) - fetched_at).total_seconds() / 60
+        if age_minutes > max_age_minutes:
+            return None
+
+        # Only keep intervals that haven't expired yet (period_end in the future).
+        # A 60-min-old forecast still has 47+ hours of unexpired intervals.
+        rows = self._db.sql(
+            """SELECT period_end, pv_estimate_kw, pv_estimate10_kw, pv_estimate90_kw
+               FROM pv_forecast_log
+               WHERE fetched_at = ? AND period_end > ?
+               ORDER BY period_end""",
+            params=[fetched_at, datetime.now(fetched_at.tzinfo)],
+        ).fetchall()
+        if not rows:
+            return None
+
+        forecasts = [
+            PVForecast(
+                start=period_end - timedelta(minutes=30),
+                end=period_end,
+                pv_estimate_kw=p50,
+                pv_estimate10_kw=p10,
+                pv_estimate90_kw=p90,
+            )
+            for (period_end, p50, p10, p90) in rows
+        ]
+        return forecasts, fetched_at
 
     def write_price_forecast_log(self, rows: list[PriceForecastLogRow]) -> None:
         """Append price forecast rows. Best-effort: failures are logged

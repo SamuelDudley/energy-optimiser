@@ -23,7 +23,7 @@ import httpx
 from ..config import SolcastConfig
 from ..logging_utils import emit
 from ..time_utils import now_utc, parse_iso
-from ..types import EventType, PVForecast
+from ..types import EventType, PVForecast, PVForecastLogRow
 from ._retry import solcast_retry
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ class SolcastClient:
         )
         self._last_forecast: list[PVForecast] | None = None
         self._last_fetch: datetime | None = None
+        self._pending_log_rows: list[PVForecastLogRow] = []
         # Quota tracker (resets at UTC midnight). Counts successful
         # responses only — 4xx/5xx don't count against quota.
         self._call_count_today: int = 0
@@ -48,6 +49,23 @@ class SolcastClient:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    def drain_log_rows(self) -> list[PVForecastLogRow]:
+        """Drain pending pv_forecast_log rows from the last successful
+        fetch. Destructive — the internal buffer is emptied so
+        double-logging can't occur. Returns [] if no new fetches have
+        happened since the last drain."""
+        out = self._pending_log_rows
+        self._pending_log_rows = []
+        return out
+
+    def seed_cache(self, forecast: list[PVForecast], fetched_at: datetime) -> None:
+        """Populate the in-memory cache from an external source (typically
+        the DuckDB log on startup) so the first tick has PV data without
+        spending an API call. No log rows are generated — we're not
+        re-fetching, just restoring."""
+        self._last_forecast = forecast
+        self._last_fetch = fetched_at
 
     @property
     def forecast_age(self) -> timedelta | None:
@@ -129,7 +147,9 @@ class SolcastClient:
         self._call_count_today += 1
         data = resp.json()
 
+        fetched_at = now_utc()
         forecasts: list[PVForecast] = []
+        log_rows: list[PVForecastLogRow] = []
         for item in data.get("forecasts", []):
             period_end = parse_iso(item["period_end"])
             # Period is typically PT30M — compute start from end
@@ -141,18 +161,32 @@ class SolcastClient:
                 minutes = 5
             period_start = period_end - timedelta(minutes=minutes)
 
+            pv50 = float(item.get("pv_estimate", 0))
+            pv10 = float(item.get("pv_estimate10", 0))
+            pv90 = float(item.get("pv_estimate90", 0))
+
             forecasts.append(
                 PVForecast(
                     start=period_start,
                     end=period_end,
-                    pv_estimate_kw=float(item.get("pv_estimate", 0)),
-                    pv_estimate10_kw=float(item.get("pv_estimate10", 0)),
-                    pv_estimate90_kw=float(item.get("pv_estimate90", 0)),
+                    pv_estimate_kw=pv50,
+                    pv_estimate10_kw=pv10,
+                    pv_estimate90_kw=pv90,
+                )
+            )
+            log_rows.append(
+                PVForecastLogRow(
+                    fetched_at=fetched_at,
+                    period_end=period_end,
+                    pv_estimate_kw=pv50,
+                    pv_estimate10_kw=pv10,
+                    pv_estimate90_kw=pv90,
                 )
             )
 
         self._last_forecast = forecasts
-        self._last_fetch = now_utc()
+        self._last_fetch = fetched_at
+        self._pending_log_rows = log_rows
         logger.info("Fetched %d PV forecast intervals from Solcast", len(forecasts))
         return forecasts
 

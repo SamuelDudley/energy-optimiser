@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from .clients.amber import AmberClient
 from .clients.bom import BOMClient
@@ -95,7 +96,23 @@ class Service:
         amber_ok = await self._fetch_5min_prices()
         await self._fetch_30min_prices()
         if self._solcast:
-            await self._fetch_solcast()
+            # Solcast has a hard 10/day quota — a crashloop without this
+            # seed path burns it fast. If the log has a forecast from
+            # within the last hour, seed the client from it and skip the
+            # initial API call; the next scheduled poll (every ~2.4h)
+            # will refresh. If nothing cached, fall through to a live fetch.
+            cached = self._store.read_latest_pv_forecast(max_age_minutes=60)
+            if cached is not None:
+                forecasts, fetched_at = cached
+                self._solcast.seed_cache(forecasts, fetched_at)
+                self._pv_forecast = forecasts
+                logger.info(
+                    "Seeded Solcast cache from log (%d intervals, %.0f min old) — skipping initial fetch",
+                    len(forecasts),
+                    (datetime.now(fetched_at.tzinfo) - fetched_at).total_seconds() / 60,
+                )
+            else:
+                await self._fetch_solcast()
         await self._fetch_bom()
 
         # Notify state machine
@@ -579,8 +596,18 @@ class Service:
             return
         try:
             self._pv_forecast = await self._solcast.get_forecast()
+            self._persist_pv_forecast_log()
         except Exception:
             logger.exception("Solcast forecast fetch failed")
+
+    def _persist_pv_forecast_log(self) -> None:
+        """Drain and persist the Solcast client's pending log rows.
+        Mirrors `_persist_price_log` for Amber. Best-effort."""
+        if not self._solcast:
+            return
+        rows = self._solcast.drain_log_rows()
+        if rows:
+            self._store.write_pv_forecast_log(rows)
 
     async def _fetch_bom(self) -> None:
         try:
