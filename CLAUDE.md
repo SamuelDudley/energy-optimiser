@@ -4,7 +4,7 @@ This file provides context for AI-assisted development of the energy optimiser. 
 
 ## Project overview
 
-A standalone Python service that optimises a Sigenergy hybrid inverter + 40kWh battery + solar against Amber Electric wholesale pricing. Runs as a Docker container on Proxmox. Controls battery charge/discharge and shiftable loads (hot water heat pump) via Modbus TCP and Shelly HTTP APIs.
+A standalone Python service that optimises a Sigenergy hybrid inverter + 40kWh battery + solar against Amber Electric wholesale pricing. Runs as a Docker container (plus a watchdog sidecar) on Proxmox. Controls battery charge/discharge and shiftable loads (hot water heat pump) via Modbus TCP and Shelly HTTP APIs.
 
 **Spec document:** `SPEC-ENERGY-01.md` is the source of truth. Every design decision is documented there with rationale. Read relevant sections before modifying code.
 
@@ -13,17 +13,19 @@ A standalone Python service that optimises a Sigenergy hybrid inverter + 40kWh b
 ## Architecture
 
 ```
-service.py          # Spawns N wake loops via asyncio.gather
+service.py          # Spawns N wake loops via asyncio.gather; touches heartbeat
+  ├── __main__.py       # Entry point; Service is constructed inside asyncio.run
   ├── wake_loop.py      # Wall-clock-aligned async wake loops (no drift)
   ├── state_machine.py  # Operational lifecycle: ACTIVE/DEGRADED/FALLBACK
   ├── profiler.py       # Builds load profiles from DuckDB historical data
-  ├── store.py          # DuckDB persistence (telemetry + load_telemetry tables)
+  ├── store.py          # DuckDB persistence (telemetry, price/pv forecast logs)
   ├── validation.py     # Per-field validation before DuckDB writes
   ├── logging_utils.py  # Structured JSON events + NDJSON tick snapshots
   ├── time_utils.py     # NEM/local/UTC conversions — DST-aware
   ├── config.py         # TOML config loading
   ├── types.py          # All value types — frozen dataclasses, enums
   ├── replay.py         # Backtest LP configs against historical snapshots
+  ├── watchdog.py       # Dead-man sidecar entry point (eo-watchdog)
   ├── lp/
   │   ├── constants.py      # Slot size, horizon, solver timeout, scenario weights
   │   ├── formulation.py    # LP/MILP builder (deterministic + stochastic)
@@ -34,8 +36,7 @@ service.py          # Spawns N wake loops via asyncio.gather
   │   ├── watcher.py        # Post-write verification (10s poll of reg 30037)
   │   ├── fallback.py       # Paranoid fallback: mode 2 + relays off
   │   ├── snapshot_adapter.py  # LPSolution → PlannerOutput for snapshot compat
-  │   ├── result.py         # LPSolution, SlotDecision, SolveStatus
-  │   └── constants.py      # SLOT_MINUTES, HORIZON_HOURS, WEAR_COST, etc.
+  │   └── result.py         # LPSolution, SlotDecision, SolveStatus
   └── clients/
       ├── amber.py      # Amber Electric REST API
       ├── solcast.py    # Solcast rooftop PV forecast REST API
@@ -45,15 +46,25 @@ service.py          # Spawns N wake loops via asyncio.gather
       └── shelly.py     # Shelly Pro EM HTTP RPC (CT measurement + relay)
 ```
 
+### Two-container deployment
+
+The service is deployed as two containers managed by `docker-compose.yml`:
+
+- **`energy-optimiser`** — runs `energy-optimiser` (the tick loop). Imports the full project.
+- **`energy-optimiser-watchdog`** — runs `eo-watchdog`. Imports only `watchdog.py` (pymodbus + stdlib). Polls `/var/lib/energy-optimiser/heartbeat`; if the main service stops touching it, writes `REMOTE_EMS_ENABLE (40029) = 0` to the inverter so the plant reverts to local EMS. Separate failure domain from the main service — covers OOM, Python deadlock, container-runtime death.
+
+Both containers are brought up at boot by `energy-optimiser.service` (systemd).
+
 ## Critical rules
 
 ### Safety
 
 - **The LP must never crash the tick loop.** All LP code runs in `asyncio.to_thread` with a wall-clock timeout. If the solver fails, times out, or returns infeasible, the service falls back to `SELF_CONSUME` mode via the paranoid fallback path (mode 2 + relays off). The circuit breaker latches for 5 minutes before re-attempting.
-- **Modbus writes are real-world actuations.** A wrong value to register 40031 changes the physical behaviour of a 10kW inverter. Triple-check register addresses, gain values, and sign conventions. See KNOWN-ISSUES.md #3 for the addressing concern.
-- **Fallback must always work.** If any component fails, the system must degrade to `Maximum Self Consumption` (EMS mode 2). This is the inverter's native safe mode. Never leave the inverter in a state that depends on the service being alive unless the heartbeat/watchdog question (KNOWN-ISSUES #3, spec §10.6) has been resolved.
+- **Modbus writes are real-world actuations.** A wrong value to register 40031 changes the physical behaviour of a 10kW inverter. Triple-check register addresses, gain values, and sign conventions.
+- **The Sigenergy firmware has NO Modbus-comms watchdog.** Verified on live hardware (KNOWN-ISSUES #0d). A crash of the main service leaves the inverter executing the last commanded mode indefinitely. Fallback is enforced by three layers: (1) `set_fallback()` on clean shutdown, (2) Docker `restart: unless-stopped` for Python-level crashes, (3) the dead-man watchdog sidecar (`watchdog.py`) for OOM/deadlock/container-runtime failures. Don't break any of these layers without understanding which failure modes fall through.
 - **Never write to Modbus registers that aren't in the spec.** The register map in `SPEC-ENERGY-01.md §7` and `types.py` is the approved set. Register 40001 (continuous power setpoint) is documented but deliberately not used — see §7.2 for rationale.
 - **Mode 0 (PCS Remote Control) is deliberately not used.** It doesn't track dynamic house load. Use modes 3/4/6 with magnitude caps via `apply_lp_dispatch()`. See `lp/dispatch.py` for the mapping.
+- **Discharge cap writes the physical max, not the LP's point estimate.** `dispatch_from_slot` sets reg 40034 to `battery_config.max_discharge_kw` on discharge so transient house loads (kettle, AC, oven) stay on battery instead of leaking to grid. The LP's signed magnitude is preserved on the dispatch as `signed_intent_kw` for the watcher's direction check. Charge cap is still the LP's intended rate — charge is directly controllable and over-charging past the plan spends too much from grid.
 
 ### Battery & charge rates
 
@@ -72,7 +83,7 @@ The Modbus register `REG_ESS_MAX_CHARGING_LIMIT` (40032) sets the limit the inve
 ### Data integrity
 
 - **Never write derived values when inputs are suspect.** If the grid sensor is offline (register 30004 ≠ 1), `grid_power_kw` and `house_load_kw` are nulled at the read layer (`clients/sigenergy.py::read_state`) before any downstream code sees them. `validation.py` is a defence-in-depth second check at the telemetry-row layer.
-- **Don't poison the load profile.** The load profiler (§6.7) builds slowly over months. Bad data corrupts it silently. Always validate before writing to DuckDB. See KNOWN-ISSUES #10 — until the PV register is fixed, house_load data is wrong.
+- **Don't poison the load profile.** The load profiler (§6.7) builds slowly over months. Bad data corrupts it silently. Always validate before writing to DuckDB.
 - **Null over wrong.** A missing data point is recoverable. A wrong data point fed into a 90-day rolling average is not.
 
 ### Time
@@ -102,7 +113,7 @@ The project pins Python 3.12 via `.python-version`; `uv sync` will use the
 interpreter specified there. Install-mode is PEP 660 editable by default, so
 source edits take effect without reinstall.
 
-- Currently ~210 tests across the modules under `tests/`. All must pass before committing; check the latest count with `pytest tests/ -q`.
+- Full suite currently passes at ~250+ tests. All must pass before committing; check the latest count with `pytest tests/ -q`.
 - LP tests use synthetic fixtures from `tests/conftest.py`. Add new test helpers there, not in individual test files.
 - DuckDB tests use in-memory databases (`:memory:`) — no disk I/O, no cleanup needed.
 - Service LP tests use `Service.__new__` + hand-injected mocks to avoid standing up real clients. See `tests/test_service_lp.py` for the pattern.
@@ -211,3 +222,7 @@ duckdb -c "
 | Dual-resolution Amber polling | 5-min prices for acute decisions (spike, neg export, neg import); 30-min for planning (cheapest window, future_max). 5-min only meaningful for current+next 30-min period, beyond that 30-min is the only reliable data. | amber.py, lp/formulation.py, §5.1.1 |
 | SIGNAL_DRIVEN load category | Hot water HP runs in PV mode triggered by a continuously-held dry contact — the appliance manages its own internal cycles. The original SHIFTABLE one-shot model didn't fit. SIGNAL_DRIVEN is now an LP binary variable with daily-target-by-deadline constraint. Same pattern fits future EV charging. | types.py, lp/loads.py, §5.5 |
 | 5-min slot resolution in the LP | LP uses 5-min slots over a horizon that's the lesser of `HORIZON_HOURS` (48h ceiling) and the actual priced coverage from Amber (currently up to ~36h). Never extrapolates: if prices end at hour 36, the LP ends at hour 36, with a terminal SOC floor at the last slot to preserve reserve into the unpriced tail. Negative 5-min spikes inside an otherwise-expensive 30-min interval are visible and exploitable. | lp/formulation.py, lp/constants.py `TERMINAL_SOC_FLOOR_PCT`, §5.2 |
+| Discharge cap = physical max, not LP point estimate | The LP's `battery_kw` is its expected load (e.g. 2 kW from a default load profile). Writing that as the discharge cap meant any transient above the forecast (kettle, AC) leaked to grid import at retail. Writing `max_discharge_kw` lets mode 6 load-follow up to the physical limit while the LP still controls direction via `signed_intent_kw`. | lp/dispatch.py:109 |
+| External dead-man watchdog sidecar | Sigenergy firmware has no Modbus watchdog (verified on hardware, KNOWN-ISSUES #0d). Without a sidecar, a main-service crash leaves the inverter executing the last command forever. The watchdog is a tiny pymodbus-only process in a separate container watching a heartbeat file; on staleness it writes `REMOTE_EMS_ENABLE=0`. Separate dep surface + separate container = separate failure domain. | watchdog.py, docker-compose.yml |
+| Normalise Amber NEM 1-sec gap at parse time | Amber's API returns intervals offset by +1s (10:30:01→11:00:00, 11:00:01→11:30:00) producing 1-second gaps between intervals that the LP's slot grid falls into. Normalising to wall-clock boundaries at the client layer is cleaner than making the LP gap-tolerant. | clients/amber.py |
+| Solcast startup seed from DuckDB | Solcast has a hard 10/day quota. A crashloop before this change burned through it. On startup, if `pv_forecast_log` has a fetch <60 min old, restore the in-memory cache from it and skip the initial API call. Next scheduled poll refreshes normally. | service.py startup path, store.read_latest_pv_forecast |

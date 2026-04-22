@@ -4,22 +4,26 @@ Amber wholesale energy optimiser for a Sigenergy hybrid inverter with ~13 kW
 solar and a 40 kWh battery. Solves a stochastic MILP (PuLP + HiGHS) over
 5-min slots across the priced Amber forecast horizon, applies the slot-0
 decision to the inverter via Modbus, and verifies behaviour against a
-10-second watchdog.
+10-second post-write watcher.
+
+An external dead-man watchdog sidecar enforces a safe state if the main
+service stops ticking — the Sigenergy firmware has no Modbus communication
+watchdog of its own (verified against live hardware; see KNOWN-ISSUES #0d).
 
 Co-optimises battery dispatch with a Shelly-relayed Haier HP330M1-U1 hot
 water heat pump in PV mode.
 
 ## Requirements
 
-- Python 3.12 (the project pins this in `.python-version`)
+- Python 3.12 (pinned via `.python-version`)
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) for dependency management
-- Optional: Docker + Docker Compose for production deploy
+- Docker + Docker Compose for deploy (watchdog sidecar depends on compose)
 
 ## Quick start
 
 ```bash
 uv sync                       # install the project + dev group
-uv run pytest tests/ -q       # full test suite — expect 213 passed
+uv run pytest tests/ -q       # full test suite
 ```
 
 ## Local smoke testing (before touching hardware)
@@ -41,17 +45,13 @@ uv run eo-smoke -c config.toml --api-probe     # 1 call per API (costs 1 Solcast
 uv run eo-smoke -c config.toml --dry-tick      # full tick, prints proposed writes, no actuations
 ```
 
-Once all four are clean, start the service:
+Once all four are clean, bring up the stack:
 
 ```bash
-uv run energy-optimiser --config config.toml
+docker compose up -d          # runs both the service and the watchdog sidecar
 ```
 
-Or with Docker Compose:
-
-```bash
-docker compose up -d
-```
+For boot-time autostart, install the systemd unit — see `DEPLOY.md`.
 
 ## Replay (post-deploy, once snapshots are flowing)
 
@@ -69,6 +69,7 @@ Compares a candidate LP configuration against historical snapshot ticks.
 - `energy-optimiser` — the service (tick loop + wake loops)
 - `eo-smoke` — read-only pre-deploy smoke tests
 - `eo-replay` — replay historical ticks against a candidate config
+- `eo-watchdog` — dead-man sidecar; writes REMOTE_EMS_ENABLE=0 if the main service stops ticking
 
 ## Documentation
 

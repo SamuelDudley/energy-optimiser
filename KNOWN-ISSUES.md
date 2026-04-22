@@ -21,9 +21,11 @@
 
 ## Critical — Must fix before first run
 
-### 0d. No Sigenergy firmware watchdog — ungraceful service death leaves inverter executing last command indefinitely
+### 0d. No Sigenergy firmware watchdog — mitigated by dead-man sidecar (bb6a864)
 
-**Severity:** high safety — refutes a core assumption.
+**Severity:** high safety — refutes a core assumption. The gap itself is
+permanent (a firmware-level feature we can't add), but the main failure
+modes are now covered by the sidecar.
 
 **Test on 2026-04-22, live hardware (IP 192.168.2.220, slave 247):**
 Ran the service, let it reach `active` and command mode 6 (DISCHARGE_ESS_FIRST,
@@ -68,30 +70,44 @@ indefinitely.
 
 **Mitigations (in priority order):**
 
-1. **External sidecar writing `REMOTE_EMS_ENABLE (40029) = 0` when main
-   service goes stale.** Preferred approach per the protocol audit.
-   A single U16 write disables the remote-control path; 30003 then
-   returns to whatever local EMS mode is configured. Implement as a
-   separate process (systemd `WatchdogSec=`, sidecar container, or
-   cron-driven script) that pings the main service every N seconds
-   and writes `40029 = 0` if the ping fails. Separate failure domain:
-   doesn't depend on pymodbus transactions inside the main service,
-   HiGHS, DuckDB, or the Python interpreter being alive. Covers OOM
-   kill, container-runtime death, kernel panic, not just ordinary
-   crashes.
+1. ✅ **Implemented (bb6a864): external dead-man sidecar** writing
+   `REMOTE_EMS_ENABLE (40029) = 0` when the main service goes stale.
+   Lives in `src/optimiser/watchdog.py`, runs as the
+   `energy-optimiser-watchdog` container defined in `docker-compose.yml`.
+   Dep surface: pymodbus + stdlib only. Main service touches
+   `/var/lib/energy-optimiser/heartbeat` at the end of every successful
+   tick; watchdog polls mtime every 15 s; writes the fallback if age
+   > 90 s (or file missing > 180 s at startup). Separate failure domain
+   from the main service — covers OOM, Python deadlock, container
+   runtime crash. Recovery is automatic: if the main service comes back
+   and starts ticking, the watchdog re-arms and the service's next
+   tick re-enables remote EMS.
 
-2. **Existing Docker `restart: unless-stopped`** already covers
-   Python-level crashes of the service itself — the container
-   supervisor restarts it and the next tick re-plans. The sidecar
-   above is only needed for cases the supervisor itself can't handle.
+2. ✅ **Docker `restart: unless-stopped`** on both containers covers
+   ordinary Python crashes — supervisor restarts, next tick re-plans.
 
-3. **Not recommended:** writing `REMOTE_EMS_CONTROL_MODE (40031) = 0x02`
-   (MAX_SELF_CONSUMPTION) as the dead-man action. Leaves remote-EMS
-   still enabled, which means a stuck-but-alive main process could
-   re-assert a different mode. Strictly worse than option 1.
+3. ✅ **systemd unit** (`energy-optimiser.service`) brings the compose
+   stack up on boot, so a host reboot doesn't leave the plant under
+   whatever the last manual command was.
 
-4. **Not recommended:** writing charge/discharge caps to 0 as a revert.
-   Undocumented firmware behaviour for cap=0 in modes 3–6; don't trust it.
+**Residual failure modes (none currently mitigated):**
+
+- Both containers gone simultaneously (docker daemon crash, host down
+  without boot-time recovery). The plant holds the last command until
+  someone intervenes via the Sigenergy app or an external Modbus tool.
+- LAN partition between the watchdog container and the inverter. The
+  heartbeat would go stale, the watchdog would try to write, and the
+  Modbus write would fail — the inverter continues on the last command
+  until the partition heals. Watchdog logs the failure; recovery is
+  whatever state the inverter is in when connectivity returns.
+
+**Rejected alternatives** (kept for reference):
+
+- Writing `REMOTE_EMS_CONTROL_MODE (40031) = 0x02` (MAX_SELF_CONSUMPTION)
+  instead: leaves remote-EMS enabled, so a stuck-but-alive main process
+  could re-assert a bad mode. Strictly worse than disabling remote EMS.
+- Writing charge/discharge caps to 0: undocumented firmware behaviour
+  for cap=0 in modes 3–6; don't trust it.
 
 ### ~~0c. Hot water scheduler refactor (SIGNAL_DRIVEN)~~ — Resolved
 
@@ -192,11 +208,6 @@ The HA integration is widely deployed and known to work with Sigenergy hardware.
 **Live verification (2026-04-22, inverter 192.168.2.220 slave 247):** `eo-smoke --modbus-read` returned plausible values for all plant registers (SOC 58.2%, grid ~0 kW, ESS power consistent with observed discharge, PV 0 kW at night). SOC matched the Sigenergy app's display within 0.1%. Register addressing is confirmed correct.
 
 **Also surfaced during the live test:** pymodbus 3.13 renamed the `slave=` kwarg to `device_id=` (breaking change vs 3.12 that the spec was written against). Fixed in `clients/sigenergy.py` — commit 8894d92.
-
-### ~~3-old. Original concern~~
-
-**File:** `clients/sigenergy.py`
-**Original concern:** pymodbus uses 0-based addressing by default. Sigenergy documentation uses absolute addresses (30003, 40029, etc.). The HA integration may handle this differently. If the offset is wrong, every read/write will hit the wrong register — potentially dangerous for writes.
 
 ---
 

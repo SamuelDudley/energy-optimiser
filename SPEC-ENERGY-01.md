@@ -32,7 +32,7 @@ Proxmox.
 | SOC ceiling (configurable) | 95%         |
 | Max AC charge rate (grid)  | 10 kW       |
 | Max DC charge rate (solar) | 13 kW       |
-| Max discharge rate         | 10 kW (TBC) |
+| Max discharge rate         | 10 kW       |
 | PV array capacity          | ~13 kW      |
 | Battery round-trip efficiency | ~90%     |
 | HW heat pump draw          | ~1.0–1.5 kW |
@@ -44,281 +44,98 @@ Proxmox.
 
 ## 2. Architecture
 
+Two containers managed by `docker-compose.yml`, brought up at boot by
+a systemd unit. The main service runs the LP + dispatch; a dead-man
+sidecar enforces a safe state if the main service stops ticking.
+
 ```
-┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────┐  ┌──────────┐
-│  Amber API  │  │ Solcast API │  │  BOM JSON   │  │  UniFi   │  │ Shelly   │
-│  (prices)   │  │ (PV fcst)   │  │  (weather)  │  │ (occup.) │  │ Pro EM   │
-└──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └────┬─────┘  └────┬─────┘
-       │                │                │               │             │
-       ▼                ▼                ▼               ▼             │
-┌──────────────────────────────────────────────────────────┐          │
-│                      Planner                             │          │
-│              (rolling look-ahead opt)                    │          │
-│                                                          │          │
-│  Inputs:                                                 │          │
-│   - price forecast (48 intervals)                        │          │
-│   - PV forecast (optional)                               │          │
-│   - current SOC, house load                              │          │
-│   - load profile (temp + occupancy bucketed)             │          │
-│   - outdoor temp, occupancy                              │          │
-│                                                          │          │
-│  Outputs:                                                │          │
-│   - battery command                                      │◄─────────┘
-│   - HW schedule                                          │
-└──────────────┬───────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│   Operational State Machine  │
-│  (lifecycle, health, fbk)    │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐    ┌─────────────┐
-│  Sigenergy Modbus Controller │    │   DuckDB    │
-│  (TCP, registers 40xxx)      │    │ (telemetry) │
-└──────────────────────────────┘    └─────────────┘
+┌──────────┐ ┌────────┐ ┌──────┐ ┌──────┐ ┌────────┐
+│ Amber API│ │Solcast │ │BOM   │ │UniFi │ │Shelly  │
+└────┬─────┘ └────┬───┘ └──┬───┘ └──┬───┘ └────┬───┘
+     ▼            ▼        ▼        ▼          │
+┌─────────────────────────────────────────┐   │
+│  energy-optimiser  (main service)        │   │
+│   stochastic MILP → LPDispatch           │   │
+│   state machine, profiler, replay        │   │
+│   touches heartbeat each successful tick │◄──┘
+└────────────┬───────────────────┬─────────┘
+             │                   │
+             ▼                   ▼
+┌──────────────────────┐   ┌──────────────┐
+│ Sigenergy Modbus TCP │   │   DuckDB +   │
+│  reg 40xxx writes    │   │  NDJSON      │
+└──────────▲───────────┘   │   snapshots  │
+           │               └──────────────┘
+           │ REMOTE_EMS_ENABLE=0
+           │ (only on heartbeat stale)
+           │
+┌──────────┴───────────────────────────────┐
+│  energy-optimiser-watchdog  (sidecar)    │
+│   pymodbus + stdlib only                 │
+│   polls /var/lib/energy-optimiser/heartbeat │
+└──────────────────────────────────────────┘
 ```
 
 ### 2.1 Components
 
-| Component                | Responsibility                                        |
-|--------------------------|-------------------------------------------------------|
-| `AmberClient`            | Poll prices, forecasts, historical usage              |
-| `SolcastClient`          | Poll rooftop PV production forecast (optional)        |
-| `SigenergyController`    | Modbus TCP read/write to inverter                     |
-| `HotWaterController`     | Shelly Pro EM: dry contact relay + CT energy monitoring |
-| `ManagedLoadController`  | Generalised Shelly-based load monitor/control (N loads) |
-| `WeatherClient`          | Poll BOM observations (outdoor temp, conditions)      |
-| `OccupancyDetector`      | UniFi client presence detection (phone MAC addresses) |
-| `LoadProfiler`           | Build typical load curves from historical telemetry   |
-| `Planner`                | Decide battery mode + HW schedule each interval       |
-| `StateMachine`           | Manage operational lifecycle and failure recovery      |
-| `TelemetryStore`         | Persist interval data to DuckDB                       |
+| Component                | Container | Responsibility                                        |
+|--------------------------|-----------|-------------------------------------------------------|
+| `AmberClient`            | main      | Poll prices + forecasts; log every interval to `price_forecast_log` |
+| `SolcastClient`          | main      | Poll rooftop PV forecast; log to `pv_forecast_log`; startup-seeds cache from log |
+| `SigenergyController`    | main      | Modbus TCP read/write to inverter                     |
+| `ManagedLoadManager`     | main      | Generalised Shelly-based load monitor/control (N loads) |
+| `BOMClient`              | main      | Poll weather observations (outdoor temp)              |
+| `UniFiOccupancyDetector` | main      | UniFi client presence detection (phone MAC addresses) |
+| `LoadProfiler`           | main      | Build typical load curves from historical telemetry   |
+| `Service` / LP           | main      | Tick loop, LP solve, dispatch, verify; touches heartbeat |
+| `StateMachine`           | main      | Manage operational lifecycle and failure recovery      |
+| `TelemetryStore`         | main      | Persist interval data + forecast logs to DuckDB       |
+| `eo-watchdog`            | sidecar   | Write `REMOTE_EMS_ENABLE=0` if heartbeat goes stale   |
 
 ---
 
 ## 3. Interfaces
 
-```python
-from __future__ import annotations
+`src/optimiser/types.py` is the canonical declaration of every value type
+the system exchanges. Read that file rather than the spec when you need
+an exact field list — duplicating it here would drift. This section
+sketches the high-level language so the rest of the spec makes sense.
 
-from dataclasses import dataclass
-from datetime import datetime
-from enum import StrEnum, auto
-from typing import Protocol
+**Key value types** (all frozen dataclasses, `slots=True`):
 
+- `SystemState` — SOC, battery/PV/grid/house power, EMS mode, outdoor
+  temp, occupancy. `grid_power_kw` and `house_load_kw` are `float | None`
+  — null when the grid sensor reports offline.
+- `PriceInterval` — one slot of Amber's general + feedIn data: import/
+  export c/kWh, spot, renewables %, spike, descriptor, and optional
+  advanced-price bands.
+- `PVForecast` — one 30-min slot from Solcast with p10/p50/p90 kW.
+- `LoadProfile` — the profiler's per-slot expected house load plus a
+  maturity level (L0 default → L3 seasoned).
+- `ManagedLoadStatus` / `ManagedLoadConfig` — Shelly-managed loads
+  (see §5.5 for the SIGNAL_DRIVEN scheduler).
+- `LPSolution` / `SlotDecision` / `LPDispatch` (in `lp/result.py`,
+  `lp/dispatch.py`) — the LP's output and the derived inverter command.
 
-# ── Value Types ──────────────────────────────────────────────────
+**Load categories** (`LoadCategory` enum):
 
-class BatteryAction(StrEnum):
-    CHARGE_GRID = auto()      # Mode 3: Command Charging (Grid First)
-    CHARGE_PV = auto()        # Mode 4: Command Charging (PV First)
-    DISCHARGE_PV = auto()     # Mode 5: Command Discharging (PV First)
-    DISCHARGE_ESS = auto()    # Mode 6: Command Discharging (ESS First)
-    SELF_CONSUME = auto()     # Mode 2: Maximum Self Consumption
-    STANDBY = auto()          # Mode 1: Standby
-    
+| Value              | Use                                                    |
+|--------------------|--------------------------------------------------------|
+| `SIGNAL_DRIVEN`    | Continuous relay assertion; appliance manages its own cycles (HP in PV mode, future EV). See §5.5. |
+| `SHIFTABLE`        | One-shot cycle model (legacy HW). Preserved for back-compat. |
+| `PRECONDITIONABLE` | Pre-run during cheap windows to reduce peak demand (aircon). |
+| `OBSERVABLE`       | Measurement only — feeds the load profiler, no control. |
+| `DEADLINE_BIDIR`   | Charge/discharge with a departure deadline (EV via V2H, §11). |
 
-@dataclass(frozen=True, slots=True)
-class PriceInterval:
-    start: datetime
-    end: datetime
-    import_per_kwh: float       # c/kWh inc GST (general channel)
-    export_per_kwh: float       # c/kWh inc GST (feedIn channel)
-    spot_per_kwh: float         # NEM spot c/kWh
-    renewables_pct: float
-    spike_status: str           # "none" | "potential" | "spike"
-    descriptor: str             # "extremelyLow" .. "spike"
-    # Advanced forecast (optional, forecast intervals only)
-    forecast_low: float | None = None
-    forecast_high: float | None = None
+**Architectural flow per tick** (see `service.py::_tick` for the
+authoritative sequence):
 
-
-@dataclass(frozen=True, slots=True)
-class PVForecast:
-    start: datetime
-    end: datetime
-    pv_estimate_kw: float       # Expected output
-    pv_estimate10_kw: float     # P10 (pessimistic)
-    pv_estimate90_kw: float     # P90 (optimistic)
-
-
-@dataclass(frozen=True, slots=True)
-class SystemState:
-    timestamp: datetime
-    soc_pct: float              # 0–100
-    battery_power_kw: float     # +charge, -discharge
-    pv_power_kw: float
-    grid_power_kw: float        # +import, -export
-    house_load_kw: float        # Derived: grid + battery_discharge + pv_consumed
-    ems_mode: int
-    outdoor_temp_c: float | None  # BOM observation
-    occupied: bool                # UniFi presence detection
-
-
-@dataclass(frozen=True, slots=True)
-class LoadCommand:
-    load_id: str
-    start_cycle: bool           # True = commit to full cycle (shiftable only)
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class PlannerOutput:
-    battery_action: BatteryAction
-    charge_limit_kw: float
-    discharge_limit_kw: float
-    target_soc: float           # SOC to charge/discharge towards
-    load_commands: list[LoadCommand]  # Commands for managed loads
-    reason: str                 # Human-readable explanation for logging
-
-
-@dataclass(frozen=True, slots=True)
-class LoadProfile:
-    """Typical load curve: mean kW per half-hour slot, by context."""
-    slots: list[float]          # 48 values (30-min intervals), selected for context
-    maturity_level: int         # 0–3, from assess_maturity()
-    context: str                # e.g. "cold+occupied+weekday" or "L0 default"
-
-
-# ── Protocols ────────────────────────────────────────────────────
-
-class PriceSource(Protocol):
-    async def get_current_prices(self) -> list[PriceInterval]:
-        """Current + forecast prices for general and feedIn channels."""
-        ...
-
-    async def get_usage(
-        self, start: datetime, end: datetime
-    ) -> list[dict]:
-        """Historical usage intervals."""
-        ...
-
-
-class SolarForecastSource(Protocol):
-    async def get_forecast(self) -> list[PVForecast]:
-        """Rooftop PV forecast for next 24–48h."""
-        ...
-
-
-class BatteryController(Protocol):
-    async def read_state(self) -> SystemState:
-        """Read current inverter/battery state via Modbus."""
-        ...
-
-    async def apply(self, command: PlannerOutput) -> None:
-        """Write EMS mode and limits to holding registers."""
-        ...
-
-    async def set_fallback(self) -> None:
-        """Set Maximum Self Consumption mode (safe default)."""
-        ...
-
-
-class LoadCategory(StrEnum):
-    SHIFTABLE = auto()          # Planner chooses when (hot water, pool pump)
-    PRECONDITIONABLE = auto()   # Planner can pre-run to reduce peak demand (aircon)
-    OBSERVABLE = auto()         # Measurement only, feeds load profiler (oven, dryer)
-    DEADLINE_BIDIR = auto()     # Charge/discharge with departure deadline (EV via V2H)
-
-
-class LoadCycleState(StrEnum):
-    IDLE = auto()               # Not running, available to schedule
-    RUNNING = auto()            # Active (shiftable: must not interrupt)
-    COMPLETE_TODAY = auto()     # Daily energy target met (shiftable only)
-
-
-@dataclass(frozen=True, slots=True)
-class ManagedLoadStatus:
-    load_id: str                # Config key, e.g. "hot_water", "aircon", "oven"
-    category: LoadCategory
-    power_kw: float             # Live draw from Shelly CT
-    energy_today_kwh: float     # Accumulated energy today
-    relay_on: bool | None       # Contactor state (None if no relay)
-    cycle_state: LoadCycleState | None  # Only for SHIFTABLE loads
-
-
-@dataclass(frozen=True, slots=True)
-class ManagedLoadConfig:
-    load_id: str
-    category: LoadCategory
-    shelly_host: str
-    shelly_channel: int         # CT channel (0 or 1)
-    has_relay: bool             # Can we control it?
-    # Shiftable-specific
-    daily_energy_kwh: float | None = None
-    draw_kw: float | None = None
-    cycle_duration_min: int | None = None
-    power_zero_threshold_kw: float = 0.05
-    # Pre-conditionable-specific
-    precondition_strategy: str | None = None  # e.g. "pre_cool", "pre_heat"
-
-
-class ManagedLoadController(Protocol):
-    async def status(self, load_id: str) -> ManagedLoadStatus:
-        """Read live power, energy, and state for a managed load."""
-        ...
-
-    async def start_cycle(self, load_id: str) -> None:
-        """Start a cycle on a shiftable load. Raises if load is not
-        SHIFTABLE or not IDLE."""
-        ...
-
-    async def all_statuses(self) -> list[ManagedLoadStatus]:
-        """Read status for all managed loads in one pass."""
-        ...
-
-
-# Convenience alias — hot water is the first shiftable load
-HotWaterStatus = ManagedLoadStatus
-
-
-class WeatherSource(Protocol):
-    async def get_outdoor_temp(self) -> float | None:
-        """Current outdoor temperature (°C) from BOM observations.
-        BOM Canberra Airport (station 94926):
-        http://www.bom.gov.au/fwo/IDN60801/IDN60801.94926.json
-        Updates every 30 min, 72h history, no auth required."""
-        ...
-
-
-class OccupancyDetector(Protocol):
-    async def is_occupied(self) -> bool:
-        """Check if any tracked devices (phone MACs) are connected
-        to the UniFi network. Uses UniFi controller local API:
-        GET /api/s/default/stat/sta
-        Returns True if any tracked MAC is in the client list."""
-        ...
-
-    async def set_override(self, occupied: bool | None) -> None:
-        """Manual override. None clears the override."""
-        ...
-
-
-class Planner(Protocol):
-    def plan(
-        self,
-        state: SystemState,
-        prices: list[PriceInterval],
-        pv_forecast: list[PVForecast] | None,
-        load_profile: LoadProfile,
-        managed_loads: list[ManagedLoadStatus],
-    ) -> PlannerOutput:
-        """Given current state and forecasts, decide what to do now.
-        
-        state.occupied and state.outdoor_temp_c influence:
-        - Evening reserve sizing (unoccupied → minimal reserve)
-        - Load profile selection (temp-adjusted curves)
-        
-        managed_loads provides per-load status for scheduling decisions:
-        - SHIFTABLE loads: schedule into cheapest contiguous window
-        - PRECONDITIONABLE loads: consider pre-running during cheap windows
-          (e.g. pre-cool house at 2pm cheap rate → less aircon at 5pm spike)
-        - OBSERVABLE loads: no commands, but current draw informs decisions
-          (e.g. oven running → house load is temporarily high → don't discharge)
-        """
-        ...
+```
+read Modbus state → fetch prices (if due) → fetch PV forecast (if due)
+  → build load profile → solve stochastic LP → dispatch_from_slot
+  → apply_lp_dispatch (reg 40031 mode, 40032/40034 cap, 40038 export)
+  → schedule managed load relays → write telemetry + snapshot
+  → emit TICK_COMPLETE → touch heartbeat
 ```
 
 ---
@@ -545,6 +362,16 @@ data wins for the immediate interval. Example: 30-min price is +15c on average
 but the current 5-min slot is -2c export → curtail export now even though the
 30-min average is positive.
 
+**Interval-boundary normalisation (NEM quirk).** Amber returns `startTime`
+offset by +1s from the NEM boundary (e.g. interval 0: `10:30:01 → 11:00:00`;
+interval 1: `11:00:01 → 11:30:00`). This produces a 1-second gap between
+every consecutive interval. The LP's slot grid lands on exact boundaries
+(`11:00:00`, `11:30:00`, ...) — without normalisation, every top-of-half-hour
+slot would fall into the gap and `_price_at` would raise "no price interval
+covers ...". `clients/amber.py` truncates both `start` and `end` back to
+wall-clock boundaries at parse time, so the rest of the system can treat
+intervals as contiguous `[start, end)`.
+
 ### 5.2 Optimisation (Stochastic MILP)
 
 The energy optimiser uses a mixed-integer linear program (MILP) to find the
@@ -650,17 +477,30 @@ setpoint). Mode 0 was rejected because it doesn't track dynamic house load
 
 **Mapping rules:**
 
-| LP output                   | Mode                       | Cap register | Cap value     |
-|-----------------------------|----------------------------|--------------|---------------|
-| \|battery_kw\| < 100W      | SELF_CONSUME (mode 2)      | —            | —             |
-| battery_kw > 0, grid-dom.  | CHARGE_GRID_FIRST (mode 3) | 40032        | battery_kw    |
-| battery_kw > 0, PV-dom.    | CHARGE_PV_FIRST (mode 4)   | 40032        | battery_kw    |
-| battery_kw < 0             | DISCHARGE_ESS_FIRST (mode 6)| 40034       | \|battery_kw\||
+| LP output                   | Mode                       | Cap register | Cap value              |
+|-----------------------------|----------------------------|--------------|------------------------|
+| \|battery_kw\| < 100W      | SELF_CONSUME (mode 2)      | —            | —                      |
+| battery_kw > 0, grid-dom.  | CHARGE_GRID_FIRST (mode 3) | 40032        | battery_kw             |
+| battery_kw > 0, PV-dom.    | CHARGE_PV_FIRST (mode 4)   | 40032        | battery_kw             |
+| battery_kw < 0             | DISCHARGE_ESS_FIRST (mode 6)| 40034       | `max_discharge_kw`     |
 
 "Grid-dominant" means the LP plans to source more charge from grid than PV
 in that slot. The mode's "first" preference tells the inverter which source
-to prefer; the cap limits the total charge/discharge rate. The inverter
-handles sub-second load following within that cap.
+to prefer.
+
+**Charge cap** uses the LP's intended rate. Charging is directly controllable
+and exceeding the plan (e.g. charging harder than the cheap window supports,
+or over-drawing from grid when PV was about to cover) wastes money.
+
+**Discharge cap** uses the *physical* `battery_config.max_discharge_kw`
+(typically 10 kW), **not** `|battery_kw|`. The LP's `battery_kw` is its
+point estimate of required discharge (e.g. 2 kW from the L0 default load
+profile). Writing that as a hard cap meant any house transient above the
+forecast (kettle, AC, oven) leaked to grid import at retail price while
+the battery sat idle. Writing the physical max lets mode 6 load-follow up
+to that limit; the inverter discharges exactly what the house consumes,
+no more. The LP's signed magnitude is preserved on the dispatch as
+`signed_intent_kw` for the watcher's direction check.
 
 Mode 5 (DISCHARGE_PV_FIRST) is intentionally not used: it lets the inverter
 skip battery discharge entirely if PV happens to cover house load, which
@@ -944,9 +784,19 @@ occupancy.
 
 ### 6.3 Solcast Forecast Tracking
 
-Store forecasts alongside actuals to measure accuracy over time. Solcast's
-`/estimated_actuals` endpoint provides satellite-derived actual PV output,
-which can be compared to the forecast that was active at that time.
+Every Solcast fetch writes one row per forecast interval to
+`pv_forecast_log`. Two use cases:
+
+1. **Calibration / drift analysis.** Compare logged `pv_estimate*` against
+   realised PV from the telemetry table (or Solcast's `/estimated_actuals`,
+   which is satellite-derived). `actual_kw` is NULL at insert time and
+   left for a backfill job to populate.
+2. **Startup-seed cache.** Solcast has a hard 10 calls/day quota on the
+   hobbyist tier. A crashloop burns through it fast. On startup, if the
+   log's most recent `fetched_at` is within the last 60 min, the service
+   reads back the unexpired intervals and seeds the in-memory cache
+   (`SolcastClient.seed_cache`), skipping the initial live fetch. The
+   next scheduled poll (every ~2.4 h) refreshes on its own cadence.
 
 ```sql
 CREATE TABLE pv_forecast_log (
@@ -955,12 +805,16 @@ CREATE TABLE pv_forecast_log (
     pv_estimate_kw  REAL,
     pv_estimate10_kw REAL,
     pv_estimate90_kw REAL,
-    actual_kw       REAL,                  -- Backfilled from estimated_actuals
+    actual_kw       REAL                   -- Backfilled from estimated_actuals
 );
 ```
 
-This enables future tuning: if Solcast consistently over/under-forecasts
-for this rooftop, the planner can apply a dampening factor.
+Write path: `SolcastClient.get_forecast()` builds a `PVForecastLogRow` per
+interval, `drain_log_rows()` returns them to the service, and
+`TelemetryStore.write_pv_forecast_log()` appends via `executemany`.
+Read path on startup: `TelemetryStore.read_latest_pv_forecast(max_age_minutes=60)`
+returns `(forecasts, fetched_at)` if the most recent fetch is fresh
+*and* has unexpired intervals, else `None` (fall through to live fetch).
 
 ### 6.3.1 Amber Price Forecast Tracking
 
@@ -1615,122 +1469,27 @@ control over battery direction.
 
 ## 8. Configuration
 
-```toml
-[amber]
-api_key = "..."
-site_id = "..."                       # From /sites endpoint
-# Two poll cadences for dual-resolution price data:
-poll_5min_interval_s = 60             # Fetch 5-min prices every tick
-poll_30min_interval_s = 300           # Fetch 30-min forecast every 5 min
-forecast_intervals_30min = 72         # Up to ~36h — Amber returns what they have
-forecast_intervals_5min = 12          # 1h forward at 5-min resolution
-previous_intervals_5min = 2           # 10 min of recent 5-min history
+`config.example.toml` in the repo root is the authoritative template
+for every field, with comments explaining each knob. Runtime loading
+happens in `config.py` — the dataclasses there are the ground truth
+if the example drifts.
 
-[solcast]
-enabled = true
-api_key = "..."
-resource_id = "b250-711b-7b8e-5c23"
-base_url = "https://api.solcast.com.au"
-# Endpoints:
-#   GET /rooftop_sites/{resource_id}/forecasts?format=json&hours=48
-#   GET /rooftop_sites/{resource_id}/estimated_actuals?format=json
-# Auth: Bearer token in Authorization header
-# Response: { "forecasts": [{ "pv_estimate": kW, "pv_estimate10": kW,
-#              "pv_estimate90": kW, "period_end": ISO8601, "period": "PT30M" }] }
-poll_interval_s = 8640           # 10 calls/day = every ~2.4h
-forecast_hours = 48              # Request 48h of forecast data
+Architectural points the example can't convey on its own:
 
-[sigenergy]
-host = "192.168.x.x"
-port = 502
-slave_id = 1                     # Modbus unit ID
-
-[battery]
-capacity_kwh = 40.0
-soc_floor_pct = 10.0
-soc_ceiling_pct = 95.0
-max_ac_charge_kw = 10.0          # Grid import limit (AC-coupled inverter)
-max_dc_charge_kw = 13.0          # Solar charge limit (DC-coupled, ~PV array)
-max_discharge_kw = 10.0          # Assumed — verify against inverter spec
-round_trip_efficiency = 0.90
-export_limit_kw = 5.0
-pv_array_kw = 13.0               # Nameplate PV array capacity
-
-# ── Managed Loads ──────────────────────────────────────────────
-# Each [[managed_load]] entry defines a Shelly-monitored circuit.
-# Shelly Pro EM has 2 CT channels — use shelly_channel to specify.
-# Loads with has_relay = true can be controlled by the planner.
-
-[[managed_load]]
-load_id = "hot_water"
-category = "shiftable"          # Planner schedules into cheapest window
-shelly_host = "192.168.x.x"    # Shelly Pro EM
-shelly_channel = 0              # CT channel 0
-has_relay = true                # Dry contact contactor
-daily_energy_kwh = 3.0
-draw_kw = 1.2
-cycle_duration_min = 90
-power_zero_threshold_kw = 0.05
-
-[[managed_load]]
-load_id = "mains"
-category = "observable"         # Independent grid measurement for cross-validation
-shelly_host = "192.168.x.x"    # Same Shelly Pro EM, second channel
-shelly_channel = 1              # CT channel 1 on mains input
-has_relay = false
-
-# Future examples (uncomment when Shelly devices are installed):
-#
-# [[managed_load]]
-# load_id = "aircon"
-# category = "preconditionable"  # Can pre-cool/pre-heat during cheap windows
-# shelly_host = "192.168.x.y"
-# shelly_channel = 0
-# has_relay = true                # Can force on for pre-conditioning
-# precondition_strategy = "pre_cool"  # or "pre_heat"
-#
-# [[managed_load]]
-# load_id = "oven"
-# category = "observable"         # Measurement only, feeds load profiler
-# shelly_host = "192.168.x.z"
-# shelly_channel = 0
-# has_relay = false
-
-[weather]
-# BOM Canberra Airport observations (station 94926)
-# Free, no auth, updates every 30 min
-bom_url = "http://www.bom.gov.au/fwo/IDN60801/IDN60801.94926.json"
-poll_interval_s = 1800           # 30 min (matches BOM update frequency)
-
-[occupancy]
-# UniFi controller local API
-unifi_host = "192.168.x.x"
-unifi_port = 443
-unifi_username = "..."
-unifi_password = "..."
-unifi_site = "default"
-poll_interval_s = 300            # 5 min
-# MAC addresses of phones to track (any connected = occupied)
-tracked_macs = [
-    "AA:BB:CC:DD:EE:01",         # Phone 1
-    "AA:BB:CC:DD:EE:02",         # Phone 2
-]
-# Grace period: don't mark unoccupied until all phones gone for N min
-# (avoids flapping when phone briefly disconnects from WiFi)
-away_threshold_min = 30
-
-[storage]
-db_path = "/var/lib/energy-optimiser/telemetry.duckdb"
-snapshot_dir = "/var/lib/energy-optimiser/snapshots"  # NDJSON tick snapshots
-
-[planner]
-tick_interval_s = 60                  # 1-min tick for 5-min micro-arbitrage
-telemetry_write_interval_s = 300      # Write telemetry on 5-min boundary
-# LOCAL times (AEST/AEDT) — converted internally to UTC
-evening_reserve_start_hour = 17  # 5pm local
-evening_reserve_end_hour = 21    # 9pm local
-charge_spread_threshold_pct = 12 # Min % spread to justify grid charge
-```
+- **Two cadences for Amber polling** (`poll_5min_interval_s`,
+  `poll_30min_interval_s`) because 5-min prices are only reliable for
+  the current and next 30-min window; see §5.1.1 and the decision log.
+- **Separate AC and DC charge limits** (`max_ac_charge_kw`,
+  `max_dc_charge_kw`). Grid import is AC-coupled through the 10 kW
+  inverter; solar is DC-coupled directly to the battery and bounded
+  by the ~13 kW PV array, not the inverter. The LP keeps them separate.
+- **Slave ID 247 is the plant aggregate.** Individual inverters live
+  on slaves 1..N; we read/write the plant to get combined-system state.
+- **All times in config are local** (`deadline_hour_local`, evening
+  reserve bounds). Internal storage is UTC. DST conversion lives in
+  `time_utils.py` and `lp/loads.py`. See §6.8.
+- **`config.toml` holds live API keys** — gitignored; edit in place
+  under `/etc/energy-optimiser/config.toml` when deploying.
 
 ---
 
@@ -1881,13 +1640,27 @@ message indicating possible element activation (LC misconfigured)
 
 ### 9.7 Fallback Safety
 
-**Given** the service crashes or is killed (SIGKILL)
+**Given** the service receives SIGTERM
+**When** `set_fallback()` runs during shutdown
+**Then** the inverter is left in mode 2 (MAX_SELF_CONSUMPTION)
+
+**Given** the service is killed ungracefully (SIGKILL, OOM)
 **When** Remote EMS was enabled (register 40029 = 1)
 **Then** the inverter remains in last-set mode
+**And** the dead-man watchdog writes `REMOTE_EMS_ENABLE = 0` within
+  `stale_seconds` + `poll_seconds` (default 90 s + 15 s = 105 s worst case)
 
 **Given** the service restarts after a crash
 **When** it reads register 40029 = 1 (Remote EMS still active)
-**Then** it resumes control without toggling Remote EMS off/on
+**Then** it resumes control, re-enables Remote EMS if needed, and
+  the next tick touches the heartbeat — the watchdog re-arms
+
+**Given** the container is killed hard but the watchdog is alive
+**When** the heartbeat ages past `stale_seconds`
+**Then** a `FALLBACK FIRED` log line is emitted
+**And** register 40029 is written to 0
+**And** no second write occurs until the heartbeat recovers (one-shot
+  per staleness episode)
 
 ### 9.8 Data Quality & Validation
 
@@ -2037,21 +1810,27 @@ the original planner operated at L0 maturity
 
 ## 10. Open Questions
 
-1. **Max charge/discharge rate** — AC charge confirmed 10kW (grid import, inverter AC-coupled limit). DC charge up to ~13kW (solar, limited by PV array MPPT capacity). Discharge rate assumed 10kW — needs operational verification.
+1. **Max discharge rate** — AC charge confirmed 10 kW, DC charge ~13 kW
+   (bounded by PV array). Discharge rate assumed 10 kW; still wants
+   explicit confirmation against the inverter's nameplate, though no
+   deviation has been observed in operation.
 
-2. ~~**Hot water relay protocol**~~ — Resolved: Shelly Pro EM with dry contact contactor. Provides both relay control and CT clamp energy monitoring via HTTP RPC API.
+2. ~~**Heartbeat / watchdog on the inverter side**~~ — Answered
+   definitively 2026-04-22: **there is no firmware watchdog**. Verified
+   by (a) live SIGKILL test on hardware: the inverter held mode 6
+   discharge for 3+ minutes with no revert; (b) protocol audit of the
+   HA integration register definitions (3344 lines) and vendor Modbus
+   Protocol PDF v2.8 — no `watchdog|heartbeat|keep-alive|timeout|auto-revert`
+   mechanism outside alarm-code string tables. Mitigation implemented:
+   external dead-man sidecar (§2) writes `REMOTE_EMS_ENABLE = 0` if
+   the main service stops touching its heartbeat file. See KNOWN-ISSUES
+   #0d for the full audit record and residual failure modes.
 
-3. ~~**Solcast resource ID**~~ — Resolved: `b250-711b-7b8e-5c23`
-
-4. ~~**Amber controlled load channel**~~ — Resolved: No controlled load channel on the meter.
-
-5. ~~**Modbus unit/slave ID**~~ — Resolved: Assumed 1 (default).
-
-6. **Heartbeat / watchdog** — Unknown. Does the Sigenergy inverter revert to a default mode if no Modbus writes are received within N seconds? Needs operational verification. Mitigation: the 5-min tick loop provides regular writes; if a watchdog exists with a timeout >5 min, it won't fire under normal operation.
-
-7. ~~**Container runtime**~~ — Resolved: Docker on Proxmox.
-
-8. **Hot water temperature feedback** — Not currently available. The Shelly Pro EM energy monitoring partially compensates: if measured `energy_today_kwh` is low, the tank likely needed less heating (was already warm). Future enhancement: add a temperature probe.
+3. **Hot water temperature feedback** — Not currently available. The
+   Shelly Pro EM energy monitoring partially compensates: if measured
+   `energy_today_kwh` is low, the tank likely needed less heating
+   (was already warm). Future enhancement: add a temperature probe,
+   or reverse-engineer the HP330M1-U1 CN10 display bus.
 
 ---
 
