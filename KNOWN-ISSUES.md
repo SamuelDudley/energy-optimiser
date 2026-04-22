@@ -48,20 +48,50 @@ crash during an evening discharge ramps SOC to the floor with no
 correction; a crash during a cheap-window grid charge could keep
 charging straight into the evening peak.
 
-**Mitigations (to be prioritised):**
-1. Investigate Sigenergy holding registers for an explicit keep-alive /
-   watchdog register (many industrial inverters have one — write a heartbeat
-   every N seconds, firmware reverts if it ages out). Cleanest fix if available.
-2. External dead-man on the Docker host: tiny shell/Python script
-   polls the container's health or last-tick timestamp; if stale > N
-   seconds, sends a standalone Modbus write to disable remote EMS
-   (write 0 to 40029) and set mode 2. Separate failure domain from
-   the main service, doesn't depend on pymodbus, HiGHS, DuckDB etc.
-3. Docker `restart: unless-stopped` is already set — covers python-level
-   crashes of the service (the container supervisor restarts it, next
-   tick retakes control and re-plans). Only the cases where the
-   supervisor itself dies (host reboot mid-peak, docker daemon crash)
-   fall through to the dead-man above.
+**Protocol audit (2026-04-22):** cloned the Sigenergy-Local-Modbus HA
+integration and searched `modbusregisterdefinitions.py` (3344 lines),
+`const.py`, `modbus.py`, and the vendor PDF `Modbus_Protocol_EN_2.8-SIGEN.pdf`
+for `watchdog | heartbeat | keep.?alive | liveness | expir | revert |
+safe.?mode | fall.?back | dead.?man | session | ping | refresh`. No
+matches outside alarm-code strings. Register 40029's description
+explicitly says only that enabling it switches EMS work mode (30003)
+to remote; no timeout field, no companion auto-revert register.
+Appendix 6 "Remote EMS control mode" (PDF lines 2376–2411) lists
+modes 0x00–0x06 with no note about timeout behaviour. §4.2
+"Interaction timeout" in the PDF is a client request-spacing rule,
+not a device-side watchdog.
+
+Conclusion: **Sigenergy does not expose a firmware watchdog mechanism
+on the Modbus interface.** Our live SIGKILL test is consistent with
+the protocol docs — the inverter latches the last commanded mode
+indefinitely.
+
+**Mitigations (in priority order):**
+
+1. **External sidecar writing `REMOTE_EMS_ENABLE (40029) = 0` when main
+   service goes stale.** Preferred approach per the protocol audit.
+   A single U16 write disables the remote-control path; 30003 then
+   returns to whatever local EMS mode is configured. Implement as a
+   separate process (systemd `WatchdogSec=`, sidecar container, or
+   cron-driven script) that pings the main service every N seconds
+   and writes `40029 = 0` if the ping fails. Separate failure domain:
+   doesn't depend on pymodbus transactions inside the main service,
+   HiGHS, DuckDB, or the Python interpreter being alive. Covers OOM
+   kill, container-runtime death, kernel panic, not just ordinary
+   crashes.
+
+2. **Existing Docker `restart: unless-stopped`** already covers
+   Python-level crashes of the service itself — the container
+   supervisor restarts it and the next tick re-plans. The sidecar
+   above is only needed for cases the supervisor itself can't handle.
+
+3. **Not recommended:** writing `REMOTE_EMS_CONTROL_MODE (40031) = 0x02`
+   (MAX_SELF_CONSUMPTION) as the dead-man action. Leaves remote-EMS
+   still enabled, which means a stuck-but-alive main process could
+   re-assert a different mode. Strictly worse than option 1.
+
+4. **Not recommended:** writing charge/discharge caps to 0 as a revert.
+   Undocumented firmware behaviour for cap=0 in modes 3–6; don't trust it.
 
 ### ~~0c. Hot water scheduler refactor (SIGNAL_DRIVEN)~~ — Resolved
 
