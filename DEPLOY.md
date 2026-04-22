@@ -230,19 +230,37 @@ the Sigenergy HA integration for the correct offset pattern.
    the inverter not following the commanded dispatch. Occasional single
    deviations are normal (measurement noise). Three consecutive = fallback.
 
-5. Let it run for 24 hours. Check the telemetry database:
+5. Let it run for 24 hours. Check the telemetry database via the
+   **snapshot-and-query** pattern. The running service holds a write lock
+   on `telemetry.duckdb`; DuckDB doesn't allow a second connection to
+   attach read-only while a writer has the file open. Copy the file aside
+   and query the copy:
+
    ```bash
-   docker exec energy-optimiser python -c "
+   # 1. Snapshot the DB (inside the container, so paths match)
+   docker exec energy-optimiser cp /var/lib/energy-optimiser/telemetry.duckdb /tmp/tel.duckdb
+
+   # 2. Pull it out to the host
+   docker cp energy-optimiser:/tmp/tel.duckdb /tmp/tel.duckdb
+
+   # 3. Query from the host (duckdb needs pytz to materialise TIMESTAMPTZ)
+   uv run --no-project --with duckdb --with pytz python -c "
    import duckdb
-   db = duckdb.connect('/var/lib/energy-optimiser/telemetry.duckdb', read_only=True)
+   db = duckdb.connect('/tmp/tel.duckdb', read_only=True)
    print(db.sql('SELECT COUNT(*), MIN(ts), MAX(ts) FROM telemetry').fetchall())
-   print(db.sql(\"\"\"
-     SELECT planner_action, COUNT(*) as n, AVG(import_price) as avg_price
+   for row in db.sql('''
+     SELECT planner_action, COUNT(*) AS n, AVG(import_price) AS avg_price
      FROM telemetry WHERE planner_action IS NOT NULL
      GROUP BY planner_action ORDER BY n DESC
-   \"\"\").fetchall())
+   ''').fetchall():
+       print(row)
    "
    ```
+
+   The snapshot is a point-in-time copy — it will be stale up to the
+   next telemetry write (5 min by default). For trend analysis that's
+   fine; for "what's happening right now" use `docker compose logs -f`
+   or read the latest NDJSON snapshot from `snapshots/`.
 
 ### Phase 3: Add managed loads (optional)
 

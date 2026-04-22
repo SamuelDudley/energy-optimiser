@@ -189,6 +189,7 @@ duckdb -c "
 - **Python:** 3.12+
 - **Key deps:** httpx (async HTTP), pymodbus (Modbus TCP), duckdb (analytics DB)
 - **Data volumes:** `/var/lib/energy-optimiser/` contains `telemetry.duckdb` and `snapshots/`
+- **DuckDB concurrency:** only one process can hold `telemetry.duckdb` at a time — DuckDB takes a file lock on open, even for `read_only=True`. The running service holds it; ad-hoc queries must `cp` the file aside first and open the copy. See DEPLOY.md "Phase 2" for the snapshot-and-query pattern. If you add a second process that needs live data, prefer reading the NDJSON tick snapshots (append-only, concurrent-safe) over opening the DuckDB.
 - **Config:** `/etc/energy-optimiser/config.toml`
 - **Logs:** stdout (JSON structured events), collected by Docker log driver
 
