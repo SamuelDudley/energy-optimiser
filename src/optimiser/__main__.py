@@ -15,6 +15,22 @@ from .logging_utils import setup_logging
 from .service import Service
 
 
+async def _async_main(config_path: str) -> None:
+    # Service construction must happen inside the event loop: pymodbus 3.13's
+    # AsyncModbusTcpClient calls asyncio.get_running_loop() in __init__.
+    config = load_config(config_path)
+    service = Service(config)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(service.stop()))
+
+    try:
+        await service.start()
+    except KeyboardInterrupt:
+        await service.stop()
+
+
 def main() -> None:
     setup_logging()
 
@@ -27,21 +43,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    service = Service(config)
-
-    loop = asyncio.new_event_loop()
-
-    # Handle shutdown signals
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda: asyncio.ensure_future(service.stop()))
-
-    try:
-        loop.run_until_complete(service.start())
-    except KeyboardInterrupt:
-        loop.run_until_complete(service.stop())
-    finally:
-        loop.close()
+    asyncio.run(_async_main(args.config))
 
 
 if __name__ == "__main__":
