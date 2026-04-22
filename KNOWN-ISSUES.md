@@ -21,6 +21,48 @@
 
 ## Critical — Must fix before first run
 
+### 0d. No Sigenergy firmware watchdog — ungraceful service death leaves inverter executing last command indefinitely
+
+**Severity:** high safety — refutes a core assumption.
+
+**Test on 2026-04-22, live hardware (IP 192.168.2.220, slave 247):**
+Ran the service, let it reach `active` and command mode 6 (DISCHARGE_ESS_FIRST,
+cap 10 kW). Sent SIGKILL to the container (no SIGTERM, `set_fallback()`
+never ran). Polled the inverter at 3-s intervals for 3+ minutes.
+
+Result: `EMS work mode` stayed at 7 (REMOTE_EMS), `remote_ems_enabled`
+stayed at 1, `remote_mode` stayed at 6, battery kept discharging at
+~1.3 kW tracking house load. No firmware-level revert at any point.
+
+**Refutes:**
+- DEPLOY.md rollback section: *"the Sigenergy firmware has a built-in
+  'no Modbus communication for N seconds → revert to local mode' safety"*
+  — not observed in practice.
+- CLAUDE.md Critical rules: *"Fallback must always work... Never leave
+  the inverter in a state that depends on the service being alive
+  unless the heartbeat/watchdog question... has been resolved."* —
+  it is now resolved, and the answer is *"it isn't there."*
+
+**Crash-time exposure:** the inverter holds the last command forever. A
+crash during an evening discharge ramps SOC to the floor with no
+correction; a crash during a cheap-window grid charge could keep
+charging straight into the evening peak.
+
+**Mitigations (to be prioritised):**
+1. Investigate Sigenergy holding registers for an explicit keep-alive /
+   watchdog register (many industrial inverters have one — write a heartbeat
+   every N seconds, firmware reverts if it ages out). Cleanest fix if available.
+2. External dead-man on the Docker host: tiny shell/Python script
+   polls the container's health or last-tick timestamp; if stale > N
+   seconds, sends a standalone Modbus write to disable remote EMS
+   (write 0 to 40029) and set mode 2. Separate failure domain from
+   the main service, doesn't depend on pymodbus, HiGHS, DuckDB etc.
+3. Docker `restart: unless-stopped` is already set — covers python-level
+   crashes of the service (the container supervisor restarts it, next
+   tick retakes control and re-plans). Only the cases where the
+   supervisor itself dies (host reboot mid-peak, docker daemon crash)
+   fall through to the dead-man above.
+
 ### ~~0c. Hot water scheduler refactor (SIGNAL_DRIVEN)~~ — Resolved
 
 **Background:** the original "shiftable load with 90-min cycle" model didn't
@@ -111,13 +153,15 @@ stop.
 path going forward; the SHIFTABLE path remains as legacy and benefits from
 this fix).
 
-### ~~3. Sigenergy Modbus register addressing may need offset~~ — Likely resolved (pending hardware verification)
+### ~~3. Sigenergy Modbus register addressing may need offset~~ — Resolved on live hardware (2026-04-22)
 
 **Investigation:** Audited the Sigenergy HA integration's `modbus.py` (`custom_components/sigen/modbus.py` lines 395-410). It calls `client.read_input_registers(address=register.address, ...)` with the **raw absolute address** (e.g. 30014, 30037), exactly the same pattern our code uses. The integration uses `pymodbus>=3.8.3`; we use 3.12.1 — same major version, same API.
 
 The HA integration is widely deployed and known to work with Sigenergy hardware. Our code following the same pattern should also work. **No offset adjustment needed.**
 
-**Still pending:** First-deploy hardware test. Read `30014` (plant_ess_soc) and confirm the value matches the SOC shown in the Sigenergy app. If they match, addressing is confirmed.
+**Live verification (2026-04-22, inverter 192.168.2.220 slave 247):** `eo-smoke --modbus-read` returned plausible values for all plant registers (SOC 58.2%, grid ~0 kW, ESS power consistent with observed discharge, PV 0 kW at night). SOC matched the Sigenergy app's display within 0.1%. Register addressing is confirmed correct.
+
+**Also surfaced during the live test:** pymodbus 3.13 renamed the `slave=` kwarg to `device_id=` (breaking change vs 3.12 that the spec was written against). Fixed in `clients/sigenergy.py` — commit 8894d92.
 
 ### ~~3-old. Original concern~~
 
