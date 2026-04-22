@@ -70,18 +70,35 @@ indefinitely.
 
 **Mitigations (in priority order):**
 
-1. ✅ **Implemented (bb6a864): external dead-man sidecar** writing
-   `REMOTE_EMS_ENABLE (40029) = 0` when the main service goes stale.
-   Lives in `src/optimiser/watchdog.py`, runs as the
-   `energy-optimiser-watchdog` container defined in `docker-compose.yml`.
-   Dep surface: pymodbus + stdlib only. Main service touches
-   `/var/lib/energy-optimiser/heartbeat` at the end of every successful
-   tick; watchdog polls mtime every 15 s; writes the fallback if age
-   > 90 s (or file missing > 180 s at startup). Separate failure domain
-   from the main service — covers OOM, Python deadlock, container
-   runtime crash. Recovery is automatic: if the main service comes back
-   and starts ticking, the watchdog re-arms and the service's next
-   tick re-enables remote EMS.
+1. ✅ **Implemented: external dead-man sidecar** that pins the inverter
+   to an explicit safe state when the main service goes stale. Lives in
+   `src/optimiser/watchdog.py`, runs as the
+   `energy-optimiser-watchdog` container in `docker-compose.yml`.
+   Dep surface: pymodbus + stdlib only.
+
+   **Fallback protocol (three writes in order):**
+   1. `REMOTE_EMS_CONTROL_MODE (40031) = 2` (MAXIMUM_SELF_CONSUMPTION)
+   2. `GRID_EXPORT_POWER_LIMIT (40038) = 0` (no export)
+   3. `REMOTE_EMS_ENABLE (40029) = 1` (pin the mode above)
+
+   If any of those three writes fails, the watchdog falls through to a
+   **last-resort single write**: `REMOTE_EMS_ENABLE = 0`, which disables
+   remote EMS and hands control back to the inverter's local EMS config.
+   Less deterministic than the explicit pin (depends on what local mode
+   the Sigenergy app had configured), but requires only one successful
+   write.
+
+   **Re-assertion model**: fallback writes run on *every poll* while the
+   heartbeat is stale, not just once. Each write is idempotent and
+   re-asserting defends against a transient Modbus drop at the exact
+   moment the first fallback fires.
+
+   Main service touches `/var/lib/energy-optimiser/heartbeat` at the end
+   of every successful tick; watchdog polls mtime every 15 s; fires if
+   age > 90 s (or file missing > 180 s at startup). Recovery is
+   automatic: once the main service ticks again, the watchdog's next
+   poll sees a fresh heartbeat and stops writing — the service's LP
+   tick takes back control on its next cycle.
 
 2. ✅ **Docker `restart: unless-stopped`** on both containers covers
    ordinary Python crashes — supervisor restarts, next tick re-plans.
@@ -96,18 +113,18 @@ indefinitely.
   without boot-time recovery). The plant holds the last command until
   someone intervenes via the Sigenergy app or an external Modbus tool.
 - LAN partition between the watchdog container and the inverter. The
-  heartbeat would go stale, the watchdog would try to write, and the
-  Modbus write would fail — the inverter continues on the last command
-  until the partition heals. Watchdog logs the failure; recovery is
-  whatever state the inverter is in when connectivity returns.
+  heartbeat would go stale, all four fallback writes would fail, and
+  the inverter continues on the last command until the partition heals.
+  Watchdog logs the failures (one line per write per poll — noisy by
+  design); recovery is whatever state the inverter is in when
+  connectivity returns.
 
-**Rejected alternatives** (kept for reference):
+**Rejected alternative** (kept for reference):
 
-- Writing `REMOTE_EMS_CONTROL_MODE (40031) = 0x02` (MAX_SELF_CONSUMPTION)
-  instead: leaves remote-EMS enabled, so a stuck-but-alive main process
-  could re-assert a bad mode. Strictly worse than disabling remote EMS.
-- Writing charge/discharge caps to 0: undocumented firmware behaviour
-  for cap=0 in modes 3–6; don't trust it.
+- Writing charge/discharge caps to 0 as part of the fallback:
+  undocumented firmware behaviour for cap=0 in modes 3–6; don't trust it.
+  The explicit `(mode=2, export=0)` pin achieves the same safety without
+  leaning on undocumented behaviour.
 
 ### ~~0c. Hot water scheduler refactor (SIGNAL_DRIVEN)~~ — Resolved
 

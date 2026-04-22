@@ -121,8 +121,9 @@ policies are already set.
 eo-watchdog starting: heartbeat=/var/lib/energy-optimiser/heartbeat host=... stale_after=90s poll=15s grace=180s
 ```
 If it ever emits `FALLBACK FIRED`, the main service went silent and the
-watchdog wrote `REMOTE_EMS_ENABLE=0`. Investigate — see KNOWN-ISSUES
-#0d for what that means.
+watchdog pinned the inverter to `(mode=2, export=0, remote_ems=1)` — or
+fell through to `remote_ems=0` if any write failed. Investigate — see
+KNOWN-ISSUES #0d for what that means.
 
 ### Phase 5 — Let it run, then verify telemetry
 
@@ -199,13 +200,15 @@ watchdog (verified on live hardware 2026-04-22 — see KNOWN-ISSUES #0d),
 so the inverter holds the last commanded mode indefinitely. The
 dead-man watchdog sidecar catches this: if the main service stops
 touching its heartbeat file (`/var/lib/energy-optimiser/heartbeat`) for
->90 s, the watchdog writes `REMOTE_EMS_ENABLE (40029) = 0` and the
-plant reverts to local EMS.
+>90 s, the watchdog pins the inverter explicitly — three writes:
+`40031=2` (MAX_SELF_CONSUMPTION), `40038=0` (no export), `40029=1`
+(REMOTE_EMS_ENABLE). If any of those fails, last-resort `40029=0`
+hands control to the inverter's local EMS config. Writes re-assert on
+every poll while stale.
 
 If both containers are gone (host down, docker daemon crash), you'll
 need to intervene manually — use the Sigenergy app to confirm the
-plant mode or write `REMOTE_EMS_ENABLE = 0` from any Modbus-capable
-tool on the LAN.
+plant mode, or write `40029=0` from any Modbus-capable tool on the LAN.
 
 
 ## Monitoring

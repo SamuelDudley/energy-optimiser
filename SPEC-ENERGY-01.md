@@ -1646,21 +1646,34 @@ message indicating possible element activation (LC misconfigured)
 
 **Given** the service is killed ungracefully (SIGKILL, OOM)
 **When** Remote EMS was enabled (register 40029 = 1)
-**Then** the inverter remains in last-set mode
-**And** the dead-man watchdog writes `REMOTE_EMS_ENABLE = 0` within
+**Then** the inverter remains in last-set mode until the watchdog fires
+**And** the dead-man watchdog drives the fallback within
   `stale_seconds` + `poll_seconds` (default 90 s + 15 s = 105 s worst case)
 
-**Given** the service restarts after a crash
-**When** it reads register 40029 = 1 (Remote EMS still active)
-**Then** it resumes control, re-enables Remote EMS if needed, and
-  the next tick touches the heartbeat — the watchdog re-arms
+**Given** the watchdog fires
+**When** Modbus is healthy
+**Then** three registers are written in order:
+  - `REMOTE_EMS_CONTROL_MODE (40031) = 2` (MAXIMUM_SELF_CONSUMPTION)
+  - `GRID_EXPORT_POWER_LIMIT (40038) = 0`
+  - `REMOTE_EMS_ENABLE (40029) = 1`
+**And** the inverter is pinned to an explicit known-safe state
+  (not "whatever the operator had configured as local EMS")
 
-**Given** the container is killed hard but the watchdog is alive
-**When** the heartbeat ages past `stale_seconds`
-**Then** a `FALLBACK FIRED` log line is emitted
-**And** register 40029 is written to 0
-**And** no second write occurs until the heartbeat recovers (one-shot
-  per staleness episode)
+**Given** the watchdog fires
+**When** any of the three writes fails
+**Then** the watchdog falls through to a last-resort
+  `REMOTE_EMS_ENABLE (40029) = 0`, handing control to local EMS
+
+**Given** the watchdog has fired and the heartbeat remains stale
+**When** subsequent polls find the heartbeat still stale
+**Then** the fallback writes run again on every poll (re-assertion model)
+  — idempotent, defends against transient Modbus drops between poll and
+  service recovery
+
+**Given** the service restarts after a crash
+**When** it reads register 40029 = 1 (Remote EMS still active, from the watchdog pin)
+**Then** it resumes control, and the next tick touches the heartbeat —
+  the watchdog sees the fresh mtime and stops re-asserting on its next poll
 
 ### 9.8 Data Quality & Validation
 
@@ -1822,9 +1835,12 @@ the original planner operated at L0 maturity
    HA integration register definitions (3344 lines) and vendor Modbus
    Protocol PDF v2.8 — no `watchdog|heartbeat|keep-alive|timeout|auto-revert`
    mechanism outside alarm-code string tables. Mitigation implemented:
-   external dead-man sidecar (§2) writes `REMOTE_EMS_ENABLE = 0` if
-   the main service stops touching its heartbeat file. See KNOWN-ISSUES
-   #0d for the full audit record and residual failure modes.
+   external dead-man sidecar (§2) pins the inverter to an explicit
+   safe state (mode=2, export=0, remote_ems=1) when the main service
+   stops touching its heartbeat file, with a last-resort
+   `REMOTE_EMS_ENABLE=0` fallthrough if any of those writes fails. See
+   KNOWN-ISSUES #0d for the full audit record, the re-assertion model,
+   and residual failure modes.
 
 3. **Hot water temperature feedback** — Not currently available. The
    Shelly Pro EM energy monitoring partially compensates: if measured

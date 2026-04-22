@@ -15,6 +15,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from optimiser.watchdog import (
+    MODE_MAXIMUM_SELF_CONSUMPTION,
+    REG_GRID_EXPORT_POWER_LIMIT,
+    REG_REMOTE_EMS_CONTROL_MODE,
     REG_REMOTE_EMS_ENABLE,
     _heartbeat_age_s,
     _trigger_fallback,
@@ -45,34 +48,139 @@ class TestHeartbeatAge:
         assert 119 < age < 121
 
 
+def _ok_result() -> MagicMock:
+    r = MagicMock()
+    r.isError.return_value = False
+    return r
+
+
+def _err_result() -> MagicMock:
+    r = MagicMock()
+    r.isError.return_value = True
+    return r
+
+
 class TestTriggerFallback:
-    async def test_writes_40029_as_zero(self) -> None:
+    """The fallback writes three registers in order on the happy path, and
+    falls through to a last-resort REMOTE_EMS_ENABLE=0 if any of them
+    fails. All of that is load-bearing for the dead-man guarantee."""
+
+    async def test_happy_path_writes_three_registers_in_order(self) -> None:
         client = MagicMock()
-        result = MagicMock()
-        result.isError.return_value = False
-        client.write_register = AsyncMock(return_value=result)
+        client.write_register = AsyncMock(return_value=_ok_result())
 
         ok = await _trigger_fallback(client, slave_id=247)
         assert ok is True
-        client.write_register.assert_awaited_once()
-        kwargs = client.write_register.call_args.kwargs
-        # The whole safety of this sidecar hinges on these three args.
-        assert kwargs["address"] == REG_REMOTE_EMS_ENABLE
-        assert kwargs["value"] == 0
-        assert kwargs["device_id"] == 247
 
-    async def test_returns_false_when_modbus_write_errors(self) -> None:
+        calls = client.write_register.await_args_list
+        assert len(calls) == 3, f"expected 3 writes, got {len(calls)}"
+
+        # Order matters: mode → export → enable. The enable=1 write must be
+        # last so the earlier-written mode is already in place when remote
+        # EMS takes effect.
+        args_seq = [c.kwargs for c in calls]
+        assert args_seq[0]["address"] == REG_REMOTE_EMS_CONTROL_MODE
+        assert args_seq[0]["value"] == MODE_MAXIMUM_SELF_CONSUMPTION
+        assert args_seq[1]["address"] == REG_GRID_EXPORT_POWER_LIMIT
+        assert args_seq[1]["value"] == 0
+        assert args_seq[2]["address"] == REG_REMOTE_EMS_ENABLE
+        assert args_seq[2]["value"] == 1
+        for c in calls:
+            assert c.kwargs["device_id"] == 247
+
+    async def test_mode_write_fails_falls_through_to_last_resort(self) -> None:
         client = MagicMock()
-        result = MagicMock()
-        result.isError.return_value = True
-        client.write_register = AsyncMock(return_value=result)
+        # Mode write fails, export and enable writes succeed, last-resort succeeds.
+        # The fallback still continues to attempt export+enable after mode
+        # fails (no short-circuit), then fires the last-resort.
+        client.write_register = AsyncMock(
+            side_effect=[
+                _err_result(),  # mode
+                _ok_result(),  # export
+                _ok_result(),  # enable=1
+                _ok_result(),  # last-resort enable=0
+            ]
+        )
+
+        ok = await _trigger_fallback(client, slave_id=247)
+        assert ok is True  # last-resort succeeded
+
+        calls = client.write_register.await_args_list
+        assert len(calls) == 4
+        # Last write is the last-resort enable=0.
+        assert calls[-1].kwargs["address"] == REG_REMOTE_EMS_ENABLE
+        assert calls[-1].kwargs["value"] == 0
+
+    async def test_export_write_fails_falls_through_to_last_resort(
+        self,
+    ) -> None:
+        client = MagicMock()
+        client.write_register = AsyncMock(
+            side_effect=[
+                _ok_result(),  # mode
+                _err_result(),  # export fails
+                _ok_result(),  # enable=1
+                _ok_result(),  # last-resort enable=0
+            ]
+        )
+
+        ok = await _trigger_fallback(client, slave_id=247)
+        assert ok is True
+        assert client.write_register.await_count == 4
+
+    async def test_enable_write_fails_falls_through_to_last_resort(
+        self,
+    ) -> None:
+        client = MagicMock()
+        client.write_register = AsyncMock(
+            side_effect=[
+                _ok_result(),  # mode
+                _ok_result(),  # export
+                _err_result(),  # enable=1 fails
+                _ok_result(),  # last-resort enable=0
+            ]
+        )
+
+        ok = await _trigger_fallback(client, slave_id=247)
+        assert ok is True
+        assert client.write_register.await_count == 4
+
+    async def test_modbus_raises_triggers_last_resort(self) -> None:
+        client = MagicMock()
+        # First three raise, last-resort also raises — total failure.
+        client.write_register = AsyncMock(
+            side_effect=[
+                ConnectionError("no route"),
+                ConnectionError("no route"),
+                ConnectionError("no route"),
+                ConnectionError("no route"),
+            ]
+        )
 
         ok = await _trigger_fallback(client, slave_id=247)
         assert ok is False
+        assert client.write_register.await_count == 4
 
-    async def test_returns_false_when_modbus_write_raises(self) -> None:
+    async def test_all_writes_fail_returns_false(self) -> None:
         client = MagicMock()
-        client.write_register = AsyncMock(side_effect=ConnectionError("refused"))
+        client.write_register = AsyncMock(return_value=_err_result())
+
+        ok = await _trigger_fallback(client, slave_id=247)
+        assert ok is False
+        # Three explicit + one last-resort = 4
+        assert client.write_register.await_count == 4
+
+    async def test_last_resort_raises_returns_false(self) -> None:
+        """Explicit path fails, then last-resort also raises — must not crash."""
+        client = MagicMock()
+        client.write_register = AsyncMock(
+            side_effect=[
+                _err_result(),
+                _err_result(),
+                _err_result(),
+                ConnectionError("refused"),
+            ]
+        )
 
         ok = await _trigger_fallback(client, slave_id=247)
         assert ok is False
@@ -131,24 +239,40 @@ class TestRunLoop:
         client = await self._run_briefly(hb)
         client.write_register.assert_not_awaited()
 
-    async def test_stale_heartbeat_fires_once(self, tmp_path: Path) -> None:
+    async def test_stale_heartbeat_re_asserts_every_poll(
+        self, tmp_path: Path
+    ) -> None:
+        """Re-assertion model: each stale poll fires the full three-write
+        fallback. Idempotent and defends against transient Modbus drops."""
         hb = tmp_path / "hb"
         hb.touch()
-        # Make it 10 minutes old
         old = time.time() - 600
         import os
         os.utime(hb, (old, old))
 
         client = await self._run_briefly(
-            hb, stale_seconds=1.0, poll_seconds=0.01, iterations=5
+            hb, stale_seconds=1.0, poll_seconds=0.02, iterations=4
         )
-        # Must fire exactly once — repeat stale polls are suppressed until
-        # the heartbeat recovers.
-        assert client.write_register.await_count == 1
+        # Each stale poll issues 3 writes on the happy path. After ~4
+        # polls we expect at least 2 full fires (6 writes). Allow slack
+        # for scheduler jitter.
+        assert client.write_register.await_count >= 6, (
+            f"expected re-assertion across polls, got {client.write_register.await_count} writes"
+        )
+        # Every third write should target REG_REMOTE_EMS_ENABLE with value 1
+        # (the third write of each fallback fire is the enable=1 assertion).
+        enable_writes = [
+            c for c in client.write_register.await_args_list
+            if c.kwargs["address"] == REG_REMOTE_EMS_ENABLE
+        ]
+        assert len(enable_writes) >= 2
+        # In the happy path, every enable write is value=1 (explicit pin).
+        # No last-resort enable=0 should fire when Modbus is healthy.
+        assert all(c.kwargs["value"] == 1 for c in enable_writes)
 
-    async def test_recovery_re_arms(self, tmp_path: Path) -> None:
-        """After firing, if the heartbeat comes back fresh, the watchdog
-        re-arms so a second failure can fire again."""
+    async def test_recovery_stops_writes(self, tmp_path: Path) -> None:
+        """While stale: writes. After heartbeat refresh: writes stop
+        until the next staleness episode."""
         hb = tmp_path / "hb"
         hb.touch()
         import os
@@ -179,20 +303,33 @@ class TestRunLoop:
                     grace_seconds=0.0,
                 )
             )
-            await asyncio.sleep(0.06)  # fires once
-            # Refresh heartbeat (simulate service recovery)
+            await asyncio.sleep(0.1)  # stale episode #1 — several fires
+            writes_during_stale_1 = mock_client.write_register.await_count
+            assert writes_during_stale_1 >= 3
+
+            # Refresh heartbeat — should stop firing
             hb.touch()
-            await asyncio.sleep(0.06)  # watchdog re-arms
+            await asyncio.sleep(0.1)
+            writes_after_recovery = mock_client.write_register.await_count
+            # After recovery, no new writes should accumulate. Allow 1
+            # extra in case the recovery landed mid-poll.
+            assert writes_after_recovery - writes_during_stale_1 <= 3, (
+                "watchdog should stop firing after recovery"
+            )
+
             # Go stale again
             os.utime(hb, (old, old))
-            await asyncio.sleep(0.06)  # fires second time
+            await asyncio.sleep(0.1)
+            writes_during_stale_2 = mock_client.write_register.await_count
+            assert writes_during_stale_2 > writes_after_recovery, (
+                "watchdog should resume firing on second staleness episode"
+            )
+
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-
-        assert mock_client.write_register.await_count == 2
 
     async def test_missing_file_within_grace_does_not_fire(
         self, tmp_path: Path

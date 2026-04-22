@@ -69,7 +69,7 @@ Compares a candidate LP configuration against historical snapshot ticks.
 - `energy-optimiser` — the service (tick loop + wake loops)
 - `eo-smoke` — read-only pre-deploy smoke tests
 - `eo-replay` — replay historical ticks against a candidate config
-- `eo-watchdog` — dead-man sidecar; writes REMOTE_EMS_ENABLE=0 if the main service stops ticking
+- `eo-watchdog` — dead-man sidecar; pins the inverter to an explicit safe state if the main service stops ticking
 
 ## Documentation
 
