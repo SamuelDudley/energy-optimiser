@@ -233,28 +233,24 @@ the Sigenergy HA integration for the correct offset pattern.
 5. Let it run for 24 hours. Check the telemetry database via the
    **snapshot-and-query** pattern. The running service holds a write lock
    on `telemetry.duckdb`; DuckDB doesn't allow a second connection to
-   attach read-only while a writer has the file open. Copy the file aside
-   and query the copy:
+   attach read-only while a writer has the file open. Copy the file
+   aside inside the container and query the copy:
 
    ```bash
-   # 1. Snapshot the DB (inside the container, so paths match)
-   docker exec energy-optimiser cp /var/lib/energy-optimiser/telemetry.duckdb /tmp/tel.duckdb
-
-   # 2. Pull it out to the host
-   docker cp energy-optimiser:/tmp/tel.duckdb /tmp/tel.duckdb
-
-   # 3. Query from the host (duckdb needs pytz to materialise TIMESTAMPTZ)
-   uv run --no-project --with duckdb --with pytz python -c "
+   docker exec energy-optimiser bash -c '
+     cp /var/lib/energy-optimiser/telemetry.duckdb /tmp/tel.duckdb
+     python -c "
    import duckdb
-   db = duckdb.connect('/tmp/tel.duckdb', read_only=True)
-   print(db.sql('SELECT COUNT(*), MIN(ts), MAX(ts) FROM telemetry').fetchall())
-   for row in db.sql('''
+   db = duckdb.connect(\"/tmp/tel.duckdb\", read_only=True)
+   print(db.sql(\"SELECT COUNT(*), MIN(ts), MAX(ts) FROM telemetry\").fetchall())
+   for row in db.sql(\"\"\"
      SELECT planner_action, COUNT(*) AS n, AVG(import_price) AS avg_price
      FROM telemetry WHERE planner_action IS NOT NULL
      GROUP BY planner_action ORDER BY n DESC
-   ''').fetchall():
+   \"\"\").fetchall():
        print(row)
    "
+   '
    ```
 
    The snapshot is a point-in-time copy — it will be stale up to the
