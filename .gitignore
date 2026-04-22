@@ -1,0 +1,10 @@
+config.toml
+.venv/
+__pycache__/
+*.pyc
+*.duckdb
+*.duckdb.wal
+*.ndjson
+*.ndjson.gz
+.pytest_cache/
+.ruff_cache/

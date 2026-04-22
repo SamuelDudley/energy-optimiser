@@ -177,7 +177,7 @@ async def smoke_modbus_read(config: Config) -> bool:
             _fail("read_state returned None after individual reads succeeded")
             all_ok = False
 
-    controller.close()
+    await controller.disconnect()
     return all_ok
 
 
@@ -315,7 +315,7 @@ async def smoke_dry_tick(config: Config) -> bool:
         _fail("Modbus connect failed — dry tick cannot proceed")
         return False
     state = await sigenergy.read_state(outdoor_temp_c=None, occupied=True)
-    sigenergy.close()
+    await sigenergy.disconnect()
     if state is None:
         _fail("read_state returned None")
         return False
@@ -480,9 +480,18 @@ async def smoke_offline(config: Config) -> bool:
     _section("Offline LP sanity check")
     from datetime import timedelta
 
+    from .lp.constants import SLOT_MINUTES
     from .types import PriceInterval, SystemState
 
-    now = datetime.now(UTC)
+    # Align to the LP's slot boundary. The LP snaps state.timestamp backwards
+    # to the nearest SLOT_MINUTES boundary; synthetic prices must start at
+    # or before that snapped time, else slot 0 falls into no price interval.
+    raw_now = datetime.now(UTC)
+    now = raw_now.replace(
+        minute=raw_now.minute - (raw_now.minute % SLOT_MINUTES),
+        second=0,
+        microsecond=0,
+    )
 
     # Synthetic state: low SOC so the LP has real reason to care about
     # charging during the cheap window. Mid-SOC + modest load often yields
