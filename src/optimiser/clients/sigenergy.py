@@ -129,7 +129,7 @@ class SigenergyController:
             result = await self._client.read_input_registers(
                 address=address,
                 count=1,
-                slave=self._config.slave_id,
+                device_id=self._config.slave_id,
             )
             if result.isError():
                 logger.warning("Modbus read error at %d: %s", address, result)
@@ -146,7 +146,7 @@ class SigenergyController:
             result = await self._client.read_input_registers(
                 address=address,
                 count=2,
-                slave=self._config.slave_id,
+                device_id=self._config.slave_id,
             )
             if result.isError():
                 logger.warning("Modbus read error at %d: %s", address, result)
@@ -168,7 +168,7 @@ class SigenergyController:
             result = await self._client.read_holding_registers(
                 address=address,
                 count=1,
-                slave=self._config.slave_id,
+                device_id=self._config.slave_id,
             )
             if result.isError():
                 return None
@@ -279,7 +279,7 @@ class SigenergyController:
             result = await self._client.write_register(
                 address=address,
                 value=value,
-                slave=self._config.slave_id,
+                device_id=self._config.slave_id,
             )
             if result.isError():
                 logger.warning("Modbus write error at %d: %s", address, result)
@@ -308,7 +308,7 @@ class SigenergyController:
             result = await self._client.write_registers(
                 address=address,
                 values=[hi, lo],
-                slave=self._config.slave_id,
+                device_id=self._config.slave_id,
             )
             if result.isError():
                 logger.warning("Modbus write error at %d: %s", address, result)

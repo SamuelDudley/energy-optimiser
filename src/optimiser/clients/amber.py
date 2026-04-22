@@ -188,8 +188,15 @@ class AmberClient:
             is_locked: bool | None = None
             if interval_type == "CurrentInterval" and "estimate" in gen:
                 is_locked = not gen["estimate"]
-            start = parse_iso(gen["startTime"])
-            end = parse_iso(gen["endTime"])
+            # Amber follows a NEM convention where startTime is offset by +1s
+            # (e.g. "10:30:01") and endTime is the wall-clock boundary of the
+            # current NEM settlement period (e.g. "11:00:00"), producing a
+            # 1-second gap between consecutive intervals. The LP's slot grid
+            # lands on exact boundaries, so every top-of-half-hour slot falls
+            # into the gap. Normalise start back to the wall-clock boundary
+            # so intervals are contiguous [start, end).
+            start = parse_iso(gen["startTime"]).replace(second=0, microsecond=0)
+            end = parse_iso(gen["endTime"]).replace(second=0, microsecond=0)
             per_kwh = gen.get("perKwh", 0)
             export_per_kwh = fi.get("perKwh", 0)
             spot = gen.get("spotPerKwh", 0)
