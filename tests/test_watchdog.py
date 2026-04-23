@@ -21,6 +21,7 @@ from optimiser.watchdog import (
     REG_REMOTE_EMS_ENABLE,
     _heartbeat_age_s,
     _trigger_fallback,
+    _write_register,
     run,
 )
 
@@ -147,19 +148,18 @@ class TestTriggerFallback:
 
     async def test_modbus_raises_triggers_last_resort(self) -> None:
         client = MagicMock()
-        # First three raise, last-resort also raises — total failure.
+        # All calls raise → the retry path inside _write_register fires
+        # one extra attempt per logical write (bounded), so four logical
+        # writes (mode, export, enable=1, last-resort) become eight
+        # physical attempts before returning False.
         client.write_register = AsyncMock(
-            side_effect=[
-                ConnectionError("no route"),
-                ConnectionError("no route"),
-                ConnectionError("no route"),
-                ConnectionError("no route"),
-            ]
+            side_effect=[ConnectionError("no route")] * 8
         )
+        client.connect = AsyncMock(return_value=False)
 
         ok = await _trigger_fallback(client, slave_id=247)
         assert ok is False
-        assert client.write_register.await_count == 4
+        assert client.write_register.await_count == 8
 
     async def test_all_writes_fail_returns_false(self) -> None:
         client = MagicMock()
@@ -171,19 +171,79 @@ class TestTriggerFallback:
         assert client.write_register.await_count == 4
 
     async def test_last_resort_raises_returns_false(self) -> None:
-        """Explicit path fails, then last-resort also raises — must not crash."""
+        """Explicit path fails, then last-resort also raises — must not crash.
+
+        isError() responses don't trigger the retry path (deterministic
+        protocol errors), so mode/export/enable each fire once. The
+        last-resort raise is transient-looking, so it retries once →
+        4 logical + 1 retry = 5 physical writes.
+        """
         client = MagicMock()
         client.write_register = AsyncMock(
             side_effect=[
-                _err_result(),
-                _err_result(),
-                _err_result(),
-                ConnectionError("refused"),
+                _err_result(),           # mode
+                _err_result(),           # export
+                _err_result(),           # enable=1
+                ConnectionError("refused"),   # last-resort, attempt 1
+                ConnectionError("refused"),   # last-resort, attempt 2 (retry)
             ]
         )
+        client.connect = AsyncMock(return_value=False)
 
         ok = await _trigger_fallback(client, slave_id=247)
         assert ok is False
+        assert client.write_register.await_count == 5
+
+
+class TestWriteRetry:
+    """§4.1: `_write_register` retries once on Exception (TCP-level),
+    calling connect() in between. isError() responses are not retried —
+    protocol errors are deterministic."""
+
+    async def test_succeeds_on_second_attempt_after_transient_failure(
+        self,
+    ) -> None:
+        client = MagicMock()
+        client.write_register = AsyncMock(
+            side_effect=[ConnectionError("socket dropped"), _ok_result()]
+        )
+        client.connect = AsyncMock(return_value=True)
+
+        ok = await _write_register(
+            client, slave_id=247, address=40031, value=2, label="mode"
+        )
+        assert ok is True
+        assert client.write_register.await_count == 2
+        # Reconnect was called exactly once, between the two attempts.
+        assert client.connect.await_count == 1
+
+    async def test_returns_false_after_retries_exhausted(self) -> None:
+        client = MagicMock()
+        client.write_register = AsyncMock(
+            side_effect=[ConnectionError("down"), ConnectionError("down")]
+        )
+        client.connect = AsyncMock(return_value=False)
+
+        ok = await _write_register(
+            client, slave_id=247, address=40031, value=2, label="mode"
+        )
+        assert ok is False
+        assert client.write_register.await_count == 2
+
+    async def test_iserror_does_not_retry(self) -> None:
+        """Protocol-level isError() is a deterministic write rejection —
+        retrying won't help. Returns False on first error without
+        consulting connect() or issuing a second write."""
+        client = MagicMock()
+        client.write_register = AsyncMock(return_value=_err_result())
+        client.connect = AsyncMock(return_value=True)
+
+        ok = await _write_register(
+            client, slave_id=247, address=40031, value=2, label="mode"
+        )
+        assert ok is False
+        assert client.write_register.await_count == 1
+        assert client.connect.await_count == 0
 
 
 class TestRunLoop:
@@ -206,6 +266,10 @@ class TestRunLoop:
         mock_result = MagicMock()
         mock_result.isError.return_value = False
         mock_client.write_register = AsyncMock(return_value=mock_result)
+        # §4.1: run() now pre-connects explicitly on startup; the mock
+        # must provide an awaitable connect() or the pre-connect raises
+        # (which is caught and logged but noisy).
+        mock_client.connect = AsyncMock(return_value=True)
 
         from unittest.mock import patch
 
@@ -238,6 +302,63 @@ class TestRunLoop:
         hb.touch()
         client = await self._run_briefly(hb)
         client.write_register.assert_not_awaited()
+
+    async def test_run_pre_connects_on_startup(self, tmp_path: Path) -> None:
+        """§4.1: run() calls client.connect() once at startup so the
+        first fallback write isn't stalled on connect-on-demand latency.
+        """
+        hb = tmp_path / "hb"
+        hb.touch()
+        client = await self._run_briefly(hb, iterations=2)
+        # Exactly one connect on startup, regardless of whether fallback
+        # fired during the run.
+        assert client.connect.await_count >= 1
+
+    async def test_run_survives_pre_connect_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """If the inverter is unreachable at startup, the watchdog must
+        keep running — the main service may still come up and freshen
+        the heartbeat before a fallback is needed."""
+        hb = tmp_path / "hb"
+        hb.touch()
+
+        mock_client = MagicMock()
+        mock_result = MagicMock()
+        mock_result.isError.return_value = False
+        mock_client.write_register = AsyncMock(return_value=mock_result)
+        # Pre-connect raises — simulates inverter offline at startup.
+        mock_client.connect = AsyncMock(
+            side_effect=ConnectionError("unreachable")
+        )
+
+        from unittest.mock import patch
+
+        with patch(
+            "optimiser.watchdog.AsyncModbusTcpClient",
+            return_value=mock_client,
+        ):
+            task = asyncio.create_task(
+                run(
+                    heartbeat_path=hb,
+                    sigenergy_host="127.0.0.1",
+                    sigenergy_port=502,
+                    slave_id=247,
+                    stale_seconds=60.0,
+                    poll_seconds=0.02,
+                    grace_seconds=0.0,
+                )
+            )
+            # Let a few poll iterations pass; task should still be alive.
+            await asyncio.sleep(0.1)
+            assert not task.done(), (
+                "watchdog must not exit if pre-connect fails"
+            )
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     async def test_stale_heartbeat_re_asserts_every_poll(
         self, tmp_path: Path
@@ -285,6 +406,7 @@ class TestRunLoop:
         mock_result = MagicMock()
         mock_result.isError.return_value = False
         mock_client.write_register = AsyncMock(return_value=mock_result)
+        mock_client.connect = AsyncMock(return_value=True)
 
         from unittest.mock import patch
 

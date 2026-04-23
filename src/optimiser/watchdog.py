@@ -77,6 +77,10 @@ EXIT_UNEXPECTED = 3
 logger = logging.getLogger("eo-watchdog")
 
 
+WRITE_MAX_ATTEMPTS = 2
+WRITE_RETRY_BACKOFF_S = 0.2
+
+
 async def _write_register(
     client: AsyncModbusTcpClient,
     slave_id: int,
@@ -84,20 +88,59 @@ async def _write_register(
     value: int,
     label: str,
 ) -> bool:
-    """One Modbus write. Returns True on success, logs on failure."""
-    try:
-        result = await client.write_register(
-            address=address, value=value, device_id=slave_id
-        )
-    except Exception as exc:
-        logger.error("write %s (%d=%d) raised: %s", label, address, value, exc)
-        return False
-    if result.isError():
-        logger.error(
-            "write %s (%d=%d) returned error: %s", label, address, value, result
-        )
-        return False
-    return True
+    """One Modbus write with bounded retry on TCP-level failure.
+
+    Retry only runs on `Exception` raised by pymodbus (socket dropped,
+    connect-refused, etc.) — a protocol-level `isError()` response
+    (illegal function, bad address) is deterministic and retrying
+    won't help. Before the retry attempt we call `client.connect()`
+    because the most common cause of transient write failure is a
+    dead TCP socket, and pymodbus's auto-reconnect isn't guaranteed
+    to fire before the next call.
+    """
+    for attempt in range(1, WRITE_MAX_ATTEMPTS + 1):
+        try:
+            result = await client.write_register(
+                address=address, value=value, device_id=slave_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "write %s (%d=%d) attempt %d/%d raised: %s",
+                label, address, value, attempt, WRITE_MAX_ATTEMPTS, exc,
+            )
+            if attempt < WRITE_MAX_ATTEMPTS:
+                # Reconnect + back off before the retry.
+                try:
+                    connect_ok = await client.connect()
+                    if not connect_ok:
+                        logger.warning(
+                            "reconnect before retry of %s returned False", label,
+                        )
+                except Exception as reconnect_exc:
+                    logger.warning(
+                        "reconnect before retry of %s raised: %s",
+                        label, reconnect_exc,
+                    )
+                await asyncio.sleep(WRITE_RETRY_BACKOFF_S)
+                continue
+            logger.error(
+                "write %s (%d=%d) failed after %d attempts: last exc=%s",
+                label, address, value, WRITE_MAX_ATTEMPTS, exc,
+            )
+            return False
+        if result.isError():
+            logger.error(
+                "write %s (%d=%d) returned error: %s",
+                label, address, value, result,
+            )
+            return False
+        if attempt > 1:
+            logger.info(
+                "write %s (%d=%d) succeeded on attempt %d/%d",
+                label, address, value, attempt, WRITE_MAX_ATTEMPTS,
+            )
+        return True
+    return False  # unreachable (loop always returns); silences type checkers
 
 
 async def _trigger_fallback(
@@ -211,9 +254,28 @@ async def run(
     )
 
     client = AsyncModbusTcpClient(host=sigenergy_host, port=sigenergy_port)
-    # We don't pre-connect; pymodbus reconnects per-write. That's fine
-    # here — we only write on the failure path, and a fresh connect when
-    # we actually need it avoids stale sockets after a long idle period.
+    # Pre-connect so the first fallback write isn't paying the
+    # connect-on-demand latency — observed ~60 s of "FALLBACK FAILED"
+    # logs during a long-downtime test before pymodbus caught up. If
+    # pre-connect fails (inverter unreachable at startup), we keep
+    # running anyway: `_write_register` re-attempts the connect on
+    # retry, and the main service may come up and freshen the
+    # heartbeat before any fallback is needed.
+    try:
+        connect_ok = await client.connect()
+        if connect_ok:
+            logger.info(
+                "Modbus pre-connect OK: %s:%d", sigenergy_host, sigenergy_port
+            )
+        else:
+            logger.warning(
+                "Modbus pre-connect returned False — will retry per-write "
+                "on first fallback attempt",
+            )
+    except Exception as exc:
+        logger.warning(
+            "Modbus pre-connect raised: %s — will retry per-write", exc,
+        )
 
     startup_time = time.time()
     was_stale = False  # log transitions at WARNING, re-assertions at DEBUG
