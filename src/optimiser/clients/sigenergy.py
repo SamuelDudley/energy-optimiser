@@ -391,16 +391,58 @@ class SigenergyController:
         logger.info("Setting grid export limit to %.1f kW", limit_kw)
         return await self._write_u32(REG_GRID_EXPORT_LIMIT, raw)
 
-    async def set_fallback(self) -> bool:
-        """Set Maximum Self Consumption mode (safe default)."""
-        logger.info("Setting fallback: Maximum Self Consumption")
+    async def set_fallback(
+        self,
+        export_price_ckwh: float | None = None,
+        *,
+        block_export: bool = False,
+    ) -> bool:
+        """Set Maximum Self Consumption mode + price-aware export cap.
+
+        Writes both registers. The LP's last command may have left the export
+        limit pinned to 0 (during a charge slot) or at DNSP max; either way
+        the fallback should re-assert an explicit safe value so it doesn't
+        inherit a stale command.
+
+        Export cap selection:
+        - `block_export=True` → 0 kW. Used by the watcher on verify
+          deviation: we've lost control of the inverter, so don't push
+          power to grid until trust is restored.
+        - `export_price_ckwh < 0` (we would pay to export) → 0 kW (curtail).
+        - Otherwise (price ≥ 0 or price unknown) → `battery.export_limit_kw`
+          (DNSP max). Price-unknown defaulting to DNSP is the revenue-
+          maximising choice for the common case; the edge case where we
+          lose money during a price-negative window with no price cache is
+          bounded by the watchdog (90 s) or the next LP tick (60 s).
+        """
+        if block_export:
+            export_cap_kw = 0.0
+            export_reason = "block_export (verify deviation)"
+        elif export_price_ckwh is not None and export_price_ckwh < 0:
+            export_cap_kw = 0.0
+            export_reason = f"price={export_price_ckwh:.2f}c/kWh"
+        else:
+            export_cap_kw = self._battery.export_limit_kw
+            export_reason = (
+                f"price={export_price_ckwh:.2f}c/kWh"
+                if export_price_ckwh is not None else "price=unknown"
+            )
+        logger.info(
+            "Setting fallback: Maximum Self Consumption + export=%.1fkW (%s)",
+            export_cap_kw, export_reason,
+        )
         if not self._remote_ems_enabled:
             if not await self.enable_remote_ems():
                 return False
-        return await self._write_u16(
+        mode_ok = await self._write_u16(
             REG_REMOTE_EMS_CONTROL_MODE,
             RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
         )
+        export_ok = await self._write_u32(
+            REG_GRID_EXPORT_LIMIT,
+            int(export_cap_kw * 1000),
+        )
+        return mode_ok and export_ok
 
     # ── LP dispatch path ──────────────────────────────────────────
     #

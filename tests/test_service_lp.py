@@ -95,6 +95,11 @@ def _make_service() -> Service:
     svc._sigenergy = MagicMock()
     svc._sigenergy.set_fallback = AsyncMock(return_value=True)
 
+    # Amber mock — `_lp_fallback` reads `last_5min_prices` to pick a safe
+    # export cap (curtail if current export price is negative).
+    svc._amber = MagicMock()
+    svc._amber.last_5min_prices = None
+
     # Loads mock — `_lp_fallback` reads `controllers` (list of relay ctrls)
     svc._loads = MagicMock()
     svc._loads.controllers = []  # No managed loads → no relays to open

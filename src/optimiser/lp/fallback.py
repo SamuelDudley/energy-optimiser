@@ -49,6 +49,8 @@ async def trigger_fallback(
     *,
     commanded_kw: float | None = None,
     measured_kw: float | None = None,
+    export_price_ckwh: float | None = None,
+    block_export: bool = False,
     extra_context: dict | None = None,
 ) -> FallbackResult:
     """Drive the system into Maximum Self Consumption + all relays off.
@@ -69,7 +71,10 @@ async def trigger_fallback(
     # whatever the last LP write put there, and the inverter ignores them.
     self_consume_ok = False
     try:
-        self_consume_ok = await sigenergy.set_fallback()
+        self_consume_ok = await sigenergy.set_fallback(
+            export_price_ckwh=export_price_ckwh,
+            block_export=block_export,
+        )
     except Exception:
         logger.exception("Fallback: set_fallback raised")
 

@@ -202,6 +202,10 @@ class VerificationWatcher:
             FallbackReason.VERIFY_DEVIATION,
             commanded_kw=commanded_kw,
             measured_kw=measured_kw,
+            # Watcher fires because the inverter is not tracking commands.
+            # Until we regain confidence in control, curtail all export —
+            # the priority is stopping unintended grid flows, not revenue.
+            block_export=True,
             extra_context={"outcome": outcome.value},
         )
         await self._runtime.latch(FallbackReason.VERIFY_DEVIATION)

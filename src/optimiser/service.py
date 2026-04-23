@@ -343,6 +343,9 @@ class Service:
                     self._sigenergy,
                     self._loads.controllers,
                     FallbackReason.LP_ERROR,
+                    export_price_ckwh=(
+                        prices_5min[0].export_per_kwh if prices_5min else None
+                    ),
                     extra_context={"phase": "apply_lp_dispatch"},
                 )
                 await self._lp_runtime.latch(FallbackReason.LP_ERROR)
@@ -369,7 +372,11 @@ class Service:
                     await self._loads.start_cycle(cmd.load_id)
 
         elif self._state_machine.should_fallback:
-            await self._sigenergy.set_fallback()
+            await self._sigenergy.set_fallback(
+                export_price_ckwh=(
+                    prices_5min[0].export_per_kwh if prices_5min else None
+                ),
+            )
 
         # 10. Build and validate telemetry row
         # Current price comes from 5-min for accuracy; snapshot keeps both
@@ -595,10 +602,13 @@ class Service:
         """Trigger the paranoid fallback writes, latch the breaker, and
         emit the BREAKER_LATCHED event. Used by every LP failure path so
         the side effects stay consistent."""
+        prices = self._amber.last_5min_prices
+        export_price = prices[0].export_per_kwh if prices else None
         await trigger_fallback(
             self._sigenergy,
             self._loads.controllers,
             reason,
+            export_price_ckwh=export_price,
         )
         await self._lp_runtime.latch(reason)
         emit(EventType.BREAKER_LATCHED, {"reason": reason.value})
