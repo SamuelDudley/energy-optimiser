@@ -156,6 +156,16 @@ class Service:
             ),
             WakeLoop("bom", self._config.weather.poll_interval_s, self._fetch_bom),
             WakeLoop("unifi", self._config.occupancy.poll_interval_s, self._poll_occupancy),
+            # Re-assert hardware SOC limits hourly. These registers
+            # (40046 backup SOC, 40048 discharge cutoff) can be reset
+            # silently by the inverter — firmware update, power cycle,
+            # local EMS override — and we'd only notice at the next
+            # restart. Idempotent write; no wake-up race risk.
+            # Deliberately skips 40047 (charge cutoff): §3.3 will make
+            # that register tick-managed at ~60s cadence, so any hourly
+            # overwrite would briefly push the ceiling back up and
+            # contradict the tick-time target.
+            WakeLoop("soc_limits", 3600, self._reassert_soc_limits),
         ]
         # BOM hourly forecast — separate cadence from current-obs. Only
         # spawn the loop if a forecast URL is configured; empty URL means
@@ -768,6 +778,15 @@ class Service:
             await self._bom.get_outdoor_temp()
         except Exception:
             logger.exception("BOM weather fetch failed")
+
+    async def _reassert_soc_limits(self) -> None:
+        """Hourly re-assertion of the hardware SOC limits the LP doesn't
+        tick-manage. Best-effort — a failed write logs but doesn't
+        propagate; the next hour will try again."""
+        try:
+            await self._sigenergy.assert_discharge_soc_limits()
+        except Exception:
+            logger.exception("assert_discharge_soc_limits failed")
 
     async def _fetch_bom_forecast(self) -> None:
         """Fetch BOM hourly forecast and persist every interval.

@@ -716,19 +716,25 @@ class SigenergyController:
         return ok
 
     async def assert_battery_soc_limits(self) -> bool:
-        """Write hardware SOC limits from `BatteryConfig`.
+        """Write all three hardware SOC limits from `BatteryConfig`.
 
-        These three registers are honoured by the inverter regardless of
-        EMS mode — which means they're the only way to stop mode 2 (or
-        any other local mode) from charging past the ceiling or
-        discharging past the floor. Writes are idempotent, so calling
-        this from startup and periodically (watchdog-style) is safe.
+        These registers are honoured by the inverter regardless of EMS
+        mode — which means they're the only way to stop mode 2 (or any
+        other local mode) from charging past the ceiling or discharging
+        past the floor. Writes are idempotent; called at service
+        startup to assert an initial safe state.
 
         - 40046 backup SOC: reserve held for blackouts (never discharged
           to below this when grid is up).
         - 40047 charge cutoff SOC: hard upper bound on charging.
         - 40048 discharge cutoff SOC: hard lower bound on on-grid
           discharge (also a safety stop).
+
+        For the hourly re-assertion loop (§4.2), use
+        `assert_discharge_soc_limits()` instead. That one skips 40047
+        because §3.3 will make reg 40047 tick-managed at ~60s cadence;
+        an hourly overwrite of the tick-time target would briefly
+        push charging back up to the ceiling.
         """
         ceiling_raw = int(self._battery.soc_ceiling_pct * 10)
         floor_raw = int(self._battery.soc_floor_pct * 10)
@@ -741,6 +747,31 @@ class SigenergyController:
         )
         ok = True
         ok &= await self._write_u16(REG_CHARGE_CUTOFF_SOC, ceiling_raw)
+        ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, floor_raw)
+        ok &= await self._write_u16(REG_BACKUP_SOC, backup_raw)
+        return ok
+
+    async def assert_discharge_soc_limits(self) -> bool:
+        """Re-assert the two SOC limits that are NOT tick-managed.
+
+        Writes 40046 (backup SOC) and 40048 (discharge cutoff) only.
+        Reg 40047 (charge cutoff) is deliberately skipped so we don't
+        fight the tick-time dispatch path once §3.3 lands — until then
+        40047 is write-once-at-startup and this method is a strict
+        subset of `assert_battery_soc_limits()`.
+
+        Use this from the periodic re-assertion loop — idempotent and
+        defends against firmware resetting these limits silently (power
+        cycle, firmware update, local EMS override).
+        """
+        floor_raw = int(self._battery.soc_floor_pct * 10)
+        backup_raw = int(self._battery.backup_soc_pct * 10)
+        logger.info(
+            "Re-asserting discharge SOC limits: floor=%.1f%% backup=%.1f%%",
+            self._battery.soc_floor_pct,
+            self._battery.backup_soc_pct,
+        )
+        ok = True
         ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, floor_raw)
         ok &= await self._write_u16(REG_BACKUP_SOC, backup_raw)
         return ok

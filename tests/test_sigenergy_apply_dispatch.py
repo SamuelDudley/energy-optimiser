@@ -10,6 +10,9 @@ from __future__ import annotations
 import pytest
 
 from optimiser.clients.sigenergy import (
+    REG_BACKUP_SOC,
+    REG_CHARGE_CUTOFF_SOC,
+    REG_DISCHARGE_CUTOFF_SOC,
     REG_ESS_MAX_CHARGING_LIMIT,
     REG_ESS_MAX_DISCHARGING_LIMIT,
     REG_REMOTE_EMS_CONTROL_MODE,
@@ -184,3 +187,51 @@ class TestWriteFailureSafety:
         assert len(rec.calls) == 2
         assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
         assert rec.calls[1][:2] == ("u16", REG_REMOTE_EMS_CONTROL_MODE)
+
+
+class TestAssertSOCLimits:
+    """§4.2: split between startup (all three limits) and periodic
+    re-assertion (discharge-side only, skipping 40047 so it doesn't
+    fight §3.3's tick-managed charge cutoff)."""
+
+    async def test_startup_writes_all_three_limits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        assert await ctrl.assert_battery_soc_limits()
+        addresses = [addr for _, addr, _ in rec.calls]
+        assert REG_CHARGE_CUTOFF_SOC in addresses
+        assert REG_DISCHARGE_CUTOFF_SOC in addresses
+        assert REG_BACKUP_SOC in addresses
+        assert len(rec.calls) == 3
+
+    async def test_periodic_writes_only_discharge_side(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hourly re-assertion must NOT write 40047 — that register will
+        become tick-managed under §3.3, and an hourly overwrite would
+        briefly push the charge ceiling back up to 95%."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        assert await ctrl.assert_discharge_soc_limits()
+        addresses = [addr for _, addr, _ in rec.calls]
+        assert REG_CHARGE_CUTOFF_SOC not in addresses, (
+            "periodic re-assertion must skip the charge cutoff register"
+        )
+        assert REG_DISCHARGE_CUTOFF_SOC in addresses
+        assert REG_BACKUP_SOC in addresses
+        assert len(rec.calls) == 2
+
+    async def test_periodic_propagates_write_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctrl = _controller()
+        rec = _WriteRecorder(u16_returns={REG_BACKUP_SOC: False})
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        assert await ctrl.assert_discharge_soc_limits() is False
