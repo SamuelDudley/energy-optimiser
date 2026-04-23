@@ -50,7 +50,8 @@ Amber wholesale pricing. Previous session established:
 
 ### 3.1 Untie `grid_export[0]` non-anticipativity (highest $ impact)
 
-**Status:** analysis complete, awaiting user go-ahead to implement.
+**Status:** ✅ shipped 2026-04-23 (commit `81ae377`). Replay validation
+skipped (no local snapshot archive). Full test suite green.
 
 **Current code** (`lp/formulation.py`, `_add_non_anticipativity`):
 
@@ -183,8 +184,19 @@ section once §3.3 is implemented — the framing will likely change.
 
 ### 3.3 Mode 2 + dynamic `charge_cut_off_soc` for all PV-charge dispatch
 
-**Status:** the right path — replaces an earlier (mode 4 + live-clamp)
-version of this section. Not started. Retires mode 4 entirely.
+**Status (2026-04-23):** plan finalised in `PLAN-3.3.md` at repo root.
+Commit 1 (probe) landed (`90cdb86` — `src/optimiser/probe_charge_cutoff.py`).
+Awaiting hardware run of the four sub-probes before Commit 2
+(implementation + tests). All four PASS criteria must be met before
+the dispatch rewrite ships. Probe run command, verdicts, and
+fail→mitigation table are in `PLAN-3.3.md §0`.
+
+**To resume:** run the probe (`docker compose stop optimiser; docker run
+... python -m optimiser.probe_charge_cutoff; docker compose start
+optimiser` — ~8 min, needs midday PV ≥ 2 kW and 55 ≤ SOC ≤ 85),
+then either (a) proceed with Phase 1 implementation as planned if all
+probes PASS, or (b) apply the specific mitigation documented in
+`PLAN-3.3.md §0` for whichever probe failed before implementing.
 
 **Previous iterations of this section explored two wrong answers:**
 
