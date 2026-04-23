@@ -157,6 +157,27 @@ class PlannerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class APIConfig:
+    """HTTP API server config.
+
+    The server is read-only: operator monitoring, metric scrapes, log
+    tails, telemetry pulls. It never mutates inverter state. The bearer
+    token lives in an environment variable, not the config file.
+    """
+
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8080
+    bearer_token_env: str = "EO_API_TOKEN"
+    log_file_path: str = "/var/lib/energy-optimiser/logs/app.log"
+    log_file_max_bytes: int = 10 * 1024 * 1024  # 10 MB
+    log_file_backup_count: int = 5
+    log_ring_buffer_size: int = 5000
+    query_max_limit: int = 10000
+    query_timeout_s: float = 5.0
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     amber: AmberConfig
     solcast: SolcastConfig
@@ -167,6 +188,7 @@ class Config:
     occupancy: OccupancyConfig
     storage: StorageConfig
     planner: PlannerConfig
+    api: APIConfig
 
 
 def _parse_load(raw: dict) -> ManagedLoadConfig:
@@ -210,4 +232,5 @@ def load_config(path: str | Path) -> Config:
         occupancy=OccupancyConfig(**raw.get("occupancy", {})),
         storage=StorageConfig(**raw.get("storage", {})),
         planner=PlannerConfig(**raw.get("planner", {})),
+        api=APIConfig(**raw.get("api", {})),
     )

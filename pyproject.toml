@@ -8,6 +8,7 @@ version = "0.2.1"
 description = "Amber wholesale energy optimiser for Sigenergy battery + solar"
 requires-python = ">=3.12"
 dependencies = [
+    "aiohttp>=3.10",
     "httpx>=0.27",
     "pymodbus>=3.6",
     "duckdb>=1.1",

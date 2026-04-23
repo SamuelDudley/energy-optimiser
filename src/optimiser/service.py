@@ -8,6 +8,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from .api import APIServer
 from .clients.amber import AmberClient
 from .clients.bom import BOMClient
 from .clients.shelly import ManagedLoadManager
@@ -15,7 +16,8 @@ from .clients.sigenergy import SigenergyController
 from .clients.solcast import SolcastClient
 from .clients.unifi import UniFiOccupancyDetector
 from .config import Config
-from .curtailment import CurtailmentState, evaluate as evaluate_curtailment
+from .curtailment import CurtailmentState
+from .curtailment import evaluate as evaluate_curtailment
 from .logging_utils import SnapshotWriter, emit, new_tick_id
 from .lp.dispatch import dispatch_from_slot
 from .lp.fallback import trigger_fallback
@@ -66,6 +68,7 @@ class Service:
         self._store = TelemetryStore(config.storage)
         self._state_machine = StateMachine()
         self._snapshots = SnapshotWriter(config.storage.snapshot_dir)
+        self._api_server = APIServer(config.api, self)
 
         # LP runtime — shared with the verification watcher.
         # Built once at startup so the runtime/breaker survives across ticks.
@@ -142,6 +145,13 @@ class Service:
         if self._state_machine.should_fallback:
             await self._sigenergy.set_fallback()
 
+        # Start the read-only HTTP API. Safe to run alongside the tick
+        # loop — handlers never block on Modbus or take locks that the
+        # tick path holds. Failure to start (e.g. port in use, missing
+        # bearer-token env var) is logged and re-raised so systemd /
+        # docker can restart and surface the misconfiguration.
+        await self._api_server.start()
+
         # Build wake loops — each runs independently, aligned to wall clock
         from .wake_loop import WakeLoop
 
@@ -203,6 +213,13 @@ class Service:
         """Gracefully stop the service."""
         logger.info("Stopping service")
         self._running = False
+
+        # Stop the HTTP API first so no new requests can arrive while
+        # we're tearing down the store / clients they might have read.
+        try:
+            await self._api_server.stop()
+        except Exception:
+            logger.exception("API server stop failed")
 
         # Stop wake loops first so no new ticks are scheduled
         for wl in self._wake_loops:
@@ -577,16 +594,36 @@ class Service:
             emit(EventType.PV_CURTAILMENT_CLEARED, body, tick_id=tick_id)
 
     def _touch_heartbeat(self) -> None:
-        path = Path(
-            os.environ.get(
-                "EO_HEARTBEAT_PATH", "/var/lib/energy-optimiser/heartbeat"
-            )
-        )
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=True)
+            self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            self.heartbeat_path.touch(exist_ok=True)
         except Exception:
-            logger.exception("heartbeat touch failed (path=%s)", path)
+            logger.exception("heartbeat touch failed (path=%s)", self.heartbeat_path)
+
+    # ── ServiceProbe surface ─────────────────────────────────────
+    # Read-only properties the API server reaches via request.app.
+
+    @property
+    def version(self) -> str:
+        return _VERSION
+
+    @property
+    def heartbeat_path(self) -> Path:
+        return Path(
+            os.environ.get("EO_HEARTBEAT_PATH", "/var/lib/energy-optimiser/heartbeat")
+        )
+
+    @property
+    def service_state(self) -> str:
+        return self._state_machine.state.value
+
+    @property
+    def sigenergy_connected(self) -> bool:
+        return self._sigenergy.connected
+
+    @property
+    def db_connection(self):  # duckdb.DuckDBPyConnection — avoid import cost here
+        return self._store.connection
 
     # ── LP Execution ─────────────────────────────────────────────
 
