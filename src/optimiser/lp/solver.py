@@ -25,7 +25,7 @@ from ..types import (
     PVForecast,
     SystemState,
 )
-from .constants import NUMERIC_EPS, SOLVER_TIMEOUT_S
+from .constants import NUMERIC_EPS, SOC_BOUND_PENALTY, SOLVER_TIMEOUT_S
 from .formulation import LPVars, build_lp, build_stochastic_lp
 from .loads import LPLoad
 from .result import LPSolution, SlotDecision, SolveStatus
@@ -306,15 +306,44 @@ def _extract_solution(
         battery_config.export_limit_kw if any_plans_export else 0.0
     )
 
-    cost = pulp.value(prob.objective) or 0.0
+    raw_cost = pulp.value(prob.objective) or 0.0
+
+    # Subtract the SOC out-of-band penalty portion so the reported cost
+    # is the *economic* expected cost. The penalty keeps the LP numerically
+    # well-behaved in recovery scenarios (initial SOC outside the band)
+    # but should not show up in dashboards as a huge cost — it's an
+    # internal regulariser, not a real grid bill. Penalty per-scenario:
+    #   weight * SOC_BOUND_PENALTY * (Σ soc_over + Σ soc_under + terminal)
+    # Deterministic: single LPVars with weight=1. Stochastic: sum over
+    # scenario LPVars, each carrying its own weight.
+    def _penalty_for(v: LPVars) -> float:
+        parts = [_v(x) for x in v.soc_over_ceiling]
+        parts += [_v(x) for x in v.soc_under_floor]
+        if v.soc_terminal_slack is not None:
+            parts.append(_v(v.soc_terminal_slack))
+        return v.weight * SOC_BOUND_PENALTY * sum(parts)
+
+    if scenarios is not None:
+        penalty_cost = sum(_penalty_for(s) for s in scenarios.values())
+    else:
+        penalty_cost = _penalty_for(vars)
+    cost = raw_cost - penalty_cost
 
     extra = ""
     if stochastic_meta:
         extra = f" [{len(stochastic_meta['scenarios'])} scenarios]"
+    # `cost` is the economic expected cost; `raw_cost` retains the
+    # slack-inflated value for debugging. Only log raw_cost when the
+    # penalty is non-negligible so steady-state logs stay tidy.
+    penalty_note = (
+        f" (penalty={penalty_cost:.0f}c)"
+        if penalty_cost > 1.0
+        else ""
+    )
     reason = (
         f"LP {status.value}{extra}: bat={slot_0.battery_kw:+.2f}kW, "
         f"export={slot_0.grid_export_kw:.2f}kW, "
-        f"cost={cost:.0f}c, solve={elapsed_ms:.0f}ms"
+        f"cost={cost:.0f}c{penalty_note}, solve={elapsed_ms:.0f}ms"
     )
 
     return LPSolution(

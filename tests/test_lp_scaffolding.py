@@ -215,6 +215,34 @@ class TestSOCBounds:
         )
         assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
 
+    def test_reported_cost_excludes_soc_slack_penalty(self) -> None:
+        """§3.4: SOC_BOUND_PENALTY * slack is an internal regulariser, not
+        a real grid cost. When the initial SOC forces recovery through
+        the slack variables, the reported economic cost must not be
+        inflated by the ~1e4 penalty coefficient.
+        """
+        cfg = BatteryConfig(soc_floor_pct=15.0, soc_ceiling_pct=95.0)
+        # Initial SOC well above ceiling — forces multiple slots of
+        # soc_over_ceiling slack activation during recovery.
+        sol = solve(
+            state=_state(soc=100.0),
+            prices_planning=_flat_prices(),  # 20c import / 5c export
+            pv_forecast=None,
+            load_profile=_flat_profile(),  # 1 kW flat load
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        # Economic-cost sanity bound: a 48h horizon at 1 kW average load,
+        # 20c import, ~5c export sits well under 2000c even in the worst
+        # arbitrage. The raw (penalty-inflated) objective would be 1e5+.
+        assert sol.expected_total_cost_cents < 2000.0, (
+            f"cost={sol.expected_total_cost_cents:.0f}c — penalty not "
+            "subtracted?"
+        )
+
 
 # ── Properties: economic behaviour ───────────────────────────────
 

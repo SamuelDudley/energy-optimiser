@@ -57,6 +57,16 @@ class LPVars:
 
     loads: dict[str, LoadVars] = field(default_factory=dict)
 
+    # Slack variables on the operating-band soft constraints + scenario
+    # weight — exposed so the solver can subtract the penalty portion of
+    # the objective from reported cost (§3.4; pure-economic reporting for
+    # dashboards and logs). Defaults make these backwards-compatible with
+    # any code constructing LPVars manually.
+    soc_over_ceiling: list[pulp.LpVariable] = field(default_factory=list)
+    soc_under_floor: list[pulp.LpVariable] = field(default_factory=list)
+    soc_terminal_slack: pulp.LpVariable | None = None
+    weight: float = 1.0
+
 
 @dataclass
 class StochasticLPVars:
@@ -466,6 +476,10 @@ def _add_scenario_to_problem(
             pv_curtailed=pv_curtailed,
             soc_pct=soc_pct,
             loads=load_vars,
+            soc_over_ceiling=soc_over_ceiling,
+            soc_under_floor=soc_under_floor,
+            soc_terminal_slack=soc_terminal_slack,
+            weight=weight,
         ),
         cost_terms,
     )
