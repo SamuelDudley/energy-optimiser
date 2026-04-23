@@ -332,7 +332,9 @@ lands; until then the battery-net tie stays.
 
 ### 3.4 Cosmetic: exclude SOC slack penalty from reported `cost`
 
-**Status:** low priority, nice-to-have.
+**Status:** ✅ shipped 2026-04-23 (commit `d38956b`). Reported cost now
+excludes the `SOC_BOUND_PENALTY * slack` internal regulariser; log
+lines append `(penalty=NNNc)` when the penalty is non-trivial.
 
 `tick_complete` events log `cost=NNNc` which is the LP's objective
 value, including `SOC_BOUND_PENALTY * slack`. When SOC is above ceiling,
@@ -347,6 +349,11 @@ solver only.
 ## 4. Smaller queued items
 
 ### 4.1 Watchdog explicit `connect()` + write-retry on startup
+
+**Status:** ✅ shipped 2026-04-23 (commit `d5792ec`). `run()` now
+pre-connects on startup; `_write_register` retries once on Exception
+with a reconnect between attempts. isError() responses are not
+retried (deterministic protocol errors).
 
 `clients/sigenergy.py` connects lazily via pymodbus. If the watchdog
 fires fallback on startup (heartbeat stale), the first Modbus writes
@@ -371,20 +378,12 @@ change.
 
 ### 4.2 Re-assert SOC limits periodically
 
-`assert_battery_soc_limits()` currently runs once at startup. If the
-inverter's firmware resets these (power cycle, firmware update, local
-EMS override), the limits revert without our knowledge.
-
-**Fix:** add a `WakeLoop("soc_limits", 3600s, ...)` that re-asserts
-every hour. Idempotent, no wake-up race risk.
-
-**Interaction with §3.3:** once §3.3 lands, reg 40047 (charge cutoff)
-is tick-managed at the ~60s cadence. The periodic re-assertion must
-skip 40047 and only re-write 40046 (backup SOC) + 40048 (discharge
-cutoff). Otherwise the hourly write would briefly overwrite the
-tick-time target with the config's `soc_ceiling_pct`. Split the helper
-into `assert_discharge_limits()` (for the periodic loop) and
-`assert_initial_charge_ceiling()` (startup-only) when §3.3 lands.
+**Status:** ✅ shipped 2026-04-23 (commit `d2d350a`). Forward-correct
+split: new `assert_discharge_soc_limits()` writes only 40046 + 40048
+from a `WakeLoop("soc_limits", 3600s, ...)`. Reg 40047 is deliberately
+skipped so §3.3 can land without touching this code path —
+`assert_battery_soc_limits()` (all three regs) remains the startup
+path unchanged.
 
 ### 4.3 Drop default `soc_floor_pct` from 10% in `BatteryConfig`
 
