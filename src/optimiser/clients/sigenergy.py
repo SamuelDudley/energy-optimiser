@@ -43,6 +43,58 @@ REG_PLANT_ESS_SOC = 30014  # plant_ess_soc, U16 gain=10 %
 REG_PLANT_PV_POWER = 30035  # plant_sigen_photovoltaic_power, S32 gain=1000 kW
 REG_PLANT_ESS_POWER = 30037  # plant_ess_power, S32 gain=1000 kW (>0 charging)
 
+# Dynamic BMS-reported charge/discharge headroom. Drops below nameplate
+# when the battery is cold, near SOC floor/ceiling, or thermally derated —
+# the observable thermal-derate signal.
+REG_ESS_AVAIL_MAX_CHARGING_POWER = 30047  # U32 gain=1000 kW
+REG_ESS_AVAIL_MAX_DISCHARGING_POWER = 30049  # U32 gain=1000 kW
+
+# Lifetime energy counters: U64, gain=100 → kWh. Stored as DOUBLE in
+# DuckDB because REAL (float32) loses precision at ~10^7 kWh.
+REG_LIFETIME_PV_KWH = 30088
+REG_LIFETIME_LOAD_KWH = 30094
+REG_LIFETIME_CHARGE_KWH = 30200
+REG_LIFETIME_DISCHARGE_KWH = 30204
+REG_LIFETIME_IMPORT_KWH = 30216
+REG_LIFETIME_EXPORT_KWH = 30220
+
+# Per-inverter health block. Single-inverter install, so inverter_* and
+# plant_* are effectively identical for these fields.
+REG_INVERTER_RUNNING_STATE = 30578  # U16 (Appendix 1)
+REG_INVERTER_ESS_SOH = 30602  # U16 gain=10 %
+REG_INVERTER_ESS_CELL_TEMP_AVG = 30603  # S16 gain=10 °C
+REG_INVERTER_ESS_CELL_VOLT_AVG = 30604  # U16 gain=1000 V
+REG_INVERTER_ALARM1 = 30605  # U16 (Appendix 2)
+REG_INVERTER_ALARM2 = 30606  # U16 (Appendix 3)
+REG_INVERTER_ALARM3 = 30607  # U16 (Appendix 4)
+REG_INVERTER_ALARM4 = 30608  # U16 (Appendix 5)
+REG_INVERTER_ALARM5 = 30609  # U16 (Appendix 11)
+REG_INVERTER_ESS_CELL_TEMP_MAX = 30620  # S16 gain=10
+REG_INVERTER_ESS_CELL_TEMP_MIN = 30621  # S16 gain=10
+REG_INVERTER_ESS_CELL_VOLT_MAX = 30622  # U16 gain=1000
+REG_INVERTER_ESS_CELL_VOLT_MIN = 30623  # U16 gain=1000
+
+# PCS (power conversion system) internal temperature — relevant for
+# summer derating modelling.
+REG_INVERTER_PCS_TEMP = 31003  # S16 gain=10 °C
+
+# Grid AC quality.
+REG_INVERTER_GRID_FREQ = 31002  # U16 gain=100 Hz
+REG_INVERTER_PHASE_A_VOLT = 31011  # U32 gain=100 V
+REG_INVERTER_PHASE_B_VOLT = 31013  # U32 gain=100 V
+REG_INVERTER_PHASE_C_VOLT = 31015  # U32 gain=100 V
+
+# Per-MPPT string V/I. Four strings captured unconditionally; null reads
+# are expected on installs with fewer strings wired.
+REG_INVERTER_PV1_VOLTAGE = 31027  # S16 gain=10 V
+REG_INVERTER_PV1_CURRENT = 31028  # S16 gain=100 A
+REG_INVERTER_PV2_VOLTAGE = 31029
+REG_INVERTER_PV2_CURRENT = 31030
+REG_INVERTER_PV3_VOLTAGE = 31031
+REG_INVERTER_PV3_CURRENT = 31032
+REG_INVERTER_PV4_VOLTAGE = 31033
+REG_INVERTER_PV4_CURRENT = 31034
+
 # Write (holding registers, 40xxx)
 REG_REMOTE_EMS_ENABLE = 40029  # U16: 0=disabled, 1=enabled
 # REG_PLANT_ACTIVE_POWER_CMD = 40001  # S32 gain=1000 kW
@@ -179,6 +231,161 @@ class SigenergyController:
             self._connected = False
             return None
 
+    # The helpers below are used exclusively for extended observational
+    # reads (temps, alarms, lifetime counters, etc.). They are BEST-EFFORT:
+    # a single-register failure must not mark the whole controller as
+    # disconnected, because the core reads for the same tick may have
+    # already succeeded. Contrast with _read_input_u16/_read_input_s32
+    # used on critical-path fields, which do mark the controller
+    # disconnected on exception — the correct behaviour there, since
+    # those reads are the connection's liveness signal.
+
+    async def _read_input_s16(
+        self,
+        address: int,
+        gain: float = 1.0,
+        slave_id: int | None = None,
+    ) -> float | None:
+        """Read a single S16 input register and scale by gain.
+
+        gain=10 is the Sigenergy convention for tenths-of-°C fields;
+        gain=100 is used for current (centi-amps). `slave_id` defaults
+        to the plant slave; pass the inverter slave explicitly for
+        per-inverter registers (305xx-306xx, 310xx range).
+        """
+        try:
+            result = await self._client.read_input_registers(
+                address=address,
+                count=1,
+                device_id=slave_id if slave_id is not None else self._config.slave_id,
+            )
+            if result.isError():
+                return None
+            raw = result.registers[0]
+            if raw >= 0x8000:
+                raw -= 0x10000
+            return raw / gain
+        except Exception:
+            logger.debug("Best-effort S16 read failed at %d", address)
+            return None
+
+    async def _read_input_u32(
+        self,
+        address: int,
+        gain: float = 1.0,
+        slave_id: int | None = None,
+    ) -> float | None:
+        """Read a U32 input register pair and scale by gain.
+
+        Sigenergy's convention for "this field is not applicable" (e.g.
+        phase B/C on a single-phase install, or a register your firmware
+        doesn't populate) is to return 0xFFFFFFFF. Treat that as None
+        so the validation layer doesn't see 42,949,672.95 as an outlier.
+        """
+        try:
+            result = await self._client.read_input_registers(
+                address=address,
+                count=2,
+                device_id=slave_id if slave_id is not None else self._config.slave_id,
+            )
+            if result.isError():
+                return None
+            raw = (result.registers[0] << 16) | result.registers[1]
+            if raw == 0xFFFFFFFF:
+                return None
+            return raw / gain
+        except Exception:
+            logger.debug("Best-effort U32 read failed at %d", address)
+            return None
+
+    async def _read_input_u64(
+        self,
+        address: int,
+        gain: float = 1.0,
+        slave_id: int | None = None,
+    ) -> float | None:
+        """Read a U64 input register quad (big-endian word order).
+
+        Sentinel 0xFFFFFFFFFFFFFFFF means "not applicable" per Sigenergy
+        convention — returned as None rather than a ~1.8e17 outlier.
+        """
+        try:
+            result = await self._client.read_input_registers(
+                address=address,
+                count=4,
+                device_id=slave_id if slave_id is not None else self._config.slave_id,
+            )
+            if result.isError():
+                return None
+            r = result.registers
+            raw = (r[0] << 48) | (r[1] << 32) | (r[2] << 16) | r[3]
+            if raw == 0xFFFFFFFFFFFFFFFF:
+                return None
+            return raw / gain
+        except Exception:
+            logger.debug("Best-effort U64 read failed at %d", address)
+            return None
+
+    async def _read_input_u16_scaled(
+        self,
+        address: int,
+        gain: float = 1.0,
+        slave_id: int | None = None,
+    ) -> float | None:
+        """Read an unsigned U16 and scale (e.g. SOH=gain 10, cell V=gain 1000).
+
+        Uses a local try/except rather than delegating to _read_input_u16
+        so a failure doesn't mark the controller disconnected.
+        """
+        try:
+            result = await self._client.read_input_registers(
+                address=address,
+                count=1,
+                device_id=slave_id if slave_id is not None else self._config.slave_id,
+            )
+            if result.isError():
+                return None
+            return result.registers[0] / gain
+        except Exception:
+            logger.debug("Best-effort U16 read failed at %d", address)
+            return None
+
+    async def _read_input_u16_best_effort(
+        self,
+        address: int,
+        slave_id: int | None = None,
+    ) -> int | None:
+        """Read a raw U16 input register without flipping connection state."""
+        try:
+            result = await self._client.read_input_registers(
+                address=address,
+                count=1,
+                device_id=slave_id if slave_id is not None else self._config.slave_id,
+            )
+            if result.isError():
+                return None
+            return result.registers[0]
+        except Exception:
+            logger.debug("Best-effort U16 read failed at %d", address)
+            return None
+
+    async def _read_holding_u16_best_effort(
+        self, address: int
+    ) -> int | None:
+        """Read a holding register without flipping connection state on failure."""
+        try:
+            result = await self._client.read_holding_registers(
+                address=address,
+                count=1,
+                device_id=self._config.slave_id,
+            )
+            if result.isError():
+                return None
+            return result.registers[0]
+        except Exception:
+            logger.debug("Best-effort holding read failed at %d", address)
+            return None
+
     async def read_state(
         self,
         outdoor_temp_c: float | None = None,
@@ -256,6 +463,8 @@ class SigenergyController:
                     self._warned_absurd_derivation = False
                     house_load_kw = derived
 
+            extended = await self._read_extended_telemetry()
+
             return SystemState(
                 timestamp=now_utc(),
                 soc_pct=soc_pct,
@@ -266,11 +475,178 @@ class SigenergyController:
                 ems_mode=ems_mode or 0,
                 outdoor_temp_c=outdoor_temp_c,
                 occupied=occupied,
+                **extended,
             )
         except Exception:
             logger.exception("Failed to read system state")
             self._connected = False
             return None
+
+    async def _read_extended_telemetry(self) -> dict[str, float | int | None]:
+        """Read the ~35 extended observational registers.
+
+        Purely observational: these don't feed the LP or the control path.
+        Every field is independently allowed to fail — a bad read surfaces
+        as a NULL in the DB rather than failing the tick. Returns a dict
+        that can be splatted into ``SystemState(**extended)``.
+
+        The Sigenergy gateway exposes plant-level aggregates at one
+        slave ID and per-inverter registers at another. All 305xx-306xx
+        and 310xx reads below target the per-inverter slave; 300xx and
+        lifetime counters target the plant slave.
+        """
+        inv = self._config.inverter_slave_id
+
+        # Battery health & thermal (inverter slave)
+        soh_pct = await self._read_input_u16_scaled(
+            REG_INVERTER_ESS_SOH, gain=10, slave_id=inv
+        )
+        cell_temp_avg_c = await self._read_input_s16(
+            REG_INVERTER_ESS_CELL_TEMP_AVG, gain=10, slave_id=inv
+        )
+        cell_temp_max_c = await self._read_input_s16(
+            REG_INVERTER_ESS_CELL_TEMP_MAX, gain=10, slave_id=inv
+        )
+        cell_temp_min_c = await self._read_input_s16(
+            REG_INVERTER_ESS_CELL_TEMP_MIN, gain=10, slave_id=inv
+        )
+        cell_volt_avg_v = await self._read_input_u16_scaled(
+            REG_INVERTER_ESS_CELL_VOLT_AVG, gain=1000, slave_id=inv
+        )
+        cell_volt_max_v = await self._read_input_u16_scaled(
+            REG_INVERTER_ESS_CELL_VOLT_MAX, gain=1000, slave_id=inv
+        )
+        cell_volt_min_v = await self._read_input_u16_scaled(
+            REG_INVERTER_ESS_CELL_VOLT_MIN, gain=1000, slave_id=inv
+        )
+        pcs_temp_c = await self._read_input_s16(
+            REG_INVERTER_PCS_TEMP, gain=10, slave_id=inv
+        )
+
+        # Dynamic power constraints (plant slave)
+        available_charge_kw = await self._read_input_u32(
+            REG_ESS_AVAIL_MAX_CHARGING_POWER, gain=1000
+        )
+        available_discharge_kw = await self._read_input_u32(
+            REG_ESS_AVAIL_MAX_DISCHARGING_POWER, gain=1000
+        )
+
+        # Alarms + running state (inverter slave). These use the
+        # best-effort U16 variant rather than the strict helper above:
+        # the strict helper emits a warning per tick per register on
+        # unsupported firmwares, flooding the log.
+        running_state = await self._read_input_u16_best_effort(
+            REG_INVERTER_RUNNING_STATE, slave_id=inv
+        )
+        alarm1 = await self._read_input_u16_best_effort(REG_INVERTER_ALARM1, slave_id=inv)
+        alarm2 = await self._read_input_u16_best_effort(REG_INVERTER_ALARM2, slave_id=inv)
+        alarm3 = await self._read_input_u16_best_effort(REG_INVERTER_ALARM3, slave_id=inv)
+        alarm4 = await self._read_input_u16_best_effort(REG_INVERTER_ALARM4, slave_id=inv)
+        alarm5 = await self._read_input_u16_best_effort(REG_INVERTER_ALARM5, slave_id=inv)
+
+        # Lifetime energy counters (plant slave)
+        lifetime_pv_kwh = await self._read_input_u64(REG_LIFETIME_PV_KWH, gain=100)
+        lifetime_load_kwh = await self._read_input_u64(
+            REG_LIFETIME_LOAD_KWH, gain=100
+        )
+        lifetime_charge_kwh = await self._read_input_u64(
+            REG_LIFETIME_CHARGE_KWH, gain=100
+        )
+        lifetime_discharge_kwh = await self._read_input_u64(
+            REG_LIFETIME_DISCHARGE_KWH, gain=100
+        )
+        lifetime_import_kwh = await self._read_input_u64(
+            REG_LIFETIME_IMPORT_KWH, gain=100
+        )
+        lifetime_export_kwh = await self._read_input_u64(
+            REG_LIFETIME_EXPORT_KWH, gain=100
+        )
+
+        # Per-MPPT strings (inverter slave)
+        mppt1_voltage_v = await self._read_input_s16(
+            REG_INVERTER_PV1_VOLTAGE, gain=10, slave_id=inv
+        )
+        mppt1_current_a = await self._read_input_s16(
+            REG_INVERTER_PV1_CURRENT, gain=100, slave_id=inv
+        )
+        mppt2_voltage_v = await self._read_input_s16(
+            REG_INVERTER_PV2_VOLTAGE, gain=10, slave_id=inv
+        )
+        mppt2_current_a = await self._read_input_s16(
+            REG_INVERTER_PV2_CURRENT, gain=100, slave_id=inv
+        )
+        mppt3_voltage_v = await self._read_input_s16(
+            REG_INVERTER_PV3_VOLTAGE, gain=10, slave_id=inv
+        )
+        mppt3_current_a = await self._read_input_s16(
+            REG_INVERTER_PV3_CURRENT, gain=100, slave_id=inv
+        )
+        mppt4_voltage_v = await self._read_input_s16(
+            REG_INVERTER_PV4_VOLTAGE, gain=10, slave_id=inv
+        )
+        mppt4_current_a = await self._read_input_s16(
+            REG_INVERTER_PV4_CURRENT, gain=100, slave_id=inv
+        )
+
+        # Grid AC quality (inverter slave)
+        grid_freq_hz = await self._read_input_u16_scaled(
+            REG_INVERTER_GRID_FREQ, gain=100, slave_id=inv
+        )
+        phase_a_voltage_v = await self._read_input_u32(
+            REG_INVERTER_PHASE_A_VOLT, gain=100, slave_id=inv
+        )
+        phase_b_voltage_v = await self._read_input_u32(
+            REG_INVERTER_PHASE_B_VOLT, gain=100, slave_id=inv
+        )
+        phase_c_voltage_v = await self._read_input_u32(
+            REG_INVERTER_PHASE_C_VOLT, gain=100, slave_id=inv
+        )
+
+        # Readback of holding reg 40031 (plant slave) — what the inverter
+        # currently has as its commanded remote EMS mode. Closes the
+        # loop against our writes; diverging from our last write is a
+        # red flag.
+        remote_ems_mode = await self._read_holding_u16_best_effort(
+            REG_REMOTE_EMS_CONTROL_MODE
+        )
+
+        return {
+            "soh_pct": soh_pct,
+            "cell_temp_avg_c": cell_temp_avg_c,
+            "cell_temp_max_c": cell_temp_max_c,
+            "cell_temp_min_c": cell_temp_min_c,
+            "cell_volt_avg_v": cell_volt_avg_v,
+            "cell_volt_max_v": cell_volt_max_v,
+            "cell_volt_min_v": cell_volt_min_v,
+            "pcs_temp_c": pcs_temp_c,
+            "available_charge_kw": available_charge_kw,
+            "available_discharge_kw": available_discharge_kw,
+            "running_state": running_state,
+            "alarm1": alarm1,
+            "alarm2": alarm2,
+            "alarm3": alarm3,
+            "alarm4": alarm4,
+            "alarm5": alarm5,
+            "lifetime_pv_kwh": lifetime_pv_kwh,
+            "lifetime_load_kwh": lifetime_load_kwh,
+            "lifetime_charge_kwh": lifetime_charge_kwh,
+            "lifetime_discharge_kwh": lifetime_discharge_kwh,
+            "lifetime_import_kwh": lifetime_import_kwh,
+            "lifetime_export_kwh": lifetime_export_kwh,
+            "mppt1_voltage_v": mppt1_voltage_v,
+            "mppt1_current_a": mppt1_current_a,
+            "mppt2_voltage_v": mppt2_voltage_v,
+            "mppt2_current_a": mppt2_current_a,
+            "mppt3_voltage_v": mppt3_voltage_v,
+            "mppt3_current_a": mppt3_current_a,
+            "mppt4_voltage_v": mppt4_voltage_v,
+            "mppt4_current_a": mppt4_current_a,
+            "grid_freq_hz": grid_freq_hz,
+            "phase_a_voltage_v": phase_a_voltage_v,
+            "phase_b_voltage_v": phase_b_voltage_v,
+            "phase_c_voltage_v": phase_c_voltage_v,
+            "remote_ems_mode": remote_ems_mode,
+        }
 
     # ── Write Methods ────────────────────────────────────────────
 

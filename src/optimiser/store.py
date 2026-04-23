@@ -35,25 +35,64 @@ CURRENT_SCHEMA_VERSION = 2
 
 TELEMETRY_DDL = """
 CREATE TABLE IF NOT EXISTS telemetry (
-    ts              TIMESTAMPTZ NOT NULL,
-    soc_pct         REAL,
-    battery_kw      REAL,
-    pv_kw           REAL,
-    grid_kw         REAL,
-    grid_kw_shelly  REAL,
-    house_load_kw   REAL,
-    import_price    REAL,
-    export_price    REAL,
-    spot_price      REAL,
-    renewables_pct  REAL,
-    spike_status    VARCHAR,
-    pv_forecast_kw  REAL,
-    outdoor_temp_c  REAL,
-    occupied        BOOLEAN,
-    ems_mode        INTEGER,
-    planner_action  VARCHAR,
-    planner_reason  VARCHAR,
-    schema_version  INTEGER
+    ts                     TIMESTAMPTZ NOT NULL,
+    soc_pct                REAL,
+    battery_kw             REAL,
+    pv_kw                  REAL,
+    grid_kw                REAL,
+    grid_kw_shelly         REAL,
+    house_load_kw          REAL,
+    import_price           REAL,
+    export_price           REAL,
+    spot_price             REAL,
+    renewables_pct         REAL,
+    spike_status           VARCHAR,
+    pv_forecast_kw         REAL,
+    outdoor_temp_c         REAL,
+    occupied               BOOLEAN,
+    ems_mode               INTEGER,
+    planner_action         VARCHAR,
+    planner_reason         VARCHAR,
+    schema_version         INTEGER,
+    -- Extended inverter telemetry: purely observational, LP does not read
+    -- these. Captured now so future backtests / models can use the history.
+    soh_pct                REAL,
+    cell_temp_avg_c        REAL,
+    cell_temp_max_c        REAL,
+    cell_temp_min_c        REAL,
+    cell_volt_avg_v        REAL,
+    cell_volt_max_v        REAL,
+    cell_volt_min_v        REAL,
+    pcs_temp_c             REAL,
+    available_charge_kw    REAL,
+    available_discharge_kw REAL,
+    running_state          INTEGER,
+    alarm1                 INTEGER,
+    alarm2                 INTEGER,
+    alarm3                 INTEGER,
+    alarm4                 INTEGER,
+    alarm5                 INTEGER,
+    -- Lifetime energy counters: DOUBLE (float64) because REAL loses
+    -- precision around 10^7 kWh.
+    lifetime_pv_kwh        DOUBLE,
+    lifetime_load_kwh      DOUBLE,
+    lifetime_charge_kwh    DOUBLE,
+    lifetime_discharge_kwh DOUBLE,
+    lifetime_import_kwh    DOUBLE,
+    lifetime_export_kwh    DOUBLE,
+    mppt1_voltage_v        REAL,
+    mppt1_current_a        REAL,
+    mppt2_voltage_v        REAL,
+    mppt2_current_a        REAL,
+    mppt3_voltage_v        REAL,
+    mppt3_current_a        REAL,
+    mppt4_voltage_v        REAL,
+    mppt4_current_a        REAL,
+    grid_freq_hz           REAL,
+    phase_a_voltage_v      REAL,
+    phase_b_voltage_v      REAL,
+    phase_c_voltage_v      REAL,
+    remote_ems_mode        INTEGER
 );
 """
 
@@ -76,6 +115,44 @@ CREATE TABLE IF NOT EXISTS load_telemetry (
 TELEMETRY_MIGRATIONS = [
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS schema_version INTEGER",
     "ALTER TABLE load_telemetry ADD COLUMN IF NOT EXISTS schema_version INTEGER",
+    # Extended inverter telemetry (2026-04). ADD COLUMN IF NOT EXISTS
+    # leaves legacy rows with NULL, which is the correct representation
+    # of "this field wasn't captured when that row was written."
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS soh_pct                REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_temp_avg_c        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_temp_max_c        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_temp_min_c        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_volt_avg_v        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_volt_max_v        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_volt_min_v        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS pcs_temp_c             REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_charge_kw    REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_discharge_kw REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS running_state          INTEGER",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS alarm1                 INTEGER",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS alarm2                 INTEGER",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS alarm3                 INTEGER",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS alarm4                 INTEGER",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS alarm5                 INTEGER",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS lifetime_pv_kwh        DOUBLE",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS lifetime_load_kwh      DOUBLE",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS lifetime_charge_kwh    DOUBLE",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS lifetime_discharge_kwh DOUBLE",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS lifetime_import_kwh    DOUBLE",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS lifetime_export_kwh    DOUBLE",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt1_voltage_v        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt1_current_a        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt2_voltage_v        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt2_current_a        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt3_voltage_v        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt3_current_a        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt4_voltage_v        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS mppt4_current_a        REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS grid_freq_hz           REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS phase_a_voltage_v      REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS phase_b_voltage_v      REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS phase_c_voltage_v      REAL",
+    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS remote_ems_mode        INTEGER",
 ]
 
 PV_FORECAST_LOG_DDL = """
@@ -108,7 +185,7 @@ CREATE TABLE IF NOT EXISTS price_forecast_log (
     interval_end        TIMESTAMPTZ NOT NULL,
     interval_type       VARCHAR,                 -- ActualInterval / CurrentInterval / ForecastInterval
     per_kwh             REAL,                    -- AEMO point estimate (general channel)
-    export_per_kwh      REAL,                    -- feedIn channel perKwh
+    export_per_kwh      REAL,                    -- feedIn revenue to customer (sign-flipped from Amber's raw)
     spot_per_kwh        REAL,
     forecast_predicted  REAL,                    -- Amber advancedPrice.predicted
     forecast_low        REAL,                    -- Amber advancedPrice.low
@@ -119,7 +196,6 @@ CREATE TABLE IF NOT EXISTS price_forecast_log (
     renewables_pct      REAL
 );
 """
-
 
 class TelemetryStore:
     """DuckDB-backed telemetry persistence with a write-ahead buffer.
@@ -234,9 +310,35 @@ class TelemetryStore:
             self._pending_load.popleft()
 
     def _do_write_telemetry(self, row: TelemetryRow) -> None:
+        # Named-column insert so adding columns to the DDL can't silently
+        # misalign values. Order below must match the column list.
         self._db.execute(
-            """INSERT INTO telemetry VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            """INSERT INTO telemetry (
+                ts, soc_pct, battery_kw, pv_kw, grid_kw, grid_kw_shelly,
+                house_load_kw, import_price, export_price, spot_price,
+                renewables_pct, spike_status, pv_forecast_kw, outdoor_temp_c,
+                occupied, ems_mode, planner_action, planner_reason,
+                schema_version,
+                soh_pct, cell_temp_avg_c, cell_temp_max_c, cell_temp_min_c,
+                cell_volt_avg_v, cell_volt_max_v, cell_volt_min_v, pcs_temp_c,
+                available_charge_kw, available_discharge_kw,
+                running_state, alarm1, alarm2, alarm3, alarm4, alarm5,
+                lifetime_pv_kwh, lifetime_load_kwh,
+                lifetime_charge_kwh, lifetime_discharge_kwh,
+                lifetime_import_kwh, lifetime_export_kwh,
+                mppt1_voltage_v, mppt1_current_a,
+                mppt2_voltage_v, mppt2_current_a,
+                mppt3_voltage_v, mppt3_current_a,
+                mppt4_voltage_v, mppt4_current_a,
+                grid_freq_hz,
+                phase_a_voltage_v, phase_b_voltage_v, phase_c_voltage_v,
+                remote_ems_mode
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?
             )""",
             [
                 row.ts,
@@ -258,6 +360,41 @@ class TelemetryStore:
                 row.planner_action,
                 row.planner_reason,
                 CURRENT_SCHEMA_VERSION,
+                row.soh_pct,
+                row.cell_temp_avg_c,
+                row.cell_temp_max_c,
+                row.cell_temp_min_c,
+                row.cell_volt_avg_v,
+                row.cell_volt_max_v,
+                row.cell_volt_min_v,
+                row.pcs_temp_c,
+                row.available_charge_kw,
+                row.available_discharge_kw,
+                row.running_state,
+                row.alarm1,
+                row.alarm2,
+                row.alarm3,
+                row.alarm4,
+                row.alarm5,
+                row.lifetime_pv_kwh,
+                row.lifetime_load_kwh,
+                row.lifetime_charge_kwh,
+                row.lifetime_discharge_kwh,
+                row.lifetime_import_kwh,
+                row.lifetime_export_kwh,
+                row.mppt1_voltage_v,
+                row.mppt1_current_a,
+                row.mppt2_voltage_v,
+                row.mppt2_current_a,
+                row.mppt3_voltage_v,
+                row.mppt3_current_a,
+                row.mppt4_voltage_v,
+                row.mppt4_current_a,
+                row.grid_freq_hz,
+                row.phase_a_voltage_v,
+                row.phase_b_voltage_v,
+                row.phase_c_voltage_v,
+                row.remote_ems_mode,
             ],
         )
 

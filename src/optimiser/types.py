@@ -185,6 +185,64 @@ class SystemState:
     outdoor_temp_c: float | None
     occupied: bool
 
+    # ── Extended inverter telemetry (added 2026-04 for backtest coverage) ──
+    # All optional: older call sites and tests may omit these. When the
+    # Sigenergy read fails or the register is unsupported on a given
+    # firmware, the field stays None (null-over-wrong).
+
+    # Battery health & thermal
+    soh_pct: float | None = None
+    cell_temp_avg_c: float | None = None
+    cell_temp_max_c: float | None = None
+    cell_temp_min_c: float | None = None
+    cell_volt_avg_v: float | None = None
+    cell_volt_max_v: float | None = None
+    cell_volt_min_v: float | None = None
+    pcs_temp_c: float | None = None
+
+    # BMS-reported real-time power limits. Drop below nameplate when the
+    # battery is cold, near SOC floor/ceiling, or thermally derated.
+    available_charge_kw: float | None = None
+    available_discharge_kw: float | None = None
+
+    # Plant state + alarms (bitfields; decode against Appendices 1-5, 11)
+    running_state: int | None = None
+    alarm1: int | None = None
+    alarm2: int | None = None
+    alarm3: int | None = None
+    alarm4: int | None = None
+    alarm5: int | None = None
+
+    # Monotonic lifetime energy counters (kWh). Stored as DOUBLE because
+    # REAL (float32) loses precision at ~10^7 kWh.
+    lifetime_pv_kwh: float | None = None
+    lifetime_load_kwh: float | None = None
+    lifetime_charge_kwh: float | None = None
+    lifetime_discharge_kwh: float | None = None
+    lifetime_import_kwh: float | None = None
+    lifetime_export_kwh: float | None = None
+
+    # Per-MPPT string voltage/current. Null if the inverter has fewer
+    # than 4 strings wired or the register read fails.
+    mppt1_voltage_v: float | None = None
+    mppt1_current_a: float | None = None
+    mppt2_voltage_v: float | None = None
+    mppt2_current_a: float | None = None
+    mppt3_voltage_v: float | None = None
+    mppt3_current_a: float | None = None
+    mppt4_voltage_v: float | None = None
+    mppt4_current_a: float | None = None
+
+    # Grid AC quality
+    grid_freq_hz: float | None = None
+    phase_a_voltage_v: float | None = None
+    phase_b_voltage_v: float | None = None
+    phase_c_voltage_v: float | None = None
+
+    # Readback of holding reg 40031 (what the inverter currently has as
+    # its commanded remote EMS mode). Closes the loop against our writes.
+    remote_ems_mode: int | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class ManagedLoadStatus:
@@ -282,6 +340,45 @@ class TelemetryRow:
     ems_mode: int | None
     planner_action: str | None
     planner_reason: str | None
+
+    # ── Extended inverter telemetry (added 2026-04 for backtest coverage) ──
+    # Mirrors the SystemState additions. All optional; older writers and
+    # tests may omit these.
+    soh_pct: float | None = None
+    cell_temp_avg_c: float | None = None
+    cell_temp_max_c: float | None = None
+    cell_temp_min_c: float | None = None
+    cell_volt_avg_v: float | None = None
+    cell_volt_max_v: float | None = None
+    cell_volt_min_v: float | None = None
+    pcs_temp_c: float | None = None
+    available_charge_kw: float | None = None
+    available_discharge_kw: float | None = None
+    running_state: int | None = None
+    alarm1: int | None = None
+    alarm2: int | None = None
+    alarm3: int | None = None
+    alarm4: int | None = None
+    alarm5: int | None = None
+    lifetime_pv_kwh: float | None = None
+    lifetime_load_kwh: float | None = None
+    lifetime_charge_kwh: float | None = None
+    lifetime_discharge_kwh: float | None = None
+    lifetime_import_kwh: float | None = None
+    lifetime_export_kwh: float | None = None
+    mppt1_voltage_v: float | None = None
+    mppt1_current_a: float | None = None
+    mppt2_voltage_v: float | None = None
+    mppt2_current_a: float | None = None
+    mppt3_voltage_v: float | None = None
+    mppt3_current_a: float | None = None
+    mppt4_voltage_v: float | None = None
+    mppt4_current_a: float | None = None
+    grid_freq_hz: float | None = None
+    phase_a_voltage_v: float | None = None
+    phase_b_voltage_v: float | None = None
+    phase_c_voltage_v: float | None = None
+    remote_ems_mode: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

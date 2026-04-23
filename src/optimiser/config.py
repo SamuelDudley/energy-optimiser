@@ -39,7 +39,14 @@ class SolcastConfig:
 class SigenergyConfig:
     host: str
     port: int = 502
-    slave_id: int = 1
+    # The Sigenergy gateway exposes plant-level aggregates on one slave
+    # ID (default 247 per HA integration) and per-inverter registers on
+    # another (default 1 for a single-inverter install). Plant registers
+    # are preferred for aggregates (SOC, grid power, lifetime counters);
+    # per-inverter registers are required for cell temps, SOH, MPPT
+    # strings, AC quality — they don't exist at the plant address.
+    slave_id: int = 247
+    inverter_slave_id: int = 1
 
 
 @dataclass(frozen=True, slots=True)

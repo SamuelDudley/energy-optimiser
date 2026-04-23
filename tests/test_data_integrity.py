@@ -139,6 +139,104 @@ class TestSchemaVersion:
         assert "schema_version" in col_names
 
 
+# ── Extended inverter telemetry (2026-04) ───────────────────────
+
+
+class TestExtendedInverterFields:
+    """Round-trip tests for the extended observational columns added for
+    backtest data coverage (battery thermal, alarms, lifetime counters,
+    per-MPPT, grid quality, commanded-mode readback)."""
+
+    def test_extended_fields_round_trip(self) -> None:
+        store = _store()
+        ts = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+        row = TelemetryRow(
+            ts=ts,
+            soc_pct=50.0,
+            battery_kw=0.0,
+            pv_kw=0.0,
+            grid_kw=1.0,
+            grid_kw_shelly=1.0,
+            house_load_kw=1.0,
+            import_price=20.0,
+            export_price=5.0,
+            spot_price=6.0,
+            renewables_pct=40.0,
+            spike_status="none",
+            pv_forecast_kw=0.0,
+            outdoor_temp_c=20.0,
+            occupied=True,
+            ems_mode=7,
+            planner_action="self_consume",
+            planner_reason="test",
+            soh_pct=99.2,
+            cell_temp_avg_c=22.4,
+            cell_temp_max_c=23.1,
+            cell_temp_min_c=21.7,
+            cell_volt_avg_v=3.35,
+            cell_volt_max_v=3.40,
+            cell_volt_min_v=3.30,
+            pcs_temp_c=35.5,
+            available_charge_kw=8.2,
+            available_discharge_kw=9.1,
+            running_state=1,
+            alarm1=0,
+            alarm2=0,
+            alarm3=0,
+            alarm4=0,
+            alarm5=0,
+            lifetime_pv_kwh=12345.67,
+            lifetime_load_kwh=8765.43,
+            lifetime_charge_kwh=4321.0,
+            lifetime_discharge_kwh=4100.5,
+            lifetime_import_kwh=2000.0,
+            lifetime_export_kwh=1500.0,
+            mppt1_voltage_v=420.3,
+            mppt1_current_a=6.1,
+            mppt2_voltage_v=415.7,
+            mppt2_current_a=5.9,
+            mppt3_voltage_v=None,
+            mppt3_current_a=None,
+            mppt4_voltage_v=None,
+            mppt4_current_a=None,
+            grid_freq_hz=50.01,
+            phase_a_voltage_v=239.4,
+            phase_b_voltage_v=240.1,
+            phase_c_voltage_v=238.9,
+            remote_ems_mode=2,
+        )
+        store.write_telemetry(row)
+
+        out = store.connection.execute(
+            """SELECT soh_pct, cell_temp_avg_c, available_charge_kw,
+                      lifetime_pv_kwh, mppt1_voltage_v, mppt3_voltage_v,
+                      grid_freq_hz, remote_ems_mode, alarm1
+               FROM telemetry"""
+        ).fetchone()
+        assert out[0] == pytest.approx(99.2)
+        assert out[1] == pytest.approx(22.4)
+        assert out[2] == pytest.approx(8.2)
+        # Lifetime counters stored as DOUBLE → full precision preserved.
+        assert out[3] == pytest.approx(12345.67)
+        assert out[4] == pytest.approx(420.3)
+        assert out[5] is None
+        assert out[6] == pytest.approx(50.01)
+        assert out[7] == 2
+        assert out[8] == 0
+
+    def test_legacy_row_without_extended_fields(self) -> None:
+        """A row constructed with only legacy fields still writes cleanly;
+        new columns come back as NULL."""
+        store = _store()
+        ts = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+        store.write_telemetry(_row(ts))  # _row omits every extended field
+
+        out = store.connection.execute(
+            "SELECT soh_pct, lifetime_pv_kwh, remote_ems_mode FROM telemetry"
+        ).fetchone()
+        assert out == (None, None, None)
+
+
 # ── #5: DuckDB write buffer ──────────────────────────────────────
 
 
