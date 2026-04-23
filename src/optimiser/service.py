@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
 from .api import APIServer
+from .api.metrics import Metrics
 from .clients.amber import AmberClient
 from .clients.bom import BOMClient
 from .clients.shelly import ManagedLoadManager
@@ -68,6 +70,7 @@ class Service:
         self._store = TelemetryStore(config.storage)
         self._state_machine = StateMachine()
         self._snapshots = SnapshotWriter(config.storage.snapshot_dir)
+        self._metrics = Metrics()
         self._api_server = APIServer(config.api, self)
 
         # LP runtime — shared with the verification watcher.
@@ -255,6 +258,21 @@ class Service:
         logger.info("Service stopped")
 
     async def _tick(self) -> None:
+        """Wrap the real tick to capture wall-clock duration and error
+        status in metrics. The exception is re-raised so the wake loop's
+        own error handling still fires."""
+        t0 = time.monotonic()
+        errored = False
+        try:
+            await self._tick_body()
+        except Exception:
+            errored = True
+            raise
+        finally:
+            duration_ms = (time.monotonic() - t0) * 1000.0
+            self._metrics.record_tick_end(duration_ms, errored)
+
+    async def _tick_body(self) -> None:
         """Execute one planning tick."""
         tick_id = new_tick_id()
         now = now_utc()
@@ -368,7 +386,9 @@ class Service:
             and lp_dispatch is not None
         ):
             apply_ok = await self._sigenergy.apply_lp_dispatch(lp_dispatch)
+            self._metrics.record_dispatch_write(apply_ok)
             if apply_ok:
+                self._metrics.record_dispatch(lp_dispatch)
                 await self._lp_runtime.record_command(lp_dispatch)
                 # Probe succeeded at the apply level. Don't clear the latch
                 # here — the watcher does that after `clean_probe_threshold`
@@ -569,7 +589,21 @@ class Service:
         # Cheap (no network), purely from state we already have in hand.
         self._check_curtailment(state, tick_id)
 
-        # 15. Heartbeat — update the mtime of the file the external watchdog
+        # 15. Update Prometheus gauges from the state we've already read.
+        # Done before the heartbeat touch so a scrape between tick end
+        # and heartbeat_age_s=0 can never see a state/heartbeat pair
+        # that contradicts (age=0 but stale state).
+        self._metrics.record_live_state(
+            state=state,
+            current_import_price=current_import,
+            current_export_price=current_export,
+            sigenergy_connected=self._sigenergy.connected,
+            service_state=self._state_machine.state.value,
+            circuit_breaker_open=self._lp_runtime.breaker.latched,
+            heartbeat_age_s=None,  # derived at scrape time from file mtime
+        )
+
+        # 16. Heartbeat — update the mtime of the file the external watchdog
         # polls. This is the liveness signal that tells the watchdog "the
         # tick loop is still running". Touching happens here, at the end of
         # a successful tick, so an LP failure or Modbus hang earlier in the
@@ -625,6 +659,10 @@ class Service:
     def db_connection(self):  # duckdb.DuckDBPyConnection — avoid import cost here
         return self._store.connection
 
+    @property
+    def metrics(self) -> Metrics:
+        return self._metrics
+
     # ── LP Execution ─────────────────────────────────────────────
 
     async def _run_lp(
@@ -648,6 +686,7 @@ class Service:
         On any failure path: triggers `trigger_fallback`, latches the
         breaker, emits BREAKER_LATCHED, returns `(None, None)`.
         """
+        t0 = time.monotonic()
         try:
             solution = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -664,12 +703,21 @@ class Service:
                 timeout=self._config.planner.lp_wall_clock_timeout_s,
             )
         except TimeoutError:
+            self._metrics.record_lp_solve("timeout", (time.monotonic() - t0) * 1000.0)
             await self._lp_fallback(FallbackReason.LP_TIMEOUT)
             return None, None
         except Exception:
             logger.exception("LP solve raised unexpectedly")
+            self._metrics.record_lp_solve("error", (time.monotonic() - t0) * 1000.0)
             await self._lp_fallback(FallbackReason.LP_ERROR)
             return None, None
+
+        # solve_time_ms comes from the solver itself (wall-clock inside
+        # the thread); prefer it over our wait_for measurement because
+        # it excludes thread-scheduling overhead.
+        self._metrics.record_lp_solve(
+            solution.status.value.lower(), float(solution.solve_time_ms)
+        )
 
         emit(
             EventType.LP_SOLVE_COMPLETE,
@@ -721,6 +769,7 @@ class Service:
             export_price_ckwh=export_price,
         )
         await self._lp_runtime.latch(reason)
+        self._metrics.record_circuit_breaker_trip(reason.value)
         emit(EventType.BREAKER_LATCHED, {"reason": reason.value})
 
     # ── Data Fetching ────────────────────────────────────────────

@@ -81,6 +81,13 @@ def _make_service() -> Service:
     svc._lp_runtime = LPRuntime()
     svc._lp_loads = []  # No managed loads → simpler LP, no LoadCommand churn
 
+    # Metrics — `_run_lp` and `_lp_fallback` record to this; a real
+    # instance is cheap and avoids sprinkling MagicMock no-ops across
+    # every recording call site.
+    from optimiser.api.metrics import Metrics
+
+    svc._metrics = Metrics()
+
     # Config — `battery` and `planner` are read by `_run_lp`
     svc._config = MagicMock()
     svc._config.battery = BatteryConfig()

@@ -18,6 +18,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from optimiser.api.auth import make_auth_middleware
 from optimiser.api.handlers.discovery import TABLE_DESCRIPTIONS, root, table_schema
 from optimiser.api.handlers.health import healthz, readyz
+from optimiser.api.handlers.metrics import metrics as metrics_handler
+from optimiser.api.metrics import Metrics
 from optimiser.api.probe import SERVICE_PROBE_KEY
 
 TOKEN = "test-token-xyz"
@@ -31,6 +33,11 @@ class _Probe:
     sigenergy_connected: bool = True
     version: str = "0.2.0-test"
     db_connection: duckdb.DuckDBPyConnection | None = None
+    metrics: Metrics | None = None
+
+    def __post_init__(self) -> None:
+        if self.metrics is None:
+            self.metrics = Metrics()
 
 
 def _fresh_heartbeat(tmp_path: Path) -> Path:
@@ -56,6 +63,7 @@ def _build_app(probe: _Probe) -> web.Application:
     app.router.add_get("/", root)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", readyz)
+    app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/{table}/schema", table_schema)
     return app
 
@@ -259,3 +267,105 @@ class TestTableSchema:
             # URL-encoded semicolon + DROP would be a real attack shape.
             r = await c.get("/telemetry;%20DROP%20TABLE/schema", headers=_auth())
             assert r.status == 404
+
+
+class TestMetrics:
+    async def test_metrics_requires_auth(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/metrics")
+            assert r.status == 401
+
+    async def test_empty_metrics_expose_zero_valued_families(
+        self, tmp_path: Path
+    ) -> None:
+        """A brand-new registry renders zero-valued counters and HELP/TYPE
+        lines for everything we declared. Proves the handler wires up."""
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/metrics", headers=_auth())
+            assert r.status == 200
+            assert r.headers["Content-Type"].startswith("text/plain")
+            body = await r.text()
+            # Sanity: every metric name we declared should appear as a
+            # HELP line, whether or not a sample exists yet.
+            for name in (
+                "eo_battery_soc_pct",
+                "eo_battery_power_kw",
+                "eo_pv_power_kw",
+                "eo_house_load_kw",
+                "eo_grid_power_kw",
+                "eo_lp_solves_total",
+                "eo_dispatch_writes_total",
+                "eo_circuit_breaker_trips_total",
+                "eo_lp_solve_duration_ms",
+                "eo_tick_duration_ms",
+            ):
+                assert f"# HELP {name}" in body, name
+
+    async def test_recorded_values_show_up(self, tmp_path: Path) -> None:
+        metrics = Metrics()
+        metrics.soc_pct.set(62.5)
+        metrics.record_lp_solve("optimal", 1234.5)
+        metrics.record_lp_solve("optimal", 800.0)
+        metrics.record_dispatch_write(True)
+        metrics.record_dispatch_write(False)
+        metrics.record_circuit_breaker_trip("lp_timeout")
+
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), metrics=metrics
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/metrics", headers=_auth())
+            body = await r.text()
+            assert "eo_battery_soc_pct 62.5" in body
+            assert 'eo_lp_solves_total{status="optimal"} 2.0' in body
+            assert 'eo_dispatch_writes_total{result="success"} 1.0' in body
+            assert 'eo_dispatch_writes_total{result="failure"} 1.0' in body
+            assert 'eo_circuit_breaker_trips_total{reason="lp_timeout"} 1.0' in body
+            # Histogram bucket lines
+            assert "eo_lp_solve_duration_ms_bucket" in body
+            assert "eo_lp_solve_duration_ms_count 2.0" in body
+
+    async def test_heartbeat_age_is_derived_at_scrape_time(
+        self, tmp_path: Path
+    ) -> None:
+        """The handler computes heartbeat_age from file mtime each scrape
+        — no need for the tick loop to update it inline."""
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/metrics", headers=_auth())
+            body = await r.text()
+            # Freshly-touched file → small value.
+            assert "eo_heartbeat_age_seconds" in body
+
+    async def test_state_machine_multiseries_reflects_current_state(
+        self, tmp_path: Path
+    ) -> None:
+        metrics = Metrics()
+        # Mock a SystemState with the fields record_live_state reads.
+        from unittest.mock import MagicMock
+
+        state = MagicMock()
+        state.soc_pct = 70.0
+        state.battery_power_kw = 1.5
+        state.pv_power_kw = 3.2
+        state.house_load_kw = 0.8
+        state.grid_power_kw = 0.1
+        metrics.record_live_state(
+            state=state,
+            current_import_price=20.0,
+            current_export_price=5.0,
+            sigenergy_connected=True,
+            service_state="ACTIVE",
+            circuit_breaker_open=False,
+            heartbeat_age_s=None,
+        )
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), metrics=metrics
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/metrics", headers=_auth())
+            body = await r.text()
+            assert 'eo_state_machine_state{state="ACTIVE"} 1.0' in body
+            assert 'eo_state_machine_state{state="FALLBACK"} 0.0' in body

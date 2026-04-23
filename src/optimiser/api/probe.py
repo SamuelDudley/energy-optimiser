@@ -12,6 +12,8 @@ from typing import Protocol, runtime_checkable
 import duckdb
 from aiohttp import web
 
+from .metrics import Metrics
+
 
 @runtime_checkable
 class ServiceProbe(Protocol):
@@ -26,6 +28,7 @@ class ServiceProbe(Protocol):
     service_state: str  # ServiceState.value
     sigenergy_connected: bool
     db_connection: duckdb.DuckDBPyConnection
+    metrics: Metrics
 
 
 # Typed app key — handlers retrieve the probe via
