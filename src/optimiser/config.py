@@ -45,8 +45,12 @@ class SigenergyConfig:
 @dataclass(frozen=True, slots=True)
 class BatteryConfig:
     capacity_kwh: float = 40.0
-    soc_floor_pct: float = 10.0
+    soc_floor_pct: float = 15.0
     soc_ceiling_pct: float = 95.0
+    # Backup SOC reserved for grid-outage. Hardware (reg 40046) refuses to
+    # discharge below this even when grid is present. Effective LP floor is
+    # max(soc_floor_pct, backup_soc_pct).
+    backup_soc_pct: float = 15.0
     max_ac_charge_kw: float = 10.0  # Grid import limit (AC-coupled)
     max_dc_charge_kw: float = 13.0  # Solar charge limit (DC-coupled, ~PV array size)
     max_discharge_kw: float = 10.0

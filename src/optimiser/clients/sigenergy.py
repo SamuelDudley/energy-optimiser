@@ -60,6 +60,7 @@ REG_REMOTE_EMS_CONTROL_MODE = 40031  # U16: RemoteEMSControlMode
 REG_ESS_MAX_CHARGING_LIMIT = 40032  # U32, gain=1000, kW
 REG_ESS_MAX_DISCHARGING_LIMIT = 40034  # U32, gain=1000, kW
 REG_GRID_EXPORT_LIMIT = 40038  # U32, gain=1000, kW
+REG_BACKUP_SOC = 40046  # U16, gain=10, % — backup reserve for blackouts
 REG_CHARGE_CUTOFF_SOC = 40047  # U16, gain=10, %
 REG_DISCHARGE_CUTOFF_SOC = 40048  # U16, gain=10, %
 
@@ -336,6 +337,36 @@ class SigenergyController:
         if ok:
             self._remote_ems_enabled = False
             logger.info("Remote EMS disabled")
+        return ok
+
+    async def assert_battery_soc_limits(self) -> bool:
+        """Write hardware SOC limits from `BatteryConfig`.
+
+        These three registers are honoured by the inverter regardless of
+        EMS mode — which means they're the only way to stop mode 2 (or
+        any other local mode) from charging past the ceiling or
+        discharging past the floor. Writes are idempotent, so calling
+        this from startup and periodically (watchdog-style) is safe.
+
+        - 40046 backup SOC: reserve held for blackouts (never discharged
+          to below this when grid is up).
+        - 40047 charge cutoff SOC: hard upper bound on charging.
+        - 40048 discharge cutoff SOC: hard lower bound on on-grid
+          discharge (also a safety stop).
+        """
+        ceiling_raw = int(self._battery.soc_ceiling_pct * 10)
+        floor_raw = int(self._battery.soc_floor_pct * 10)
+        backup_raw = int(self._battery.backup_soc_pct * 10)
+        logger.info(
+            "Asserting battery SOC limits: ceiling=%.1f%% floor=%.1f%% backup=%.1f%%",
+            self._battery.soc_ceiling_pct,
+            self._battery.soc_floor_pct,
+            self._battery.backup_soc_pct,
+        )
+        ok = True
+        ok &= await self._write_u16(REG_CHARGE_CUTOFF_SOC, ceiling_raw)
+        ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, floor_raw)
+        ok &= await self._write_u16(REG_BACKUP_SOC, backup_raw)
         return ok
 
     async def apply(self, command: PlannerOutput, tick_id: str | None = None) -> bool:

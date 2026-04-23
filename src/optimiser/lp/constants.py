@@ -81,6 +81,18 @@ ROLL_FORWARD_CAP_MULTIPLIER: float = 2.0
 WEAR_COST_PER_KWH: float = 2.5
 
 
+# ── SOC out-of-band penalty ──────────────────────────────────────
+#
+# Applied per %-slot of slack when SOC is outside [effective_floor,
+# soc_ceiling_pct]. Cost-term units are cents: a price × kWh product.
+# Normal slot cost is ~0.1–1.0 cent (sub-kWh at sub-dollar prices).
+# Setting the penalty to 1e4 per unit-of-slack-per-slot means: even a
+# single-slot 0.1%-of-SOC overshoot costs ~10 cents, more than any
+# arbitrage gain — yet stays well below big-M numerical limits.
+# The LP will always prefer returning to band, without infeasibility.
+SOC_BOUND_PENALTY: float = 1e4
+
+
 # ── Solver ───────────────────────────────────────────────────────
 
 # Hard wall-clock limit for the LP solve. Past this, the optimiser falls

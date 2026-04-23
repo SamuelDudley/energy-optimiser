@@ -27,6 +27,7 @@ from .constants import (
     DEFAULT_SCENARIO_WEIGHTS,
     HORIZON_HOURS,
     SLOT_MINUTES,
+    SOC_BOUND_PENALTY,
     TERMINAL_SOC_FLOOR_PCT,
     WEAR_COST_PER_KWH,
 )
@@ -295,14 +296,34 @@ def _add_scenario_to_problem(
     ]
 
     # ── SOC trajectory ───────────────────────────────────────────
+    # Variable bounds are [0, 100] — the physical range. The operating
+    # band (`soc_floor_pct`..`soc_ceiling_pct`) is enforced as soft
+    # constraints with slack variables penalised in the objective.
+    # Reason: if the inverter's local EMS (e.g. mode 2) charges past our
+    # ceiling before we regain control, the initial SOC will be outside
+    # the band, and a hard bound makes the LP infeasible immediately.
+    # Slack variables let the LP plan the fastest legal return to band
+    # while staying solvable.
     soc_pct = [
         pulp.LpVariable(
             f"{prefix}soc_{t}",
-            lowBound=battery_config.soc_floor_pct,
-            upBound=battery_config.soc_ceiling_pct,
+            lowBound=0.0,
+            upBound=100.0,
         )
         for t in range(n)
     ]
+    # Slack on each side of the operating band, per slot. Penalty is
+    # large enough to dominate any arbitrage gain but finite (not big-M)
+    # so the LP stays numerically well-conditioned.
+    soc_over_ceiling = [
+        pulp.LpVariable(f"{prefix}soc_over_{t}", lowBound=0.0) for t in range(n)
+    ]
+    soc_under_floor = [
+        pulp.LpVariable(f"{prefix}soc_under_{t}", lowBound=0.0) for t in range(n)
+    ]
+    effective_floor = max(
+        battery_config.soc_floor_pct, battery_config.backup_soc_pct
+    )
 
     # ── Add load variables (each load contributes its own vars) ──
     load_vars: dict[str, LoadVars] = {}
@@ -354,6 +375,19 @@ def _add_scenario_to_problem(
             f"{prefix}system_balance_{t}",
         )
 
+        # Soft operating-band constraints. `soc_pct[t]` is physically in
+        # [0, 100] but should stay in [effective_floor, soc_ceiling_pct]
+        # under normal operation. Slack activates only when the LP
+        # physically can't meet the band (e.g. initial SOC above ceiling).
+        prob += (
+            soc_pct[t] <= battery_config.soc_ceiling_pct + soc_over_ceiling[t],
+            f"{prefix}soc_ceiling_soft_{t}",
+        )
+        prob += (
+            soc_pct[t] >= effective_floor - soc_under_floor[t],
+            f"{prefix}soc_floor_soft_{t}",
+        )
+
     # ── SOC dynamics ─────────────────────────────────────────────
     capacity = battery_config.capacity_kwh
     eta = battery_config.round_trip_efficiency
@@ -372,9 +406,21 @@ def _add_scenario_to_problem(
     # horizon. Without this the LP values end-of-horizon energy at 0 and
     # will happily arrive at the floor — fine within the model, disastrous
     # when the next tick's forecast reveals an evening peak we can no
-    # longer cover.
-    terminal_floor = max(battery_config.soc_floor_pct, TERMINAL_SOC_FLOOR_PCT)
-    prob += (soc_pct[n - 1] >= terminal_floor, f"{prefix}terminal_soc")
+    # longer cover. Softened with slack to stay feasible when the initial
+    # SOC is too low to physically recover to terminal_floor within the
+    # horizon; the penalty pushes the LP to recover as much as it can.
+    terminal_floor = max(
+        battery_config.soc_floor_pct,
+        battery_config.backup_soc_pct,
+        TERMINAL_SOC_FLOOR_PCT,
+    )
+    soc_terminal_slack = pulp.LpVariable(
+        f"{prefix}soc_terminal_slack", lowBound=0.0
+    )
+    prob += (
+        soc_pct[n - 1] >= terminal_floor - soc_terminal_slack,
+        f"{prefix}terminal_soc",
+    )
 
     # ── Cost terms (already weighted) ────────────────────────────
     # Import price: prefer Amber's `advancedPrice.predicted` when present
@@ -396,6 +442,14 @@ def _add_scenario_to_problem(
             * wear_cost_per_kwh
             * slot_hours
         )
+        # SOC out-of-band penalty (see constants.SOC_BOUND_PENALTY for
+        # sizing). Weighted like any other cost term so all scenarios
+        # contribute their share; slack is zero in nominal conditions.
+        cost_terms.append(
+            weight * SOC_BOUND_PENALTY * (soc_over_ceiling[t] + soc_under_floor[t])
+        )
+    # Terminal SOC slack (one variable for the whole horizon).
+    cost_terms.append(weight * SOC_BOUND_PENALTY * soc_terminal_slack)
 
     return (
         LPVars(

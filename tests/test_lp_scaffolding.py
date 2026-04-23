@@ -171,6 +171,50 @@ class TestSOCBounds:
         for d in sol.forward_trajectory:
             assert cfg.soc_floor_pct - 0.1 <= d.soc_pct_end <= cfg.soc_ceiling_pct + 0.1
 
+    def test_initial_soc_above_ceiling_stays_feasible(self) -> None:
+        """Initial SOC > ceiling (e.g. mode 2 charged past our limit) must
+        not cause infeasibility. LP should solve, SOC should converge back
+        into the operating band as fast as discharge physics allow.
+        """
+        cfg = BatteryConfig(soc_floor_pct=15.0, soc_ceiling_pct=95.0)
+        sol = solve(
+            state=_state(soc=100.0),  # battery is full — above ceiling
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        # The LP has planned some trajectory — either coming down or at
+        # least respecting physical limits. No hard assertion on timing
+        # of return-to-band (depends on discharge kW and load), but the
+        # final SOC should be ≤ ceiling by end of horizon.
+        final = sol.forward_trajectory[-1].soc_pct_end
+        assert final <= cfg.soc_ceiling_pct + 0.5, (
+            f"LP failed to return SOC below ceiling by end of horizon: "
+            f"final={final:.2f}%"
+        )
+
+    def test_initial_soc_below_floor_stays_feasible(self) -> None:
+        """Mirror case: initial SOC < effective floor must also solve."""
+        cfg = BatteryConfig(
+            soc_floor_pct=15.0, soc_ceiling_pct=95.0, backup_soc_pct=15.0
+        )
+        sol = solve(
+            state=_state(soc=5.0),  # battery is near empty — below floor
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+
 
 # ── Properties: economic behaviour ───────────────────────────────
 

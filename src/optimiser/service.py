@@ -97,6 +97,14 @@ class Service:
         # Connect to Modbus
         modbus_ok = await self._sigenergy.connect()
 
+        # Assert battery SOC limits at hardware level (reg 40046/47/48).
+        # These bound local-mode charging/discharging so the inverter can't
+        # drift outside our operating band during mode 2 or any fallback
+        # path. Safe to call even without Remote EMS enabled — these are
+        # basic battery-protection registers, not EMS-mode-specific.
+        if modbus_ok:
+            await self._sigenergy.assert_battery_soc_limits()
+
         # Initial fetches (5-min prices drive ticks; 30-min drives planning)
         amber_ok = await self._fetch_5min_prices()
         await self._fetch_30min_prices()
