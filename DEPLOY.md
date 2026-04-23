@@ -135,6 +135,7 @@ the file aside inside the container and query the copy:
 ```bash
 docker exec energy-optimiser bash -c '
   cp /var/lib/energy-optimiser/telemetry.duckdb /tmp/tel.duckdb
+  cp /var/lib/energy-optimiser/telemetry.duckdb.wal /tmp/tel.duckdb.wal 2>/dev/null || true
   python -c "
 import duckdb
 db = duckdb.connect(\"/tmp/tel.duckdb\", read_only=True)
@@ -149,9 +150,12 @@ for row in db.sql(\"\"\"
 '
 ```
 
-The snapshot is a point-in-time copy — stale up to the next telemetry
-write (5 min). For live state, use `docker compose logs -f` or read the
-latest NDJSON snapshot under `snapshots/`.
+Copy the `.wal` sidecar too. DuckDB checkpoints infrequently, so the main
+file can be hours stale while everything recent lives in the WAL; DuckDB
+replays it in-memory on open (read-only is fine). The snapshot is a
+point-in-time copy — stale up to the next telemetry write (5 min). For
+live state, use `docker compose logs -f` or read the latest NDJSON
+snapshot under `snapshots/`.
 
 ### Phase 6 — Install the systemd unit (boot-time autostart)
 

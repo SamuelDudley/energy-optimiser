@@ -11,17 +11,24 @@ Read-only sanity check of `telemetry.duckdb`. The running service holds a file l
 
 Run the whole check in a single `docker exec` via heredoc so the copy stays inside the container and is discarded when the exec exits. Use the container's Python — it has duckdb + pytz already.
 
+**CRITICAL: copy the WAL too.** DuckDB checkpoints infrequently (default threshold 16 MB of WAL). Between checkpoints, all recent writes live only in `telemetry.duckdb.wal` — e.g. the main file can be 10+ hours stale while the WAL holds every tick since the last checkpoint. Copying only the main file silently drops this data from the audit. Copy both, then DuckDB replays the WAL in-memory on open.
+
 ```bash
 docker exec -i energy-optimiser bash -s <<'SH'
 set -e
 cp /var/lib/energy-optimiser/telemetry.duckdb /tmp/tele.duckdb
+# WAL may not exist right after a checkpoint — ignore if absent.
+cp /var/lib/energy-optimiser/telemetry.duckdb.wal /tmp/tele.duckdb.wal 2>/dev/null || true
 python - <<'PY'
 import duckdb
+# read_only=True is fine: DuckDB replays the WAL into memory on open.
 con = duckdb.connect("/tmp/tele.duckdb", read_only=True)
 # ... queries below ...
 PY
 SH
 ```
+
+Sanity-check after opening: confirm `MAX(ts)` from `telemetry` is within minutes of `now()`. If it's hours stale, the WAL copy probably failed (or wasn't replayed) — report this before running the rest of the checks, because every downstream metric will be wrong.
 
 ## Queries to run
 
@@ -50,7 +57,16 @@ All in one python block. Print each result with a short label so parsing is triv
 
 5. **Planner action distribution (last 24h).** `SELECT planner_action, COUNT(*) FROM telemetry WHERE ts > now() - INTERVAL '24h' GROUP BY 1 ORDER BY 2 DESC`. Just list. Useful signal that the LP is actually varying behaviour.
 
-6. **EMS mode distribution (last 24h).** `SELECT ems_mode, COUNT(*) ...`. Mode 2 = SELF_CONSUME (fallback). If mode 2 > 10% and no known fallback incident, it's a concern.
+6. **EMS mode distribution (last 24h).** `SELECT ems_mode, COUNT(*) ...`. **This is `plant_ems_work_mode` (reg 30003, `EMSWorkMode` enum) — NOT `RemoteEMSControlMode` (reg 40031).** Values:
+   - `0` = MAX_SELF_CONSUMPTION (plant-managed; our control is NOT engaged)
+   - `1` = AI_MODE
+   - `2` = TOU (time-of-use; plant-managed)
+   - `5` = FULL_FEED_IN_TO_GRID
+   - `6` = VPP_SCHEDULING
+   - `7` = **REMOTE_EMS** — our control is engaged. Expected on >99% of rows during normal operation.
+   - `9` = CUSTOM
+
+   Heuristics: `ems_mode = 7` sustained = healthy. Any sustained value ≠ 7 means the inverter is ignoring remote EMS commands — FAIL. Isolated non-7 ticks right after startup/restart are expected (the service enables remote EMS on first tick). Do not confuse this field with the real fallback signal, which is `planner_action = self_consume` combined with `state = fallback` in the services review — those flag *our* LP falling back, independent of what the inverter is doing.
 
 7. **Load profile coverage.** `SELECT load_id, COUNT(*), MAX(ts), MIN(ts) FROM load_telemetry GROUP BY load_id`. For each managed load, report row count and freshness of latest row.
 
@@ -78,8 +94,8 @@ PASS  pv_forecast_log:      892 rows, latest 38m ago
 PASS  price_forecast_log: 5,612 rows, latest 3m ago
 PASS  No gaps in last 24h
 PASS  Null rates: all < 1%
-Actions (24h): discharge_ess 612, charge_pv 198, idle 150, charge_grid 20
-EMS modes (24h): 3=612, 4=198, 6=150, 2=20 (10% fallback — see services review)
+Actions (24h): discharge_ess 612, self_consume 428, charge_pv 198, charge_grid 20
+PASS  EMS mode (24h): 7=1258 (99.8%), 0=2 (startup blips) — remote EMS engaged
 PASS  Load profile: hot_water 240 rows, latest 1m ago
 PV MAE: 0.42kW over 287 matched rows
 DB size: 780K
@@ -90,6 +106,7 @@ Under 20 lines. Only show detail for WARN/FAIL sections.
 ## Don't
 
 - Don't open the live DB directly. Always copy aside first.
+- Don't copy only `telemetry.duckdb` — you'll miss everything since the last checkpoint. Always copy `telemetry.duckdb.wal` alongside it.
 - Don't write to the DB. `read_only=True` on every connect.
 - Don't guess at schema — use the columns listed here or `DESCRIBE <table>`.
 - Don't recommend fixes unless the user asks. This is an audit.
