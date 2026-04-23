@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .api import APIServer
+from .api.log_buffer import RingBufferHandler
 from .api.metrics import Metrics
 from .clients.amber import AmberClient
 from .clients.bom import BOMClient
@@ -71,6 +72,8 @@ class Service:
         self._state_machine = StateMachine()
         self._snapshots = SnapshotWriter(config.storage.snapshot_dir)
         self._metrics = Metrics()
+        self._log_buffer: RingBufferHandler | None = None
+        self._file_log_handler: logging.Handler | None = None
         self._api_server = APIServer(config.api, self)
 
         # LP runtime — shared with the verification watcher.
@@ -98,6 +101,10 @@ class Service:
 
     async def start(self) -> None:
         """Start the service: connect, initialise, then run wake loops."""
+        # Attach the logging handlers before anything else logs — both
+        # handlers capture the full startup sequence, not just the
+        # post-connect tail.
+        self._attach_log_handlers()
         logger.info("Starting energy optimiser v%s", _VERSION)
         self._running = True
 
@@ -223,6 +230,11 @@ class Service:
             await self._api_server.stop()
         except Exception:
             logger.exception("API server stop failed")
+
+        # Detach our logging handlers so a subsequent Service (unusual
+        # in production but common in tests) doesn't see duplicates on
+        # the root logger.
+        self._detach_log_handlers()
 
         # Stop wake loops first so no new ticks are scheduled
         for wl in self._wake_loops:
@@ -662,6 +674,68 @@ class Service:
     @property
     def metrics(self) -> Metrics:
         return self._metrics
+
+    @property
+    def log_buffer(self) -> RingBufferHandler | None:
+        return self._log_buffer
+
+    def _attach_log_handlers(self) -> None:
+        """Attach the ring buffer and (if configured) a rotating file
+        handler to the root logger.
+
+        - The ring buffer powers /logs — bounded, in-memory, fast. It
+          is always attached: the overhead is a few MB of dicts and it
+          can be queried by operators or agents even when the rotating
+          file on disk isn't configured.
+        - The file handler is the durable log of record — Docker's log
+          driver also captures stdout, but a host-mounted file gives
+          operators something to grep without invoking docker logs.
+        """
+        import logging.handlers
+
+        api_cfg = self._config.api
+        root = logging.getLogger()
+
+        self._log_buffer = RingBufferHandler(api_cfg.log_ring_buffer_size)
+        self._log_buffer.setLevel(logging.DEBUG)
+        root.addHandler(self._log_buffer)
+
+        if api_cfg.log_file_path:
+            try:
+                log_path = Path(api_cfg.log_file_path)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                fh = logging.handlers.RotatingFileHandler(
+                    log_path,
+                    maxBytes=api_cfg.log_file_max_bytes,
+                    backupCount=api_cfg.log_file_backup_count,
+                    encoding="utf-8",
+                )
+                fh.setLevel(logging.INFO)
+                fh.setFormatter(
+                    logging.Formatter(
+                        "%(asctime)s %(levelname)s %(name)s %(message)s"
+                    )
+                )
+                root.addHandler(fh)
+                self._file_log_handler = fh
+            except Exception:
+                logger.exception(
+                    "Failed to open rotating log file at %s — continuing "
+                    "with stdout/ring-buffer logging only",
+                    api_cfg.log_file_path,
+                )
+
+    def _detach_log_handlers(self) -> None:
+        root = logging.getLogger()
+        for h in (self._log_buffer, self._file_log_handler):
+            if h is not None:
+                try:
+                    root.removeHandler(h)
+                    h.close()
+                except Exception:
+                    logger.exception("Failed to close log handler %r", h)
+        self._log_buffer = None
+        self._file_log_handler = None
 
     # ── LP Execution ─────────────────────────────────────────────
 

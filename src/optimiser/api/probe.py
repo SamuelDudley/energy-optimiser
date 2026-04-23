@@ -12,6 +12,7 @@ from typing import Protocol, runtime_checkable
 import duckdb
 from aiohttp import web
 
+from .log_buffer import RingBufferHandler
 from .metrics import Metrics
 
 
@@ -29,6 +30,7 @@ class ServiceProbe(Protocol):
     sigenergy_connected: bool
     db_connection: duckdb.DuckDBPyConnection
     metrics: Metrics
+    log_buffer: RingBufferHandler | None
 
 
 # Typed app key — handlers retrieve the probe via

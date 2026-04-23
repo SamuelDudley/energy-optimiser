@@ -7,6 +7,7 @@ protocol, so these tests don't stand up a Service.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from optimiser.api.auth import make_auth_middleware
 from optimiser.api.handlers.discovery import TABLE_DESCRIPTIONS, root, table_schema
 from optimiser.api.handlers.health import healthz, readyz
+from optimiser.api.handlers.logs import logs as logs_handler
 from optimiser.api.handlers.metrics import metrics as metrics_handler
+from optimiser.api.log_buffer import RingBufferHandler
 from optimiser.api.metrics import Metrics
 from optimiser.api.probe import SERVICE_PROBE_KEY
 
@@ -34,6 +37,7 @@ class _Probe:
     version: str = "0.2.0-test"
     db_connection: duckdb.DuckDBPyConnection | None = None
     metrics: Metrics | None = None
+    log_buffer: RingBufferHandler | None = None
 
     def __post_init__(self) -> None:
         if self.metrics is None:
@@ -64,6 +68,7 @@ def _build_app(probe: _Probe) -> web.Application:
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", readyz)
     app.router.add_get("/metrics", metrics_handler)
+    app.router.add_get("/logs", logs_handler)
     app.router.add_get("/{table}/schema", table_schema)
     return app
 
@@ -369,3 +374,159 @@ class TestMetrics:
             body = await r.text()
             assert 'eo_state_machine_state{state="ACTIVE"} 1.0' in body
             assert 'eo_state_machine_state{state="FALLBACK"} 0.0' in body
+
+
+def _seeded_buffer(capacity: int = 50) -> RingBufferHandler:
+    buf = RingBufferHandler(capacity)
+    lg = logging.getLogger(f"test.buffer.{id(buf)}")
+    lg.addHandler(buf)
+    lg.setLevel(logging.DEBUG)
+    lg.propagate = False  # keep pytest capture out of our buffer
+    lg.debug("a debug line")
+    lg.info("an info line")
+    lg.warning("a warning line")
+    lg.error("an error line")
+    lg.removeHandler(buf)
+    return buf
+
+
+class TestRingBuffer:
+    """Unit tests for RingBufferHandler (no HTTP)."""
+
+    def test_bounded_capacity(self) -> None:
+        buf = RingBufferHandler(3)
+        lg = logging.getLogger(f"test.bounded.{id(buf)}")
+        lg.addHandler(buf)
+        lg.setLevel(logging.DEBUG)
+        lg.propagate = False
+        for i in range(10):
+            lg.info("line %d", i)
+        snap = buf.snapshot(
+            since=None, until=None, min_level=logging.DEBUG, limit=100
+        )
+        assert len(snap) == 3
+
+    def test_newest_first_order(self) -> None:
+        buf = _seeded_buffer()
+        snap = buf.snapshot(
+            since=None, until=None, min_level=logging.DEBUG, limit=100
+        )
+        # Four lines; newest (error) first
+        messages = [r["message"] for r in snap]
+        assert messages[0] == "an error line"
+        assert messages[-1] == "a debug line"
+
+    def test_level_filter_min_inclusive(self) -> None:
+        buf = _seeded_buffer()
+        snap = buf.snapshot(
+            since=None, until=None, min_level=logging.WARNING, limit=100
+        )
+        levels = {r["level"] for r in snap}
+        assert levels == {"WARNING", "ERROR"}
+
+    def test_limit_clamps_output(self) -> None:
+        buf = _seeded_buffer()
+        snap = buf.snapshot(
+            since=None, until=None, min_level=logging.DEBUG, limit=2
+        )
+        assert len(snap) == 2
+
+    def test_captures_exc_info(self) -> None:
+        buf = RingBufferHandler(10)
+        lg = logging.getLogger(f"test.exc.{id(buf)}")
+        lg.addHandler(buf)
+        lg.setLevel(logging.DEBUG)
+        lg.propagate = False
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            lg.exception("something exploded")
+        snap = buf.snapshot(
+            since=None, until=None, min_level=logging.DEBUG, limit=5
+        )
+        assert len(snap) == 1
+        # The LogRecord machinery should have captured exc_info into the
+        # formatted string.
+        assert snap[0].get("exc_info") is not None
+
+
+class TestLogs:
+    async def test_logs_requires_auth(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            log_buffer=_seeded_buffer(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs")
+            assert r.status == 401
+
+    async def test_logs_returns_ring_buffer_newest_first(
+        self, tmp_path: Path
+    ) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            log_buffer=_seeded_buffer(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 4
+            assert body["records"][0]["message"] == "an error line"
+            assert body["records"][-1]["message"] == "a debug line"
+
+    async def test_logs_filters_by_level(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            log_buffer=_seeded_buffer(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs?level=WARNING", headers=_auth())
+            body = await r.json()
+            assert body["count"] == 2
+            assert {r["level"] for r in body["records"]} == {"WARNING", "ERROR"}
+
+    async def test_logs_respects_limit(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            log_buffer=_seeded_buffer(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs?limit=1", headers=_auth())
+            body = await r.json()
+            assert body["count"] == 1
+
+    async def test_bad_level_returns_400(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            log_buffer=_seeded_buffer(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs?level=NOPE", headers=_auth())
+            assert r.status == 400
+
+    async def test_bad_since_returns_400(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            log_buffer=_seeded_buffer(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs?since=not-a-timestamp", headers=_auth())
+            assert r.status == 400
+
+    async def test_bad_limit_returns_400(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            log_buffer=_seeded_buffer(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs?limit=-5", headers=_auth())
+            assert r.status == 400
+
+    async def test_missing_buffer_returns_503(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), log_buffer=None
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/logs", headers=_auth())
+            assert r.status == 503

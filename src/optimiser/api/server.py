@@ -18,6 +18,7 @@ from ..config import APIConfig
 from .auth import load_token, make_auth_middleware
 from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
+from .handlers.logs import logs as logs_handler
 from .handlers.metrics import metrics as metrics_handler
 from .probe import SERVICE_PROBE_KEY, ServiceProbe
 
@@ -54,6 +55,7 @@ class APIServer:
         app.router.add_get("/healthz", healthz)
         app.router.add_get("/readyz", readyz)
         app.router.add_get("/metrics", metrics_handler)
+        app.router.add_get("/logs", logs_handler)
         app.router.add_get("/{table}/schema", table_schema)
 
         self._runner = web.AppRunner(app, access_log=None)
