@@ -37,10 +37,10 @@ NOW = datetime(2026, 4, 15, 12, 0, 0, tzinfo=UTC)
 _BAT = BatteryConfig()
 
 
-def dispatch_from_slot(slot: SlotDecision) -> object:
+def dispatch_from_slot(slot: SlotDecision, measured_pv_kw: float | None = None) -> object:
     """Test helper: injects the default BatteryConfig so test bodies stay
     focused on the (slot → dispatch) mapping."""
-    return _dispatch_from_slot(slot, _BAT)
+    return _dispatch_from_slot(slot, _BAT, measured_pv_kw=measured_pv_kw)
 
 
 def _slot(
@@ -110,19 +110,39 @@ class TestDispatchFromSlot:
         d = dispatch_from_slot(_slot(battery_kw=4.0, pv_to_battery_kw=2.0))
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
 
-    def test_discharge_always_picks_mode_6(self) -> None:
-        # Mode 5 (DISCHARGE_PV_FIRST) is intentionally not used — see
-        # the dispatch module docstring. All discharges go to mode 6.
+    def test_discharge_with_pv_producing_picks_mode_5(self) -> None:
+        # PV is producing → use mode 5 (DISCHARGING_PV_FIRST) so the inverter
+        # load-follows with PV first, battery topping up. Mode 6 would zero
+        # the PV (verified on hardware, see SIGENERGY-MODES.md).
         d = dispatch_from_slot(_slot(battery_kw=-3.0, pv_to_house_kw=1.5))
-        assert d.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST
+        assert d.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_PV_FIRST
         assert d.kind == DispatchKind.DISCHARGE
-        assert d.cap_kw == _BAT.max_discharge_kw  # physical max, not LP's point estimate
+        assert d.cap_kw == _BAT.max_discharge_kw
         assert d.signed_intent_kw == -3.0
 
-    def test_evening_discharge_no_pv(self) -> None:
+    def test_evening_discharge_no_pv_picks_mode_6(self) -> None:
+        # No PV → mode 6 (DISCHARGING_ESS_FIRST). Mode 5 would just idle
+        # the battery here since it prefers PV.
         d = dispatch_from_slot(_slot(battery_kw=-5.0, pv_to_house_kw=0.0))
         assert d.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST
         assert d.cap_kw == _BAT.max_discharge_kw
+
+    def test_discharge_live_pv_overrides_lp_plan(self) -> None:
+        # Live PV reading trumps the LP's planned PV flows (which may be
+        # based on a stale/pessimistic forecast).
+        d = dispatch_from_slot(
+            _slot(battery_kw=-2.0, pv_to_house_kw=0.0),
+            measured_pv_kw=3.5,
+        )
+        assert d.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_PV_FIRST
+
+    def test_discharge_live_pv_zero_picks_mode_6_even_if_plan_has_pv(self) -> None:
+        # Mirror: LP planned PV but live is zero (cloud event mid-slot).
+        d = dispatch_from_slot(
+            _slot(battery_kw=-2.0, pv_to_house_kw=1.5),
+            measured_pv_kw=0.05,
+        )
+        assert d.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST
 
     def test_discharge_cap_covers_transient_loads(self) -> None:
         # Core behaviour: the LP picks -2 kW (its expected load) but the

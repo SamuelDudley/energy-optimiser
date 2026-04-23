@@ -110,9 +110,13 @@ def _make_service() -> Service:
 def _solver_args() -> dict:
     """Minimal kwargs for `_run_lp`. Solver is mocked so the actual
     contents of state/prices/etc. don't drive any logic — they're just
-    forwarded to the patched `solve_stochastic`."""
+    forwarded to the patched `solve_stochastic`. `state.pv_power_kw` is a
+    real float (not a MagicMock) because dispatch_from_slot compares it
+    against a threshold to pick mode 5 vs 6."""
+    state = MagicMock()
+    state.pv_power_kw = 0.0
     return {
-        "state": MagicMock(),
+        "state": state,
         "prices_planning": [MagicMock()],
         "pv_forecast": None,
         "load_profile": MagicMock(),

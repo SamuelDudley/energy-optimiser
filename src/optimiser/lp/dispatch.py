@@ -27,6 +27,13 @@ from .result import SlotDecision
 # better than we can. Matches the deadband from the architecture discussion.
 DEADBAND_KW: float = 0.1
 
+# Above this PV reading we pick mode 5 over mode 6 for discharge intent.
+# Rationale: mode 6 zeroes PV generation (verified on hardware, see
+# SIGENERGY-MODES.md). Any PV > 0.2 kW that we'd lose to mode 6's
+# pathological behaviour is worth routing through mode 5 instead — mode 5
+# load-follows, using PV first and topping up from battery if short.
+PV_PRODUCING_THRESHOLD_KW: float = 0.2
+
 
 class DispatchKind(StrEnum):
     """High-level intent for verification and logging.
@@ -55,14 +62,19 @@ class LPDispatch:
     kind: DispatchKind
 
 
-def dispatch_from_slot(slot_0: SlotDecision, battery_config: BatteryConfig) -> LPDispatch:
+def dispatch_from_slot(
+    slot_0: SlotDecision,
+    battery_config: BatteryConfig,
+    measured_pv_kw: float | None = None,
+) -> LPDispatch:
     """Turn the LP's slot-0 decision into an inverter-ready dispatch.
 
     Mapping:
-      |battery_kw| < DEADBAND_KW    → SELF_CONSUME (mode 2), cap = 0
-      battery_kw > 0, grid-dominant → CHARGE_GRID_FIRST (mode 3), cap = battery_kw
-      battery_kw > 0, PV-dominant   → CHARGE_PV_FIRST   (mode 4), cap = battery_kw
-      battery_kw < 0                → DISCHARGE_ESS_FIRST (mode 6), cap = max_discharge_kw
+      |battery_kw| < DEADBAND_KW       → SELF_CONSUME (mode 2), cap = 0
+      battery_kw > 0, grid-dominant    → CHARGE_GRID_FIRST (mode 3), cap = battery_kw
+      battery_kw > 0, PV-dominant      → CHARGE_PV_FIRST   (mode 4), cap = battery_kw
+      battery_kw < 0, PV > threshold   → DISCHARGE_PV_FIRST (mode 5), cap = max_discharge_kw
+      battery_kw < 0, PV ≤ threshold   → DISCHARGE_ESS_FIRST (mode 6), cap = max_discharge_kw
 
     Charge cap uses the LP's intended rate: charging is directly controllable
     and exceeding the plan wastes money (e.g. charging harder than the cheap
@@ -70,15 +82,19 @@ def dispatch_from_slot(slot_0: SlotDecision, battery_config: BatteryConfig) -> L
     over soon).
 
     Discharge cap uses the *physical* max_discharge_kw, NOT the LP's point
-    estimate of house load. The LP plans around an expected load (at L0 that's
-    a 2 kW default, at higher maturities a time-of-day average); if actual
+    estimate of house load. The LP plans around an expected load; if actual
     load spikes above that (kettle, AC, oven), a tight cap would force the
     shortfall to grid import at full retail, which is strictly worse than
-    battery wear down to the SOC floor. The inverter's native load-following
-    in mode 6 does the right thing when the cap is the physical limit: it
-    discharges exactly what the house consumes, up to max_discharge_kw, and
-    no more. The LP's signed_intent_kw is preserved for the watcher and the
-    snapshot so we can still verify the inverter's general direction.
+    battery wear down to the SOC floor. The LP's signed_intent_kw is
+    preserved for the watcher and the snapshot so we can still verify the
+    inverter's general direction.
+
+    Discharge mode selection (5 vs 6) is driven by whether PV is producing
+    meaningfully now. Mode 6 zeroes PV generation entirely (verified on
+    hardware, see SIGENERGY-MODES.md), so using it while the sun is up
+    throws away free energy. Mode 5 load-follows: PV supplies load + export
+    first, battery tops up any shortfall. When PV ≈ 0 (night), mode 6 is
+    the only mode that actually discharges — mode 5 would idle the battery.
 
     "Grid-dominant" means the LP plans to source more of the charge from grid
     than from PV in this slot. We then ask the inverter to prefer that source
@@ -86,9 +102,9 @@ def dispatch_from_slot(slot_0: SlotDecision, battery_config: BatteryConfig) -> L
     rate and the inverter supplies the remainder from the secondary source if
     the primary is short.
 
-    DISCHARGE_PV_FIRST (mode 5) is intentionally not used: it lets the
-    inverter skip battery discharge entirely if PV happens to cover house
-    load, which contradicts the LP's intent when it asks to discharge.
+    `measured_pv_kw` is the live PV reading from telemetry; None means the
+    caller doesn't have it (replay, smoke, tests) — we fall back to the
+    LP's planned PV flows in slot_0 as a proxy.
     """
     battery_kw = slot_0.battery_kw
 
@@ -120,11 +136,20 @@ def dispatch_from_slot(slot_0: SlotDecision, battery_config: BatteryConfig) -> L
             kind=DispatchKind.CHARGE,
         )
 
-    # Discharging. Always ESS-first per the discussion above. Cap is the
-    # physical max so transient loads above the LP's forecast are covered
-    # from battery, not grid import.
+    # Discharging. Pick mode 5 if PV is producing, mode 6 otherwise.
+    pv_signal_kw = (
+        measured_pv_kw
+        if measured_pv_kw is not None
+        else (
+            slot_0.pv_to_house_kw + slot_0.pv_to_battery_kw + slot_0.pv_to_export_kw
+        )
+    )
+    if pv_signal_kw > PV_PRODUCING_THRESHOLD_KW:
+        discharge_mode = RemoteEMSControlMode.COMMAND_DISCHARGING_PV_FIRST
+    else:
+        discharge_mode = RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST
     return LPDispatch(
-        mode=RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST,
+        mode=discharge_mode,
         cap_kw=battery_config.max_discharge_kw,
         signed_intent_kw=battery_kw,
         kind=DispatchKind.DISCHARGE,

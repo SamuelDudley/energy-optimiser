@@ -603,7 +603,11 @@ class Service:
             await self._lp_fallback(FallbackReason.LP_ERROR)
             return None, None
 
-        dispatch = dispatch_from_slot(solution.slot_0, self._config.battery)
+        dispatch = dispatch_from_slot(
+            solution.slot_0,
+            self._config.battery,
+            measured_pv_kw=state.pv_power_kw,
+        )
         return solution, dispatch
 
     async def _lp_fallback(self, reason: FallbackReason) -> None:
