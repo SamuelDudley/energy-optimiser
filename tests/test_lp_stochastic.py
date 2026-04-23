@@ -394,3 +394,95 @@ class TestBaseScenarioSelection:
             scenario_weights={"p10": 0.7, "p50": 0.2, "p90": 0.1},
         )
         assert svars.base_scenario == "p10"
+
+
+# ── S5: export untied across scenarios ───────────────────────────
+
+
+class TestExportUntied:
+    """`grid_export[0]` is deliberately NOT tied by non-anticipativity.
+    The cap we commit to at register 40038 is a ceiling, not a setpoint
+    — each scenario's slot-0 flow may legitimately differ inside that
+    ceiling. The cap is derived post-solve across scenarios:
+    any-scenario-plans-export → DNSP cap; all-agree-zero → 0."""
+
+    def test_per_scenario_export_can_differ(self) -> None:
+        """With SOC near ceiling and abundant PV that only P90 sees as
+        surplus-above-load, P90 should plan positive export while P10
+        plans ~0. Battery net remains tied (regression guard).
+        """
+        prob, svars = build_stochastic_lp(
+            state=_state(soc=85.0),
+            prices_planning=_flat_prices(import_c=20.0, export_c=10.0),
+            pv_forecast=_pv_forecast(p10_kw=1.0, p50_kw=3.0, p90_kw=5.0),
+            load_profile=_flat_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+        )
+        prob.solve(_solver(30.0))
+        assert pulp.LpStatus[prob.status] == "Optimal"
+
+        exports = {
+            name: (vars.grid_export[0].value() or 0.0)
+            for name, vars in svars.scenarios.items()
+        }
+        # P90 has more PV than P10; with SOC near ceiling, the surplus
+        # has nowhere to go but export. Export is free to differ now.
+        assert exports["p90"] > exports["p10"] + 0.1, (
+            f"export tie still active: p10={exports['p10']:.3f}, "
+            f"p90={exports['p90']:.3f}"
+        )
+
+        # Battery net kW is still tied — regression guard on the
+        # non-anticipativity constraint we kept.
+        def _net(v) -> float:
+            return (
+                (v.bat_charge_grid[0].value() or 0.0)
+                + (v.bat_charge_pv[0].value() or 0.0)
+                - (v.bat_discharge[0].value() or 0.0)
+            )
+        baseline = _net(svars.scenarios["p50"])
+        for name, vars in svars.scenarios.items():
+            assert _net(vars) == pytest.approx(baseline, abs=0.001), (
+                f"battery-net tie broken: {name} net={_net(vars):.3f}, "
+                f"p50 baseline={baseline:.3f}"
+            )
+
+    def test_cap_equals_dnsp_when_any_scenario_plans_export(self) -> None:
+        """End-to-end via `solve_stochastic`: the derived scalar
+        `grid_export_limit_kw` must equal the DNSP cap whenever at
+        least one scenario plans positive slot-0 export."""
+        cfg = BatteryConfig()
+        sol = solve_stochastic(
+            state=_state(soc=85.0),
+            prices_planning=_flat_prices(import_c=20.0, export_c=10.0),
+            pv_forecast=_pv_forecast(p10_kw=1.0, p50_kw=3.0, p90_kw=5.0),
+            load_profile=_flat_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        assert sol.grid_export_limit_kw == cfg.export_limit_kw
+
+    def test_cap_is_zero_when_all_scenarios_decline_export(self) -> None:
+        """Dual of the above: if export is sharply negative-priced and
+        no scenario plans positive export, the cap pins to 0 (prevents
+        transient PV leakage at a cost)."""
+        cfg = BatteryConfig()
+        sol = solve_stochastic(
+            state=_state(soc=20.0),
+            # Negative export price — exporting costs money.
+            prices_planning=_flat_prices(import_c=20.0, export_c=-5.0),
+            # Low PV, all percentiles below house load → nothing to export.
+            pv_forecast=_pv_forecast(p10_kw=0.0, p50_kw=0.3, p90_kw=0.6),
+            load_profile=_flat_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        assert sol.grid_export_limit_kw == 0.0

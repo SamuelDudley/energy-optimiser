@@ -112,6 +112,7 @@ def solve_stochastic(
         battery_config=battery_config,
         timeout_s=timeout_s,
         t0=t0,
+        scenarios=svars.scenarios,
         stochastic_meta={
             "scenarios": list(svars.scenarios.keys()),
             "base_scenario": svars.base_scenario,
@@ -153,6 +154,7 @@ def _run_and_extract(
     battery_config: BatteryConfig,
     timeout_s: float,
     t0: float,
+    scenarios: dict[str, LPVars] | None = None,
     stochastic_meta: dict | None = None,
 ) -> LPSolution:
     solver = _solver(timeout_s)
@@ -189,6 +191,7 @@ def _run_and_extract(
         battery_config=battery_config,
         elapsed_ms=elapsed_ms,
         status=status,
+        scenarios=scenarios,
         stochastic_meta=stochastic_meta,
     )
 
@@ -229,6 +232,7 @@ def _extract_solution(
     battery_config: BatteryConfig,
     elapsed_ms: float,
     status: SolveStatus,
+    scenarios: dict[str, LPVars] | None = None,
     stochastic_meta: dict | None = None,
 ) -> LPSolution:
     n = len(vars.slots)
@@ -276,18 +280,31 @@ def _extract_solution(
     # battery fills up. (With battery full + house 0.5 kW + reg 40038 at
     # 1 kW, the inverter throttles to 1.5 kW regardless of PV capability.)
     #
+    # In the stochastic case each scenario's slot-0 `grid_export` is free
+    # to differ (non-anticipativity is deliberately not applied here — see
+    # formulation._add_non_anticipativity). The cap we commit to must
+    # therefore be derived from across all scenarios, not just the base.
+    #
     # Two cases:
-    #   - LP wants zero export (negative export price, or nowhere to send
-    #     surplus): write 0 and accept the curtailment as the cost of
-    #     avoiding the penalty.
-    #   - LP wants any positive export: pin to the DNSP cap
-    #     (battery_config.export_limit_kw). The LP never plans past this
-    #     bound, so it's strictly safe, and it captures any unplanned
-    #     solar windfall when actual PV beats the p90 forecast.
-    if slot_0.grid_export_kw < NUMERIC_EPS:
-        export_limit: float | None = 0.0
+    #   - All scenarios want zero export (negative export price, or
+    #     nowhere to send surplus): write 0 and accept any curtailment
+    #     as the cost of avoiding the penalty.
+    #   - Any scenario plans positive export: pin to the DNSP cap
+    #     (battery_config.export_limit_kw). Each scenario's plan is
+    #     already bounded by this, so it's strictly safe; it also
+    #     captures any unplanned solar windfall when actual PV beats the
+    #     p90 forecast. `slot_0.grid_export_kw` (base-scenario flow)
+    #     becomes advisory — useful for snapshot/logging, not the
+    #     commit.
+    if scenarios is not None:
+        any_plans_export = any(
+            _v(s.grid_export[0]) >= NUMERIC_EPS for s in scenarios.values()
+        )
     else:
-        export_limit = battery_config.export_limit_kw
+        any_plans_export = slot_0.grid_export_kw >= NUMERIC_EPS
+    export_limit: float | None = (
+        battery_config.export_limit_kw if any_plans_export else 0.0
+    )
 
     cost = pulp.value(prob.objective) or 0.0
 

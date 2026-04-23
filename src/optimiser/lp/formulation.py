@@ -480,11 +480,20 @@ def _add_non_anticipativity(
 ) -> None:
     """Tie slot-0 decisions across scenarios.
 
-    Only what we genuinely commit to at slot 0 is tied — physically, this
-    is the battery setpoint (signed kW), the grid export cap, and load
-    relay states. Everything else (per-scenario PV allocation, grid
-    import) is derived from the actual PV that materialises in each
-    scenario via the energy balance.
+    Only what we genuinely commit to at slot 0 is tied — physically,
+    this is the battery setpoint (signed kW) and load relay states.
+    Everything else (per-scenario PV allocation, grid import) is derived
+    from the actual PV that materialises in each scenario via the
+    energy balance.
+
+    `grid_export[0]` is deliberately NOT tied. The value we actually
+    write to register 40038 is a *ceiling*, not a setpoint — each
+    scenario's slot-0 export flow may legitimately differ inside that
+    ceiling. The cap is derived post-solve across all scenarios in
+    `solver.py::_extract_solution`: any scenario planning positive
+    export → write the DNSP cap (so a better-than-expected PV
+    realisation can flow out); all scenarios agree on zero → pin to 0
+    (so transient PV above plan can't leak at a negative export price).
 
     Tying the individual PV variables would over-constrain the problem:
     different scenarios have different `pv_avail[0]` values, and the
@@ -496,12 +505,6 @@ def _add_non_anticipativity(
     base_net = base.bat_charge_grid[0] + base.bat_charge_pv[0] - base.bat_discharge[0]
     other_net = other.bat_charge_grid[0] + other.bat_charge_pv[0] - other.bat_discharge[0]
     prob += (other_net == base_net, f"nonanti_bat_net_{other_name}")
-
-    # Grid export cap at slot 0 — register 40038.
-    prob += (
-        other.grid_export[0] == base.grid_export[0],
-        f"nonanti_export_{other_name}",
-    )
 
     # Per-load slot-0 binaries (relay states).
     for load_id, base_lv in base.loads.items():
