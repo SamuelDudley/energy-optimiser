@@ -198,7 +198,14 @@ class AmberClient:
             start = parse_iso(gen["startTime"]).replace(second=0, microsecond=0)
             end = parse_iso(gen["endTime"]).replace(second=0, microsecond=0)
             per_kwh = gen.get("perKwh", 0)
-            export_per_kwh = fi.get("perKwh", 0)
+            # Amber's feedIn.perKwh is signed from their ledger perspective:
+            # negative = revenue to customer (feed-in tariff paid), positive =
+            # cost to customer (solar-glut penalty). The LP's internal
+            # convention is the customer's: positive = revenue from export.
+            # Negate at the boundary so downstream code reads a natural
+            # "what you get paid per kWh exported" (positive in normal hours,
+            # negative only during curtailment events).
+            export_per_kwh = -fi.get("perKwh", 0)
             spot = gen.get("spotPerKwh", 0)
             renewables = gen.get("renewables", 0)
             spike = gen.get("spikeStatus", "none")

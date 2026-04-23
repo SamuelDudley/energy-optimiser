@@ -112,7 +112,10 @@ class TestAmberDrainLogRows:
         assert r.forecast_low == pytest.approx(10.0)
         assert r.forecast_high == pytest.approx(35.0)
         assert r.per_kwh == pytest.approx(25.0)
-        assert r.export_per_kwh == pytest.approx(6.0)
+        # Amber's feedIn.perKwh=+6.0 is a solar-glut penalty in their ledger
+        # convention (customer charged). Our internal convention negates at
+        # the boundary so positive = revenue — stored here as -6.0.
+        assert r.export_per_kwh == pytest.approx(-6.0)
 
     async def test_drain_is_destructive(
         self, amber_config: AmberConfig,
