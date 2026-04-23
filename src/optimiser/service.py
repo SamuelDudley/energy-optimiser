@@ -112,10 +112,13 @@ class Service:
         if self._solcast:
             # Solcast has a hard 10/day quota — a crashloop without this
             # seed path burns it fast. If the log has a forecast from
-            # within the last hour, seed the client from it and skip the
-            # initial API call; the next scheduled poll (every ~2.4h)
-            # will refresh. If nothing cached, fall through to a live fetch.
-            cached = self._store.read_latest_pv_forecast(max_age_minutes=60)
+            # within the last 4 hours, seed the client from it and skip
+            # the initial API call; the next scheduled poll (every ~2.4h)
+            # will refresh. 4h tolerates a restart during a normal
+            # inter-poll gap without spending another quota slot — the
+            # seed is a defensive cache, not a freshness guarantee.
+            # If nothing cached, fall through to a live fetch.
+            cached = self._store.read_latest_pv_forecast(max_age_minutes=240)
             if cached is not None:
                 forecasts, fetched_at = cached
                 self._solcast.seed_cache(forecasts, fetched_at)
