@@ -25,7 +25,7 @@ import httpx
 from ..config import WeatherConfig
 from ..logging_utils import emit
 from ..time_utils import now_utc
-from ..types import EventType
+from ..types import EventType, WeatherForecastInterval
 from ._retry import DEFAULT_USER_AGENT, bom_retry
 
 logger = logging.getLogger(__name__)
@@ -154,3 +154,108 @@ class BOMClient:
             },
         )
         logger.warning("BOM malformed response: %s (got %s)", reason, observed_type)
+
+    async def get_hourly_forecast(self) -> list[WeatherForecastInterval]:
+        """Fetch BOM's hourly forecast for the configured geohash.
+
+        Returns an empty list if the URL is empty, the fetch fails, or
+        the response is malformed. Never raises. Schema is undocumented
+        but stable (powers the BOM mobile app); all fields are defensively
+        parsed so a shape change produces NULLs rather than exceptions.
+        """
+        url = getattr(self._config, "bom_forecast_url", "") or ""
+        if not url:
+            return []
+        try:
+            async for attempt in bom_retry():
+                with attempt:
+                    resp = await self._client.get(url)
+                    resp.raise_for_status()
+            payload = resp.json()
+        except Exception:
+            logger.exception("Failed to fetch BOM hourly forecast")
+            return []
+
+        return self._parse_hourly_forecast(payload)
+
+    def _parse_hourly_forecast(
+        self, data: object
+    ) -> list[WeatherForecastInterval]:
+        """Defensively parse BOM's hourly forecast JSON.
+
+        Expected shape (undocumented, observed):
+          {"data": [{"time": "ISO8601Z", "temp": float,
+                     "temp_feels_like": float, "relative_humidity": int,
+                     "rain": {"chance": int,
+                              "amount": {"min": float, "max": float}},
+                     "wind": {"speed_kilometre": int}, ...}, ...]}
+        """
+        if not isinstance(data, dict):
+            self._warn_malformed("forecast response is not an object", type(data).__name__)
+            return []
+        records = data.get("data")
+        if not isinstance(records, list):
+            self._warn_malformed(
+                "forecast 'data' key missing or not a list",
+                type(records).__name__,
+            )
+            return []
+        out: list[WeatherForecastInterval] = []
+        for entry in records:
+            if not isinstance(entry, dict):
+                continue
+            ts_raw = entry.get("time")
+            if not isinstance(ts_raw, str):
+                continue
+            try:
+                period_end = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            out.append(
+                WeatherForecastInterval(
+                    period_end=period_end,
+                    temp_c=_maybe_float(entry.get("temp")),
+                    apparent_temp_c=_maybe_float(entry.get("temp_feels_like")),
+                    humidity_pct=_maybe_float(entry.get("relative_humidity")),
+                    rain_chance_pct=_maybe_float(_dig(entry, "rain", "chance")),
+                    rain_mm=_rain_amount_mid(entry.get("rain")),
+                    wind_kmh=_maybe_float(_dig(entry, "wind", "speed_kilometre")),
+                )
+            )
+        return out
+
+
+def _maybe_float(v: object) -> float | None:
+    if v is None:
+        return None
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _dig(d: object, *keys: str) -> object:
+    for key in keys:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(key)
+    return d
+
+
+def _rain_amount_mid(rain: object) -> float | None:
+    """Return the midpoint of BOM's rain min/max band. BOM reports a
+    range when uncertain; the midpoint is a reasonable scalar summary
+    for later analysis (a consumer that cares about the band can join
+    back to the raw fetch log, if we ever keep one)."""
+    amount = _dig(rain, "amount")
+    if not isinstance(amount, dict):
+        return None
+    lo = _maybe_float(amount.get("min"))
+    hi = _maybe_float(amount.get("max"))
+    if lo is None and hi is None:
+        return None
+    if lo is None:
+        return hi
+    if hi is None:
+        return lo
+    return (lo + hi) / 2.0

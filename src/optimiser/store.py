@@ -18,6 +18,7 @@ from .types import (
     PVForecast,
     PVForecastLogRow,
     TelemetryRow,
+    WeatherForecastLogRow,
 )
 
 logger = logging.getLogger(__name__)
@@ -197,6 +198,23 @@ CREATE TABLE IF NOT EXISTS price_forecast_log (
 );
 """
 
+# Mirrors pv_forecast_log: every fetched interval logged with its
+# fetched_at, so forecast evolution and calibration can be analysed
+# downstream. Not consumed by the LP — strictly observational.
+WEATHER_FORECAST_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS weather_forecast_log (
+    fetched_at      TIMESTAMPTZ NOT NULL,
+    period_end      TIMESTAMPTZ NOT NULL,
+    temp_c          REAL,
+    apparent_temp_c REAL,
+    humidity_pct    REAL,
+    rain_chance_pct REAL,
+    rain_mm         REAL,
+    wind_kmh        REAL
+);
+"""
+
+
 class TelemetryStore:
     """DuckDB-backed telemetry persistence with a write-ahead buffer.
 
@@ -226,6 +244,7 @@ class TelemetryStore:
         self._db.execute(LOAD_TELEMETRY_DDL)
         self._db.execute(PV_FORECAST_LOG_DDL)
         self._db.execute(PRICE_FORECAST_LOG_DDL)
+        self._db.execute(WEATHER_FORECAST_LOG_DDL)
         # Apply migrations for installs that predate any added columns.
         for stmt in TELEMETRY_MIGRATIONS:
             try:
@@ -436,6 +455,34 @@ class TelemetryStore:
         except Exception:
             logger.exception(
                 "pv_forecast_log write failed (%d rows dropped)", len(rows),
+            )
+
+    def write_weather_forecast_log(
+        self, rows: list[WeatherForecastLogRow]
+    ) -> None:
+        """Append BOM hourly forecast rows. Best-effort."""
+        if not rows:
+            return
+        try:
+            self._db.executemany(
+                """INSERT INTO weather_forecast_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    [
+                        r.fetched_at,
+                        r.period_end,
+                        r.temp_c,
+                        r.apparent_temp_c,
+                        r.humidity_pct,
+                        r.rain_chance_pct,
+                        r.rain_mm,
+                        r.wind_kmh,
+                    ]
+                    for r in rows
+                ],
+            )
+        except Exception:
+            logger.exception(
+                "weather_forecast_log write failed (%d rows dropped)", len(rows),
             )
 
     def update_pv_actuals(self, actuals: dict[datetime, float]) -> int:

@@ -40,6 +40,7 @@ from .types import (
     PVForecast,
     TelemetryRow,
     TickSnapshot,
+    WeatherForecastLogRow,
 )
 from .validation import validate_telemetry
 
@@ -153,6 +154,17 @@ class Service:
             WakeLoop("bom", self._config.weather.poll_interval_s, self._fetch_bom),
             WakeLoop("unifi", self._config.occupancy.poll_interval_s, self._poll_occupancy),
         ]
+        # BOM hourly forecast — separate cadence from current-obs. Only
+        # spawn the loop if a forecast URL is configured; empty URL means
+        # the user hasn't opted in. Cheap to skip and easy to add later.
+        if self._config.weather.bom_forecast_url:
+            self._wake_loops.append(
+                WakeLoop(
+                    "bom_forecast",
+                    self._config.weather.forecast_poll_interval_s,
+                    self._fetch_bom_forecast,
+                )
+            )
         if self._solcast:
             self._wake_loops.append(
                 WakeLoop("solcast", self._config.solcast.poll_interval_s, self._fetch_solcast)
@@ -753,3 +765,38 @@ class Service:
             await self._bom.get_outdoor_temp()
         except Exception:
             logger.exception("BOM weather fetch failed")
+
+    async def _fetch_bom_forecast(self) -> None:
+        """Fetch BOM hourly forecast and persist every interval.
+
+        Best-effort: never raises, empty list on any failure. The client
+        itself swallows HTTP/parse errors. Each fetch is logged in full
+        so forecast evolution can be analysed offline, mirroring the
+        pv_forecast_log redundancy pattern.
+        """
+        try:
+            intervals = await self._bom.get_hourly_forecast()
+        except Exception:
+            logger.exception("BOM forecast fetch raised unexpectedly")
+            return
+        if not intervals:
+            return
+        fetched_at = now_utc()
+        rows = [
+            WeatherForecastLogRow(
+                fetched_at=fetched_at,
+                period_end=iv.period_end,
+                temp_c=iv.temp_c,
+                apparent_temp_c=iv.apparent_temp_c,
+                humidity_pct=iv.humidity_pct,
+                rain_chance_pct=iv.rain_chance_pct,
+                rain_mm=iv.rain_mm,
+                wind_kmh=iv.wind_kmh,
+            )
+            for iv in intervals
+        ]
+        try:
+            self._store.write_weather_forecast_log(rows)
+            logger.info("Logged %d BOM forecast intervals", len(rows))
+        except Exception:
+            logger.exception("weather_forecast_log persist failed")

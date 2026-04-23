@@ -102,6 +102,21 @@ class ManagedLoadConfig:
 class WeatherConfig:
     bom_url: str = "http://www.bom.gov.au/fwo/IDN60801/IDN60801.94926.json"
     poll_interval_s: int = 1800
+    # Hourly forecast endpoint. BOM's official JSON forecast API is
+    # undocumented but publicly-served (powers the BOM mobile app). The
+    # geohash here is the 6-char prefix that the ``/forecasts/hourly``
+    # route accepts (the search endpoint returns 7-char IDs — drop the
+    # last character). ``r3dp4v`` is Canberra Airport (matches obs
+    # station 94926 so forecast and current-obs align geographically);
+    # query `api.weather.bom.gov.au/v1/locations?search=<name>` for
+    # other locations and use the returned geohash's first 6 chars.
+    # Set to empty string to disable — no fetch, no table writes.
+    # Note: BOM's ToS assert the API is not for redistribution; personal
+    # use is fine but don't build a commercial product on this endpoint.
+    bom_forecast_url: str = (
+        "https://api.weather.bom.gov.au/v1/locations/r3dp4v/forecasts/hourly"
+    )
+    forecast_poll_interval_s: int = 3600
 
 
 @dataclass(frozen=True, slots=True)

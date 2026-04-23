@@ -157,6 +157,36 @@ class PVForecast:
 
 
 @dataclass(frozen=True, slots=True)
+class WeatherForecastInterval:
+    """One hour of BOM hourly forecast. All fields optional — BOM's
+    JSON sometimes omits keys for early/late intervals.
+    """
+    period_end: datetime
+    temp_c: float | None
+    apparent_temp_c: float | None
+    humidity_pct: float | None
+    rain_chance_pct: float | None
+    rain_mm: float | None  # expected amount; BOM reports a min/max, we store the mid
+    wind_kmh: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class WeatherForecastLogRow:
+    """One row per forecast interval, at each BOM fetch. Mirrors the
+    pv_forecast_log pattern: redundant logging so a single table traces
+    forecast evolution.
+    """
+    fetched_at: datetime
+    period_end: datetime
+    temp_c: float | None
+    apparent_temp_c: float | None
+    humidity_pct: float | None
+    rain_chance_pct: float | None
+    rain_mm: float | None
+    wind_kmh: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class PVForecastLogRow:
     """One row per forecast interval, at each Solcast fetch. Logged to
     `pv_forecast_log` in DuckDB for later calibration analysis (p10/p50/p90
