@@ -15,10 +15,7 @@ from ..config import BatteryConfig, SigenergyConfig
 from ..logging_utils import emit
 from ..time_utils import now_utc
 from ..types import (
-    BATTERY_ACTION_TO_EMS_MODE,
-    BatteryAction,
     EventType,
-    PlannerOutput,
     RemoteEMSControlMode,
     SystemState,
 )
@@ -774,53 +771,6 @@ class SigenergyController:
         ok = True
         ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, floor_raw)
         ok &= await self._write_u16(REG_BACKUP_SOC, backup_raw)
-        return ok
-
-    async def apply(self, command: PlannerOutput, tick_id: str | None = None) -> bool:
-        """Apply a planner output to the inverter registers."""
-        ems_mode = BATTERY_ACTION_TO_EMS_MODE[command.battery_action]
-
-        # Ensure Remote EMS is enabled
-        if not self._remote_ems_enabled:
-            if not await self.enable_remote_ems():
-                return False
-
-        ok = True
-
-        # Set control mode
-        ok &= await self._write_u16(REG_REMOTE_EMS_CONTROL_MODE, ems_mode.value)
-
-        # Set charge/discharge limits (gain=1000 → multiply kW by 1000)
-        charge_raw = int(command.charge_limit_kw * 1000)
-        discharge_raw = int(command.discharge_limit_kw * 1000)
-        ok &= await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, charge_raw)
-        ok &= await self._write_u32(REG_ESS_MAX_DISCHARGING_LIMIT, discharge_raw)
-
-        # Set SOC cutoffs
-        soc_ceiling = (
-            int(command.target_soc * 10)
-            if command.battery_action
-            in (
-                BatteryAction.CHARGE_GRID,
-                BatteryAction.CHARGE_PV,
-            )
-            else int(self._battery.soc_ceiling_pct * 10)
-        )
-
-        soc_floor = int(self._battery.soc_floor_pct * 10)
-
-        ok &= await self._write_u16(REG_CHARGE_CUTOFF_SOC, soc_ceiling)
-        ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, soc_floor)
-
-        if ok:
-            logger.info(
-                "Applied: %s, charge=%.1fkW, discharge=%.1fkW, target_soc=%.0f%%",
-                command.battery_action.value,
-                command.charge_limit_kw,
-                command.discharge_limit_kw,
-                command.target_soc,
-            )
-
         return ok
 
     async def set_export_limit_kw(self, limit_kw: float) -> bool:
