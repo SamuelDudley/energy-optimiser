@@ -29,10 +29,15 @@ from .result import LPSolution
 
 # Map the inverter mode we actually wrote to the legacy BatteryAction.
 # This is what was *commanded*, not what the LP "wanted" pre-deadband.
+#
+# Mode 4 (CHARGE_PV_FIRST) stays in the table for historical-snapshot
+# replay only — §3.3 retired it from the live dispatch path. Mode 5
+# (DISCHARGE_PV_FIRST) maps to DISCHARGE_PV.
 _MODE_TO_ACTION: dict[RemoteEMSControlMode, BatteryAction] = {
     RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION: BatteryAction.SELF_CONSUME,
     RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST: BatteryAction.CHARGE_GRID,
     RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST: BatteryAction.CHARGE_PV,
+    RemoteEMSControlMode.COMMAND_DISCHARGING_PV_FIRST: BatteryAction.DISCHARGE_PV,
     RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST: BatteryAction.DISCHARGE_ESS,
     RemoteEMSControlMode.STANDBY: BatteryAction.STANDBY,
 }
@@ -42,8 +47,20 @@ def lp_solution_to_planner_output(
     solution: LPSolution,
     dispatch: LPDispatch,
 ) -> PlannerOutput:
-    """Translate an LP outcome to the snapshot-compatible PlannerOutput shape."""
-    action = _MODE_TO_ACTION.get(dispatch.mode, BatteryAction.SELF_CONSUME)
+    """Translate an LP outcome to the snapshot-compatible PlannerOutput shape.
+
+    Mode-keyed mapping covers the bulk of the cases via `_MODE_TO_ACTION`.
+    The one exception: under §3.3 a mode-2 dispatch can carry kind=CHARGE
+    (PV-charge via cutoff). Pure mode-keyed lookup would log it as
+    SELF_CONSUME, losing the LP's intent. Special-case it explicitly.
+    """
+    if (
+        dispatch.kind == DispatchKind.CHARGE
+        and dispatch.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+    ):
+        action = BatteryAction.CHARGE_PV
+    else:
+        action = _MODE_TO_ACTION.get(dispatch.mode, BatteryAction.SELF_CONSUME)
 
     if dispatch.kind == DispatchKind.CHARGE:
         charge_limit_kw = dispatch.cap_kw

@@ -38,8 +38,8 @@ _BAT = BatteryConfig()
 
 
 def dispatch_from_slot(slot: SlotDecision) -> LPDispatch:
-    """Test helper: inject the default BatteryConfig."""
-    return _dispatch_from_slot(slot, _BAT)
+    """Test helper: inject the default BatteryConfig and a neutral SOC."""
+    return _dispatch_from_slot(slot, _BAT, current_soc_pct=50.0)
 
 
 # ── Test scaffolding ─────────────────────────────────────────────

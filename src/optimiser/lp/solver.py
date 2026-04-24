@@ -256,6 +256,7 @@ def _extract_solution(
                 pv_to_house_kw=_v(vars.pv_to_house[t]),
                 pv_to_battery_kw=_v(vars.pv_to_battery[t]),
                 pv_to_export_kw=_v(vars.pv_to_export[t]),
+                grid_to_battery_kw=_v(vars.bat_charge_grid[t]),
                 soc_pct_end=_v(vars.soc_pct[t]),
                 load_kw=load_kw_t,
             )

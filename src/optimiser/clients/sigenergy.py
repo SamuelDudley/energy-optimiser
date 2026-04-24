@@ -886,37 +886,42 @@ class SigenergyController:
     #
     # The LP outputs a continuous signed `battery_kw` for slot 0 (+ charge,
     # − discharge). We map that to one of the inverter's load-following
-    # modes (3/4/6) plus a magnitude cap, rather than mode 0 + a fixed
-    # plant-level setpoint. Reason: mode 0 holds whatever number we last
-    # wrote and doesn't react to actual house load — every load transient
-    # leaks as unintended grid import or export. Modes 3/4/6 let the
-    # inverter handle real-time load following within our magnitude cap;
-    # the LP supplies intent, the inverter supplies sub-second response.
+    # modes (2/3/5/6) plus the relevant auxiliary register (cap or
+    # cutoff), rather than mode 0 + a fixed plant-level setpoint.
+    # Reason: mode 0 holds whatever number we last wrote and doesn't react
+    # to actual house load — every load transient leaks as unintended
+    # grid import or export. The load-following modes let the inverter
+    # handle real-time response within our magnitude cap (modes 3/5/6) or
+    # SOC ceiling (mode 2); the LP supplies intent, the inverter supplies
+    # sub-second response.
     #
-    # Mode mapping:
-    #   |battery_kw| < deadband → mode 2 (SELF_CONSUME), inverter idles
-    #   battery_kw > 0, mostly grid-fed → mode 3 (CHARGE_GRID_FIRST), cap 40032
-    #   battery_kw > 0, mostly PV-fed   → mode 4 (CHARGE_PV_FIRST),   cap 40032
-    #   battery_kw < 0                  → mode 6 (DISCHARGE_ESS_FIRST), cap 40034
-    # Mode 5 (DISCHARGE_PV_FIRST) is intentionally not used: it lets the
-    # inverter skip battery discharge entirely if PV happens to cover house
-    # load, which is the opposite of the LP's intent when it asks to
-    # discharge.
+    # Mode mapping (post §3.3):
+    #   Idle (|battery|<deadband)      → mode 2, write cutoff = current+0.1%
+    #   Charge, grid > pv              → mode 3, write cap (40032) = battery_kw
+    #   Charge, pv ≥ grid              → mode 2, write cutoff (40047) = soc_end
+    #   Discharge, PV producing        → mode 5, write cap (40034) = max_discharge_kw
+    #   Discharge, no PV               → mode 6, write cap (40034) = max_discharge_kw
+    # Mode 4 (COMMAND_CHARGING_PV_FIRST) is no longer emitted — its
+    # cap (40032) is a target, not a ceiling, so any PV droop mid-slot
+    # leaks as grid draw. Mode 2 + dynamic cutoff achieves "PV-charge
+    # up to a ceiling" with no grid-draw risk.
 
     async def apply_lp_dispatch(self, dispatch: LPDispatch) -> bool:
-        """Apply the LP's slot-0 decision via mode + cap registers.
+        """Apply the LP's slot-0 decision via mode + auxiliary registers.
 
-        **Write order: cap first, then mode.** If any write fails partway,
-        the inverter must never be in (new mode, stale cap).
+        **Write order: auxiliary first, then mode.** If any write fails
+        partway, the inverter must never be in (new mode, stale aux).
 
-        - Cap write fails → mode still unchanged, so the half-written cap
-          isn't in force yet. Fallback will overwrite mode to SELF_CONSUME,
-          which doesn't consult the cap registers.
-        - Cap succeeds, mode write fails → cap has been updated but mode
-          is still the old one. The old mode either ignores the cap we
-          touched (e.g. was SELF_CONSUME, or opposite direction), or was
-          the same direction we're now updating — either way, never
-          "new direction with stale cap", which was the S3 hazard.
+        - Auxiliary write fails → mode still unchanged, so the half-written
+          aux isn't in force yet. Fallback will overwrite mode to
+          SELF_CONSUME, which still uses 40047 — but that one was just
+          written successfully (or wasn't needed for the prior mode).
+        - Auxiliary succeeds, mode fails → aux has been updated but mode
+          is the old one. For mode 2's cutoff: the old mode either was
+          mode 2 (so the cutoff was already in scope) or was a charge/
+          discharge mode (which doesn't consult 40047) — never a worse
+          state than before. For modes 3/5/6's cap: same argument with
+          40032 / 40034.
 
         Mode write is still unconditional every tick (even when unchanged)
         as a defensive re-assertion against the inverter quietly reverting
@@ -929,35 +934,59 @@ class SigenergyController:
             if not await self.enable_remote_ems():
                 return False
 
-        # Write the relevant cap FIRST. If it fails, return early WITHOUT
-        # touching the mode register — writing mode on top of a failed cap
-        # write would leave the inverter in (new direction, stale cap),
-        # which is the very state this ordering is designed to prevent.
-        if dispatch.mode in (
-            RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST,
-            RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST,
-        ):
+        mode = dispatch.mode
+
+        # Write the relevant auxiliary register FIRST. Failure here aborts
+        # the apply; the mode register is left untouched so the inverter
+        # stays in its previous (known-good) configuration until fallback
+        # or the next tick.
+        if mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION:
+            # Mode 2 — the auxiliary is reg 40047 (charge cutoff SOC).
+            # `target_soc_pct` is set by `dispatch_from_slot` and already
+            # clamped to be safely above current SOC. If it's somehow
+            # None on a mode-2 dispatch (programmer error), skip the
+            # cutoff write — the prior cutoff stays in force, which is
+            # safe but not ideal. Log loudly.
+            if dispatch.target_soc_pct is None:
+                logger.warning(
+                    "apply_lp_dispatch: mode 2 dispatch missing target_soc_pct; "
+                    "leaving cutoff (40047) untouched"
+                )
+            else:
+                cutoff_raw = max(0, min(1000, int(round(dispatch.target_soc_pct * 10))))
+                if not await self._write_u16(REG_CHARGE_CUTOFF_SOC, cutoff_raw):
+                    return False
+        elif mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST:
             cap_raw = max(0, int(round(dispatch.cap_kw * 1000)))
             if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, cap_raw):
                 return False
-        elif dispatch.mode == RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST:
+        elif mode in (
+            RemoteEMSControlMode.COMMAND_DISCHARGING_PV_FIRST,
+            RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST,
+        ):
             cap_raw = max(0, int(round(dispatch.cap_kw * 1000)))
             if not await self._write_u32(REG_ESS_MAX_DISCHARGING_LIMIT, cap_raw):
                 return False
-        # SELF_CONSUME → no cap to write
+        else:
+            # Should never happen — dispatch_from_slot only produces the
+            # modes handled above. Bail loudly rather than write mode
+            # over a missing-aux state.
+            logger.error(
+                "apply_lp_dispatch: unexpected mode %s; refusing to write",
+                mode.name,
+            )
+            return False
 
         # THEN assert the mode register. Always written (even if unchanged)
         # so a mode reset from a brief comms drop gets re-asserted.
-        if not await self._write_u16(
-            REG_REMOTE_EMS_CONTROL_MODE,
-            dispatch.mode.value,
-        ):
+        if not await self._write_u16(REG_REMOTE_EMS_CONTROL_MODE, mode.value):
             return False
 
         logger.info(
-            "Applied LP dispatch: mode=%s cap=%.2fkW intent=%+.2fkW",
-            dispatch.mode.name,
+            "Applied LP dispatch: mode=%s cap=%.2fkW target_soc=%s intent=%+.2fkW",
+            mode.name,
             dispatch.cap_kw,
+            f"{dispatch.target_soc_pct:.1f}%" if dispatch.target_soc_pct is not None else "n/a",
             dispatch.signed_intent_kw,
         )
         return True

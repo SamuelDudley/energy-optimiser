@@ -346,7 +346,9 @@ class TestRunLPFallbackSideEffects:
         # Pretend a previous tick had recorded a command
         from optimiser.lp.dispatch import dispatch_from_slot
 
-        await svc._lp_runtime.record_command(dispatch_from_slot(_make_slot(), BatteryConfig()))
+        await svc._lp_runtime.record_command(
+            dispatch_from_slot(_make_slot(), BatteryConfig(), current_soc_pct=50.0)
+        )
         assert svc._lp_runtime.commanded is not None
 
         solution = _make_solution(status=SolveStatus.INFEASIBLE, slot_0=None)

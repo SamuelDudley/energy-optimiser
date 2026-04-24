@@ -37,10 +37,19 @@ NOW = datetime(2026, 4, 15, 12, 0, 0, tzinfo=UTC)
 _BAT = BatteryConfig()
 
 
-def dispatch_from_slot(slot: SlotDecision, measured_pv_kw: float | None = None) -> object:
-    """Test helper: injects the default BatteryConfig so test bodies stay
-    focused on the (slot → dispatch) mapping."""
-    return _dispatch_from_slot(slot, _BAT, measured_pv_kw=measured_pv_kw)
+def dispatch_from_slot(
+    slot: SlotDecision,
+    measured_pv_kw: float | None = None,
+    current_soc_pct: float = 50.0,
+) -> object:
+    """Test helper: injects the default BatteryConfig and a neutral SOC so
+    test bodies stay focused on the (slot → dispatch) mapping."""
+    return _dispatch_from_slot(
+        slot,
+        _BAT,
+        current_soc_pct=current_soc_pct,
+        measured_pv_kw=measured_pv_kw,
+    )
 
 
 def _slot(
@@ -51,6 +60,7 @@ def _slot(
     pv_to_export_kw: float = 0.0,
     grid_import_kw: float = 0.0,
     grid_export_kw: float = 0.0,
+    grid_to_battery_kw: float = 0.0,
     soc_pct_end: float = 50.0,
 ) -> SlotDecision:
     """Test factory — defaults to a do-nothing slot."""
@@ -62,6 +72,7 @@ def _slot(
         pv_to_house_kw=pv_to_house_kw,
         pv_to_battery_kw=pv_to_battery_kw,
         pv_to_export_kw=pv_to_export_kw,
+        grid_to_battery_kw=grid_to_battery_kw,
         soc_pct_end=soc_pct_end,
     )
 
@@ -72,43 +83,104 @@ def _slot(
 class TestDispatchFromSlot:
     """The mapping from LP's signed battery_kw to (mode, cap)."""
 
-    def test_deadband_maps_to_self_consume(self) -> None:
-        # Below 100W either side → SELF_CONSUME, no cap
+    def test_deadband_maps_to_self_consume_with_cutoff_above_current(self) -> None:
+        # Below 100W either side → SELF_CONSUME under mode 2. Cutoff is
+        # written to current_soc + buffer so a stale higher cutoff from
+        # a previous tick can't keep PV trickling into the battery.
         for kw in (0.0, 0.05, -0.05, DEADBAND_KW - 0.001):
-            d = dispatch_from_slot(_slot(battery_kw=kw))
+            d = dispatch_from_slot(_slot(battery_kw=kw), current_soc_pct=60.0)
             assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
             assert d.kind == DispatchKind.SELF_CONSUME
             assert d.cap_kw == 0.0
             assert d.signed_intent_kw == kw
+            # Cutoff = current + 0.1% buffer (per the probe-mandated clamp)
+            assert d.target_soc_pct == 60.1
 
     def test_charge_grid_dominant_picks_mode_3(self) -> None:
-        # 5kW charge with only 1kW from PV → 4kW from grid → grid-dominant
-        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=1.0))
+        # 5 kW charge with grid contributing more than PV → mode 3,
+        # cap = total intended rate. No cutoff write (mode 3 doesn't
+        # consult 40047).
+        d = dispatch_from_slot(
+            _slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0)
+        )
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
         assert d.kind == DispatchKind.CHARGE
-        assert d.cap_kw == 5.0  # total intended charge rate
-        assert d.signed_intent_kw == 5.0
-
-    def test_charge_pv_dominant_picks_mode_4(self) -> None:
-        # 5kW charge with 4kW from PV → 1kW from grid → PV-dominant
-        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=4.0))
-        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
         assert d.cap_kw == 5.0
+        assert d.signed_intent_kw == 5.0
+        assert d.target_soc_pct is None
 
-    def test_charge_pv_only_picks_mode_4(self) -> None:
-        # All charge from PV (e.g. midday surplus) → PV-first
-        d = dispatch_from_slot(_slot(battery_kw=3.0, pv_to_battery_kw=3.0))
-        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
+    def test_charge_pv_dominant_picks_mode_2_with_cutoff(self) -> None:
+        # 5 kW charge, PV contributes more than grid → mode 2 + cutoff =
+        # planned end-of-slot SOC. The §3.3 swap from mode 4 → mode 2
+        # eliminates mode 4's silent grid-draw hazard when PV droops
+        # mid-slot.
+        d = dispatch_from_slot(
+            _slot(
+                battery_kw=5.0,
+                pv_to_battery_kw=4.0,
+                grid_to_battery_kw=1.0,
+                soc_pct_end=72.0,
+            ),
+            current_soc_pct=60.0,
+        )
+        assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+        assert d.kind == DispatchKind.CHARGE
+        assert d.cap_kw == 0.0  # mode 2 doesn't use 40032
+        assert d.target_soc_pct == 72.0  # already > current + 0.1, no clamp
+
+    def test_charge_pv_only_picks_mode_2_with_cutoff(self) -> None:
+        # All charge from PV (e.g. midday surplus) → mode 2 + cutoff
+        d = dispatch_from_slot(
+            _slot(
+                battery_kw=3.0,
+                pv_to_battery_kw=3.0,
+                grid_to_battery_kw=0.0,
+                soc_pct_end=68.0,
+            ),
+            current_soc_pct=60.0,
+        )
+        assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+        assert d.target_soc_pct == 68.0
 
     def test_charge_grid_only_picks_mode_3(self) -> None:
         # No PV available (e.g. overnight cheap charging) → grid-first
-        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=0.0))
+        d = dispatch_from_slot(
+            _slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0)
+        )
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
 
     def test_charge_equal_split_prefers_pv(self) -> None:
-        # Tie-breaker: PV-first when contributions are equal (free energy)
-        d = dispatch_from_slot(_slot(battery_kw=4.0, pv_to_battery_kw=2.0))
-        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
+        # Tie-breaker: when grid == pv, prefer the mode-2 (PV) path.
+        # Slightly under-executes the grid portion but avoids mode 4's
+        # grid-draw hazard.
+        d = dispatch_from_slot(
+            _slot(
+                battery_kw=4.0,
+                pv_to_battery_kw=2.0,
+                grid_to_battery_kw=2.0,
+                soc_pct_end=70.0,
+            ),
+            current_soc_pct=60.0,
+        )
+        assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+        assert d.target_soc_pct == 70.0
+
+    def test_pv_charge_cutoff_clamped_above_current_soc(self) -> None:
+        # Mandatory clamp from the 2026-04-24 probe: cutoff at or below
+        # current SOC is leaky (inverter trickles PV in). The +0.1%
+        # buffer puts it unambiguously above.
+        d = dispatch_from_slot(
+            _slot(
+                battery_kw=2.0,
+                pv_to_battery_kw=2.0,
+                grid_to_battery_kw=0.0,
+                # LP planned SOC ends UNDER current — implausible in
+                # production but the clamp must guard regardless.
+                soc_pct_end=50.0,
+            ),
+            current_soc_pct=70.0,
+        )
+        assert d.target_soc_pct == 70.1  # current + buffer, not 50.0
 
     def test_discharge_with_pv_producing_picks_mode_5(self) -> None:
         # PV is producing → use mode 5 (DISCHARGING_PV_FIRST) so the inverter
@@ -167,34 +239,76 @@ class TestVerifyBatteryResponse:
         assert verify_battery_response(d, measured_kw=10.0) == DeviationKind.NOT_VERIFIED
         assert verify_battery_response(d, measured_kw=-10.0) == DeviationKind.NOT_VERIFIED
 
+    # Verification tests use **grid-dominant** charge slots so the
+    # dispatch lands on mode 3 with cap_kw = LP-planned rate. Mode 2
+    # (PV-charge) sets cap_kw = 0 and the over-cap check doesn't
+    # apply — see the dedicated mode-2 tests further down.
+
     def test_charge_at_cap_is_ok(self) -> None:
-        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=4.0))
+        d = dispatch_from_slot(
+            _slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0)
+        )
         # Inverter charging at exactly cap → OK
         assert verify_battery_response(d, measured_kw=5.0) == DeviationKind.OK
 
     def test_charge_under_cap_is_ok(self) -> None:
-        # Inverter charging at less than cap (e.g. PV not enough, grid
-        # constrained) is acceptable — not all our headroom must be used.
-        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=4.0))
+        # Inverter charging at less than cap (e.g. grid constrained) is
+        # acceptable — not all our headroom must be used.
+        d = dispatch_from_slot(
+            _slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0)
+        )
         assert verify_battery_response(d, measured_kw=2.0) == DeviationKind.OK
         assert verify_battery_response(d, measured_kw=0.0) == DeviationKind.OK
 
     def test_charge_with_small_negative_within_floor_is_ok(self) -> None:
         # Measurement noise near zero — 200W discharge while we asked
         # for charge isn't a real deviation, just sensor jitter.
-        d = dispatch_from_slot(_slot(battery_kw=3.0, pv_to_battery_kw=2.0))
+        d = dispatch_from_slot(
+            _slot(battery_kw=3.0, pv_to_battery_kw=0.0, grid_to_battery_kw=3.0)
+        )
         assert verify_battery_response(d, measured_kw=-0.2) == DeviationKind.OK
 
     def test_charge_actually_discharging_is_wrong_direction(self) -> None:
-        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=0.0))
+        d = dispatch_from_slot(
+            _slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0)
+        )
         # Inverter discharging at 2kW when we asked for charge
         assert verify_battery_response(d, measured_kw=-2.0) == DeviationKind.WRONG_DIRECTION
 
     def test_charge_well_over_cap_is_over_cap(self) -> None:
-        d = dispatch_from_slot(_slot(battery_kw=3.0, pv_to_battery_kw=2.0))
+        d = dispatch_from_slot(
+            _slot(battery_kw=3.0, pv_to_battery_kw=0.0, grid_to_battery_kw=3.0)
+        )
         # 5% tolerance: 3.0 × 1.05 = 3.15 — above that is OVER_CAP
         assert verify_battery_response(d, measured_kw=3.1) == DeviationKind.OK
         assert verify_battery_response(d, measured_kw=4.0) == DeviationKind.OVER_CAP
+
+    def test_mode2_charge_skips_over_cap_check(self) -> None:
+        # Mode-2 PV-charge has cap_kw = 0 (the LP doesn't bound the
+        # instantaneous rate; PV produces what it produces, bounded by
+        # the physical 13 kW DC limit). The over-cap check is
+        # meaningless — the cutoff (40047) bounds total *energy* via
+        # SOC, not instantaneous power. The watcher should still flag
+        # wrong direction but accept any positive measurement.
+        d = dispatch_from_slot(
+            _slot(
+                battery_kw=3.0,
+                pv_to_battery_kw=3.0,
+                grid_to_battery_kw=0.0,
+                soc_pct_end=70.0,
+            ),
+            current_soc_pct=60.0,
+        )
+        assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+        assert d.cap_kw == 0.0
+        # Wrong direction still caught
+        assert (
+            verify_battery_response(d, measured_kw=-2.0)
+            == DeviationKind.WRONG_DIRECTION
+        )
+        # High charge rate is OK — no instantaneous cap under mode 2
+        assert verify_battery_response(d, measured_kw=8.0) == DeviationKind.OK
+        assert verify_battery_response(d, measured_kw=12.5) == DeviationKind.OK
 
     def test_discharge_at_cap_is_ok(self) -> None:
         d = dispatch_from_slot(_slot(battery_kw=-5.0))

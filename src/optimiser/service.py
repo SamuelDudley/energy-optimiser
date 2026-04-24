@@ -826,6 +826,7 @@ class Service:
         dispatch = dispatch_from_slot(
             solution.slot_0,
             self._config.battery,
+            current_soc_pct=state.soc_pct,
             measured_pv_kw=state.pv_power_kw,
         )
         return solution, dispatch

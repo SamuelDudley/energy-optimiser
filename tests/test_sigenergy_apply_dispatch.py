@@ -51,12 +51,24 @@ def _discharge_dispatch(kw: float = 4.0) -> LPDispatch:
     )
 
 
-def _self_consume_dispatch() -> LPDispatch:
+def _self_consume_dispatch(target_soc_pct: float | None = None) -> LPDispatch:
     return LPDispatch(
         mode=RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION,
         cap_kw=0.0,
         signed_intent_kw=0.0,
         kind=DispatchKind.SELF_CONSUME,
+        target_soc_pct=target_soc_pct,
+    )
+
+
+def _mode2_charge_dispatch(target_soc_pct: float = 70.0) -> LPDispatch:
+    """A §3.3 PV-charge dispatch: mode 2, no cap, cutoff carries intent."""
+    return LPDispatch(
+        mode=RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION,
+        cap_kw=0.0,
+        signed_intent_kw=3.0,
+        kind=DispatchKind.CHARGE,
+        target_soc_pct=target_soc_pct,
     )
 
 
@@ -127,23 +139,66 @@ class TestWriteOrdering:
             RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST.value,
         )
 
-    async def test_self_consume_writes_only_mode(
+    async def test_self_consume_without_target_soc_writes_only_mode(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # Defensive path: a mode-2 dispatch missing target_soc_pct (e.g.
+        # constructed by tests, or hypothetically by a code path that
+        # doesn't go through dispatch_from_slot) skips the cutoff write
+        # and only writes the mode. Production dispatches always carry
+        # target_soc_pct under §3.3 — see TestMode2Idle below.
         ctrl = _controller()
         rec = _WriteRecorder()
         _install_recorder(ctrl, monkeypatch, rec)
 
         assert await ctrl.apply_lp_dispatch(_self_consume_dispatch())
 
-        # SELF_CONSUME has no cap — only the mode write happens
         assert len(rec.calls) == 1
         assert rec.calls[0] == (
             "u16",
             REG_REMOTE_EMS_CONTROL_MODE,
             RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
         )
+
+    async def test_mode2_charge_writes_cutoff_before_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The §3.3 PV-charge path: write reg 40047 (cutoff SOC) FIRST,
+        then reg 40031 (mode). Symmetric with the cap-before-mode rule
+        for mode 3 — if the cutoff write fails, we don't want to land
+        on mode 2 with whatever stale cutoff was previously there."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        assert await ctrl.apply_lp_dispatch(_mode2_charge_dispatch(target_soc_pct=72.0))
+
+        assert len(rec.calls) == 2
+        assert rec.calls[0] == ("u16", REG_CHARGE_CUTOFF_SOC, 720)  # 72.0% × 10
+        assert rec.calls[1] == (
+            "u16",
+            REG_REMOTE_EMS_CONTROL_MODE,
+            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
+        )
+
+    async def test_mode2_idle_writes_cutoff_at_current_soc(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Idle (kind=SELF_CONSUME) under §3.3 still writes 40047 — to
+        current_soc + buffer — so a stale higher cutoff from a previous
+        charge tick doesn't leak PV into the battery."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        assert await ctrl.apply_lp_dispatch(_self_consume_dispatch(target_soc_pct=58.5))
+
+        assert len(rec.calls) == 2
+        assert rec.calls[0] == ("u16", REG_CHARGE_CUTOFF_SOC, 585)
+        assert rec.calls[1][:2] == ("u16", REG_REMOTE_EMS_CONTROL_MODE)
 
 
 class TestWriteFailureSafety:
@@ -166,6 +221,26 @@ class TestWriteFailureSafety:
         # Only the cap attempt happened — no mode write
         assert len(rec.calls) == 1
         assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
+
+    async def test_mode2_cutoff_failure_aborts_before_mode_write(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Symmetric with cap-failure-aborts: if 40047 (cutoff) write
+        fails on a mode-2 dispatch, we must NOT proceed to write mode.
+        The mode register is left unchanged so the inverter stays in
+        whatever known-good mode the previous tick left it in."""
+        ctrl = _controller()
+        rec = _WriteRecorder(
+            u16_returns={REG_CHARGE_CUTOFF_SOC: False},  # cutoff fails
+        )
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        result = await ctrl.apply_lp_dispatch(_mode2_charge_dispatch())
+
+        assert result is False
+        assert len(rec.calls) == 1
+        assert rec.calls[0][:2] == ("u16", REG_CHARGE_CUTOFF_SOC)
 
     async def test_mode_failure_after_successful_cap_returns_false(
         self,

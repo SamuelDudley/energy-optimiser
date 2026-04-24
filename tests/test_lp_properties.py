@@ -130,7 +130,9 @@ def _solve(
         f"LP failed: {sol.status.value} — {sol.reason}"
     )
     assert sol.slot_0 is not None
-    return sol, dispatch_from_slot(sol.slot_0, battery_config or BatteryConfig())
+    return sol, dispatch_from_slot(
+        sol.slot_0, battery_config or BatteryConfig(), current_soc_pct=soc
+    )
 
 
 # ── Charge behaviour ─────────────────────────────────────────────

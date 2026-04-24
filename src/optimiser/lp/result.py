@@ -31,6 +31,12 @@ class SlotDecision:
     pv_to_battery_kw: float
     pv_to_export_kw: float
     soc_pct_end: float  # SOC at end of this slot
+    # Grid contribution to battery charging in this slot. Read directly
+    # off the LP variable rather than inferred via subtraction — needed
+    # by the §3.3 dispatch path to choose mode 3 (grid-charge) vs mode 2
+    # (PV-charge via cutoff). Default 0.0 keeps positional construction
+    # in tests working.
+    grid_to_battery_kw: float = 0.0
     load_kw: dict[str, float] = field(default_factory=dict)  # per load_id
 
 

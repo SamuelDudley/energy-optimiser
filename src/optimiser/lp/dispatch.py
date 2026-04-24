@@ -34,6 +34,14 @@ DEADBAND_KW: float = 0.1
 # load-follows, using PV first and topping up from battery if short.
 PV_PRODUCING_THRESHOLD_KW: float = 0.2
 
+# Buffer added above current SOC when writing the charge cutoff under
+# mode 2. The 2026-04-24 hardware probe showed that writing cutoff at
+# or below current SOC is a leaky idle signal — the inverter trickles
+# ~1 kW of PV in rather than fully stopping. The +0.1% buffer puts the
+# cutoff unambiguously above the current SOC reading so the inverter
+# sees a clear ceiling. See PLAN-3.3.md "Probe results" for data.
+CUTOFF_BUFFER_PCT: float = 0.1
+
 
 class DispatchKind(StrEnum):
     """High-level intent for verification and logging.
@@ -54,86 +62,124 @@ class LPDispatch:
     `mode` and `cap_kw` go to the inverter. `signed_intent_kw` and `kind`
     are kept for the watcher and snapshot, so we can verify the inverter
     respected our intent without re-deriving it from raw register values.
+
+    `target_soc_pct` is set only for mode-2 dispatches (idle and PV-
+    dominant charge under §3.3): it's the value we write to register
+    40047 to express "charge PV up to here, then stop". Already clamped
+    by `dispatch_from_slot` to be safely above current SOC — apply
+    paths can write it as-is. None for mode-3 charge and mode-5/6
+    discharge, which don't consult 40047 in the apply path.
     """
 
     mode: RemoteEMSControlMode
     cap_kw: float  # magnitude (≥ 0); 0 for SELF_CONSUME
     signed_intent_kw: float  # the LP's signed battery_kw (+ charge, − discharge)
     kind: DispatchKind
+    target_soc_pct: float | None = None
+
+
+def _safe_cutoff_pct(target_pct: float, current_soc_pct: float) -> float:
+    """Clamp a charge-cutoff target so it sits unambiguously above current SOC.
+
+    Required by the 2026-04-24 hardware probe: the inverter trickles
+    PV in when cutoff equals or sits below current SOC. The +0.1%
+    buffer puts the cutoff above the current reading (within float
+    quantisation) so the inverter sees a clear ceiling. Also clamps
+    to [0, 100] for register sanity.
+    """
+    return max(0.0, min(100.0, max(target_pct, current_soc_pct + CUTOFF_BUFFER_PCT)))
 
 
 def dispatch_from_slot(
     slot_0: SlotDecision,
     battery_config: BatteryConfig,
+    *,
+    current_soc_pct: float,
     measured_pv_kw: float | None = None,
 ) -> LPDispatch:
     """Turn the LP's slot-0 decision into an inverter-ready dispatch.
 
     Mapping:
-      |battery_kw| < DEADBAND_KW       → SELF_CONSUME (mode 2), cap = 0
+      |battery_kw| < DEADBAND_KW       → SELF_CONSUME (mode 2), target = current_soc + buffer
       battery_kw > 0, grid-dominant    → CHARGE_GRID_FIRST (mode 3), cap = battery_kw
-      battery_kw > 0, PV-dominant      → CHARGE_PV_FIRST   (mode 4), cap = battery_kw
+      battery_kw > 0, PV-dominant      → SELF_CONSUMPTION (mode 2), target = soc_pct_end
       battery_kw < 0, PV > threshold   → DISCHARGE_PV_FIRST (mode 5), cap = max_discharge_kw
       battery_kw < 0, PV ≤ threshold   → DISCHARGE_ESS_FIRST (mode 6), cap = max_discharge_kw
 
-    Charge cap uses the LP's intended rate: charging is directly controllable
-    and exceeding the plan wastes money (e.g. charging harder than the cheap
-    window supports, or over-charging from grid when PV was planned to take
-    over soon).
+    PV-dominant charge uses **mode 2 + dynamic charge_cut_off_soc** rather
+    than mode 4 (`COMMAND_CHARGING_PV_FIRST`). Mode 4's reg 40032 is a
+    target, not a ceiling — when PV droops mid-slot the inverter pulls
+    grid to hit the target, which is a silent grid-draw hazard in
+    cloudy conditions. Mode 2's priority cascade
+    (`PV → load → battery (up to cutoff) → export → curtail`) achieves
+    "charge from PV up to a ceiling" with no grid-draw risk and no
+    transient-margin tuning knob. See `SIGENERGY-MODES.md` and
+    `PLAN-3.3.md` for the full rationale.
 
-    Discharge cap uses the *physical* max_discharge_kw, NOT the LP's point
-    estimate of house load. The LP plans around an expected load; if actual
-    load spikes above that (kettle, AC, oven), a tight cap would force the
-    shortfall to grid import at full retail, which is strictly worse than
-    battery wear down to the SOC floor. The LP's signed_intent_kw is
-    preserved for the watcher and the snapshot so we can still verify the
-    inverter's general direction.
+    Mode 4 stays in `RemoteEMSControlMode` for historical replay only;
+    this dispatch never emits it.
 
-    Discharge mode selection (5 vs 6) is driven by whether PV is producing
-    meaningfully now. Mode 6 zeroes PV generation entirely (verified on
-    hardware, see SIGENERGY-MODES.md), so using it while the sun is up
-    throws away free energy. Mode 5 load-follows: PV supplies load + export
-    first, battery tops up any shortfall. When PV ≈ 0 (night), mode 6 is
-    the only mode that actually discharges — mode 5 would idle the battery.
+    Idle (`|battery_kw| < DEADBAND_KW`) also routes through mode 2 with
+    `target = current_soc + buffer`. Reason: if a previous tick wrote a
+    higher cutoff (legitimate charge), an idle tick that didn't rewrite
+    40047 would let PV continue charging up to the stale ceiling. Always
+    writing the cutoff each tick keeps the "charge ceiling" honest.
 
-    "Grid-dominant" means the LP plans to source more of the charge from grid
-    than from PV in this slot. We then ask the inverter to prefer that source
-    (the "first" in the mode name); the cap is the *total* intended charge
-    rate and the inverter supplies the remainder from the secondary source if
-    the primary is short.
+    Charge cap (mode-3 path) uses the LP's intended rate: grid charge is
+    directly controllable and exceeding the plan wastes money.
 
-    `measured_pv_kw` is the live PV reading from telemetry; None means the
-    caller doesn't have it (replay, smoke, tests) — we fall back to the
-    LP's planned PV flows in slot_0 as a proxy.
+    Discharge cap uses the *physical* max_discharge_kw, NOT the LP's
+    point estimate of house load. The LP plans around an expected load;
+    if actual load spikes above that (kettle, AC, oven), a tight cap
+    would force the shortfall to grid import at full retail.
+
+    Discharge mode selection (5 vs 6) is driven by whether PV is
+    producing meaningfully now. Mode 6 zeroes PV generation entirely
+    (verified on hardware, see SIGENERGY-MODES.md).
+
+    "Grid-dominant" reads the LP variable `slot_0.grid_to_battery_kw`
+    directly (vs the previous behaviour of inferring it via subtraction).
+    Cleaner and avoids rounding artefacts.
+
+    `current_soc_pct` is the live SOC at the start of this slot — used
+    for the cutoff clamp on the mode-2 paths.
+
+    `measured_pv_kw` is the live PV reading from telemetry; None means
+    the caller doesn't have it (replay, smoke, tests) — we fall back to
+    the LP's planned PV flows in slot_0 as a proxy.
     """
     battery_kw = slot_0.battery_kw
 
     if abs(battery_kw) < DEADBAND_KW:
+        # Idle — write current_soc + buffer as the cutoff so any stale
+        # higher cutoff from a previous tick is overwritten.
         return LPDispatch(
             mode=RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION,
             cap_kw=0.0,
             signed_intent_kw=battery_kw,
             kind=DispatchKind.SELF_CONSUME,
+            target_soc_pct=_safe_cutoff_pct(current_soc_pct, current_soc_pct),
         )
 
     if battery_kw > 0:
-        # Charging. Decide grid-first vs PV-first based on which source
-        # is contributing more in the LP solution. With pv_to_battery == 0
-        # (no PV available), grid-dominant is the only sensible choice.
-        # When PV ≥ grid contribution, prefer PV-first to avoid paying for
-        # grid when free solar exists.
-        pv_kw = slot_0.pv_to_battery_kw
-        grid_kw = max(0.0, battery_kw - pv_kw)
-        mode = (
-            RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
-            if grid_kw > pv_kw
-            else RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
-        )
+        # Charging. Read grid contribution directly from the LP solution
+        # (no inference). When grid > pv we want explicit mode-3 grid
+        # charging so the cap (40032) is honoured; when pv ≥ grid (or
+        # pv-only), use mode 2 + cutoff so the inverter charges from PV
+        # up to the planned end-of-slot SOC and never grid-draws.
+        if slot_0.grid_to_battery_kw > slot_0.pv_to_battery_kw:
+            return LPDispatch(
+                mode=RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST,
+                cap_kw=battery_kw,
+                signed_intent_kw=battery_kw,
+                kind=DispatchKind.CHARGE,
+            )
         return LPDispatch(
-            mode=mode,
-            cap_kw=battery_kw,
+            mode=RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION,
+            cap_kw=0.0,
             signed_intent_kw=battery_kw,
             kind=DispatchKind.CHARGE,
+            target_soc_pct=_safe_cutoff_pct(slot_0.soc_pct_end, current_soc_pct),
         )
 
     # Discharging. Pick mode 5 if PV is producing, mode 6 otherwise.
@@ -197,7 +243,15 @@ def verify_battery_response(
         # for charge. Direction wrong.
         if measured_kw < -deviation_floor_kw:
             return DeviationKind.WRONG_DIRECTION
-        if measured_kw > dispatch.cap_kw * CAP_OVERSHOOT_TOLERANCE:
+        # cap_kw > 0 → mode 3 grid-charge with the LP's planned rate.
+        # Over-cap is meaningful: the inverter is charging harder than
+        # we asked, costing more grid import than planned.
+        # cap_kw == 0 → mode 2 PV-charge via cutoff. There's no
+        # meaningful instantaneous cap (the inverter charges at whatever
+        # PV produces, bounded only by the physical 13 kW DC limit).
+        # Skip the over-cap check; the cutoff (40047) bounds total
+        # energy via end-of-slot SOC, not instantaneous power.
+        if dispatch.cap_kw > 0 and measured_kw > dispatch.cap_kw * CAP_OVERSHOOT_TOLERANCE:
             return DeviationKind.OVER_CAP
         return DeviationKind.OK
 
