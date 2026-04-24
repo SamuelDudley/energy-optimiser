@@ -54,6 +54,11 @@ services:
       EO_WATCHDOG_STALE_SECONDS: "90"   # 1.5× tick_interval_s
       EO_WATCHDOG_POLL_SECONDS: "15"
       EO_WATCHDOG_GRACE_SECONDS: "180"  # startup can take 60-90s with all fetches
+      # Reg 40032 (ESS_MAX_CHARGING_LIMIT) write on fallback. Raw = kW × 1000.
+      # Default 13000 (13 kW) matches the PV array nameplate. Increase when
+      # PV array is upgraded — the inverter BMS clamps internally at its
+      # current acceptance headroom anyway (see reg 30047).
+      EO_WATCHDOG_MAX_CHARGE_RAW: "13000"
     logging:
       driver: json-file
       options:
