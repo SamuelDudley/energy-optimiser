@@ -822,6 +822,16 @@ class SigenergyController:
         if not self._remote_ems_enabled:
             if not await self.enable_remote_ems():
                 return False
+        # Uncap the charge leg (reg 40032) before we switch to mode 2 —
+        # otherwise a stale low value from a prior mode-3 dispatch caps
+        # battery DC charge in the fallback state too, and surplus PV
+        # curtails instead of soaking into the battery. See the note in
+        # apply_lp_dispatch's mode-2 branch; fallback inherits the same
+        # hazard because mode 2's cascade honours 40032.
+        max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
+        charge_cap_ok = await self._write_u32(
+            REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw
+        )
         mode_ok = await self._write_u16(
             REG_REMOTE_EMS_CONTROL_MODE,
             RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
@@ -830,7 +840,7 @@ class SigenergyController:
             REG_GRID_EXPORT_LIMIT,
             int(export_cap_kw * 1000),
         )
-        return mode_ok and export_ok
+        return charge_cap_ok and mode_ok and export_ok
 
     # ── LP dispatch path ──────────────────────────────────────────
     #
@@ -891,12 +901,29 @@ class SigenergyController:
         # stays in its previous (known-good) configuration until fallback
         # or the next tick.
         if mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION:
-            # Mode 2 — the auxiliary is reg 40047 (charge cutoff SOC).
+            # Mode 2 writes two auxiliary registers before mode:
+            #
+            # 1. reg 40032 (ESS_MAX_CHARGING_LIMIT) = physical DC max.
+            #    Mode 2's cascade is `PV → load → battery up to cutoff →
+            #    export → curtail`. The inverter honours 40032 as a cap on
+            #    the battery leg even in mode 2 — if 40032 is left at a
+            #    stale low value from a previous mode-3/4 dispatch, the
+            #    battery gets throttled and surplus PV curtails instead
+            #    of DC-charging. Verified on hardware 2026-04-24: with
+            #    40032 at 2.38 kW (left over from a prior mode-3 tick),
+            #    blocking export dropped PV to ~2.7 kW instead of soaking
+            #    into battery.  Writing max_dc_charge_kw uncaps the leg
+            #    so the battery accepts whatever PV provides.
+            # 2. reg 40047 (CHARGE_CUTOFF_SOC) — bounds charging by SOC.
+            #
             # `target_soc_pct` is set by `dispatch_from_slot` and already
             # clamped to be safely above current SOC. If it's somehow
             # None on a mode-2 dispatch (programmer error), skip the
             # cutoff write — the prior cutoff stays in force, which is
             # safe but not ideal. Log loudly.
+            max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
+            if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw):
+                return False
             if dispatch.target_soc_pct is None:
                 logger.warning(
                     "apply_lp_dispatch: mode 2 dispatch missing target_soc_pct; "

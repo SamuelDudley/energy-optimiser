@@ -64,6 +64,7 @@ from pymodbus.client import AsyncModbusTcpClient
 # these ever change, both places need updating.
 REG_REMOTE_EMS_ENABLE = 40029  # U16: 0 = disabled (local EMS), 1 = enabled
 REG_REMOTE_EMS_CONTROL_MODE = 40031  # U16: RemoteEMSControlMode
+REG_ESS_MAX_CHARGING_LIMIT = 40032  # U32: W (gain=1000 → raw kW × 1000)
 REG_GRID_EXPORT_POWER_LIMIT = 40038  # U16: kW * 1000 (0 = no export)
 
 MODE_MAXIMUM_SELF_CONSUMPTION = 2  # RemoteEMSControlMode enum value
@@ -143,20 +144,83 @@ async def _write_register(
     return False  # unreachable (loop always returns); silences type checkers
 
 
+async def _write_u32_register(
+    client: AsyncModbusTcpClient,
+    slave_id: int,
+    address: int,
+    value: int,
+    label: str,
+) -> bool:
+    """U32 variant of _write_register for the two-register gain-1000 caps.
+
+    Mirrors the retry semantics of _write_register; uses client.write_registers
+    (plural) with the high/low word split that pymodbus's u32 encoding
+    expects.
+    """
+    hi = (value >> 16) & 0xFFFF
+    lo = value & 0xFFFF
+    for attempt in range(1, WRITE_MAX_ATTEMPTS + 1):
+        try:
+            result = await client.write_registers(
+                address=address, values=[hi, lo], device_id=slave_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "write %s (%d=%d u32) attempt %d/%d raised: %s",
+                label, address, value, attempt, WRITE_MAX_ATTEMPTS, exc,
+            )
+            if attempt < WRITE_MAX_ATTEMPTS:
+                try:
+                    await client.connect()
+                except Exception:
+                    pass
+                await asyncio.sleep(WRITE_RETRY_BACKOFF_S)
+                continue
+            logger.error(
+                "write %s (%d=%d u32) failed after %d attempts: last exc=%s",
+                label, address, value, WRITE_MAX_ATTEMPTS, exc,
+            )
+            return False
+        if result.isError():
+            logger.error(
+                "write %s (%d=%d u32) returned error: %s",
+                label, address, value, result,
+            )
+            return False
+        return True
+    return False
+
+
 async def _trigger_fallback(
-    client: AsyncModbusTcpClient, slave_id: int
+    client: AsyncModbusTcpClient, slave_id: int, max_charge_raw: int
 ) -> bool:
     """Drive the inverter to an explicit known-safe state.
 
-    Three writes in order: mode=MAXIMUM_SELF_CONSUMPTION, export_limit=0,
-    remote_ems_enable=1. If any of those fails, fall through to a
+    Four writes in order: 40032 (ESS_MAX_CHARGING_LIMIT) = max DC charge
+    rate, 40031 (mode) = MAXIMUM_SELF_CONSUMPTION, 40038 (export_limit) = 0,
+    40029 (REMOTE_EMS_ENABLE) = 1. If any of those fails, fall through to a
     last-resort single write (remote_ems_enable=0) that hands control back
     to the inverter's local EMS config.
+
+    Writing 40032 to the physical DC max matters even though this is a
+    "safe state": the inverter honours 40032 as a cap on battery charging
+    in mode 2. If a previous LP tick left 40032 at a low value and then
+    the service died, fallback mode 2 would throttle the battery so
+    aggressively that surplus PV curtails rather than soaking. The
+    watchdog re-asserts the uncapped value so dead-service scenarios
+    still benefit from full PV-to-battery absorption.
 
     Returns True iff the inverter is in a safe state afterwards — either
     the explicit pin succeeded in full, or the last-resort disable
     succeeded. Returns False only if every write failed.
     """
+    ok_charge_cap = await _write_u32_register(
+        client,
+        slave_id,
+        REG_ESS_MAX_CHARGING_LIMIT,
+        max_charge_raw,
+        f"charge_cap={max_charge_raw / 1000:.1f}kW",
+    )
     ok_mode = await _write_register(
         client,
         slave_id,
@@ -179,10 +243,11 @@ async def _trigger_fallback(
         "REMOTE_EMS_ENABLE=1",
     )
 
-    if ok_mode and ok_export and ok_enable:
+    if ok_charge_cap and ok_mode and ok_export and ok_enable:
         logger.warning(
             "FALLBACK FIRED — explicit self-consume pin (mode=2, export=0, "
-            "remote_ems=1) on slave %d",
+            "charge_cap=%.1fkW, remote_ems=1) on slave %d",
+            max_charge_raw / 1000,
             slave_id,
         )
         return True
@@ -190,8 +255,9 @@ async def _trigger_fallback(
     # Partial or total failure of the explicit path. Try the last-resort
     # single-write disable, which hands control to local EMS.
     logger.error(
-        "explicit fallback partial failure (mode_ok=%s export_ok=%s enable_ok=%s) — "
-        "trying last-resort REMOTE_EMS_ENABLE=0",
+        "explicit fallback partial failure (cap_ok=%s mode_ok=%s export_ok=%s "
+        "enable_ok=%s) — trying last-resort REMOTE_EMS_ENABLE=0",
+        ok_charge_cap,
         ok_mode,
         ok_export,
         ok_enable,
@@ -239,11 +305,12 @@ async def run(
     stale_seconds: float,
     poll_seconds: float,
     grace_seconds: float,
+    max_charge_raw: int,
 ) -> None:
     """Main loop. Does not return under normal operation."""
     logger.info(
         "eo-watchdog starting: heartbeat=%s host=%s:%d slave=%d "
-        "stale_after=%.0fs poll=%.0fs grace=%.0fs",
+        "stale_after=%.0fs poll=%.0fs grace=%.0fs max_charge=%.1fkW",
         heartbeat_path,
         sigenergy_host,
         sigenergy_port,
@@ -251,6 +318,7 @@ async def run(
         stale_seconds,
         poll_seconds,
         grace_seconds,
+        max_charge_raw / 1000,
     )
 
     client = AsyncModbusTcpClient(host=sigenergy_host, port=sigenergy_port)
@@ -324,7 +392,7 @@ async def run(
             # Re-assert every poll. Writes are idempotent; re-assertion
             # defends against transient Modbus drops between the first
             # fire and service recovery.
-            await _trigger_fallback(client, slave_id)
+            await _trigger_fallback(client, slave_id, max_charge_raw)
 
         was_stale = stale
         await asyncio.sleep(poll_seconds)
@@ -419,6 +487,18 @@ def main() -> None:
             "fetches — before the watchdog concludes it's dead."
         ),
     )
+    parser.add_argument(
+        "--max-charge-raw",
+        type=int,
+        default=_getenv_int("EO_WATCHDOG_MAX_CHARGE_RAW", 13000),
+        help=(
+            "Value to write to reg 40032 (ESS_MAX_CHARGING_LIMIT) on "
+            "fallback. Raw = kW × 1000. Default 13000 (13 kW) matches "
+            "the PV array nameplate. Writing this keeps the battery "
+            "charge leg uncapped during fallback — otherwise a stale "
+            "small value from a prior mode-3 tick throttles PV absorption."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.host:
@@ -438,6 +518,7 @@ def main() -> None:
                 stale_seconds=args.stale_seconds,
                 poll_seconds=args.poll_seconds,
                 grace_seconds=args.grace_seconds,
+                max_charge_raw=args.max_charge_raw,
             )
         )
     except KeyboardInterrupt:
