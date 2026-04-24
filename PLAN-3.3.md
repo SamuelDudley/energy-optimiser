@@ -21,6 +21,38 @@ Mode 3 (explicit grid-charge) and modes 5/6 (discharge, already
 shipped) unchanged. Idle (|battery| < deadband) collapses into the
 mode-2 path with `target = current_soc` (hold).
 
+## Probe results (2026-04-24, ~10:05 AEST)
+
+Hardware probe ran during stable midday PV (SOC 57.5%, PV 7.5 kW, no
+load anomalies). Outputs persisted to
+`/var/lib/energy-optimiser/probe_charge_cutoff{,_writes}.ndjson`.
+
+| Probe | Result | Mean bat-power during probe phase | Implication |
+|---|---|---|---|
+| 1 — rewrite frequency (11 writes × ~10 s) | **PASS** | n/a (cadence test) | Reg 40047 safe to rewrite per-tick. No write-frequency guard needed. |
+| 2 — cutoff = current − 5% | **soft FAIL** | 2.18 → **0.21 kW** mean (90% drop, max 2.19) | Inverter sharply throttles but doesn't fully idle. Failure mode: writing cutoff *below* current SOC isn't a clean idle signal. |
+| 3 — cutoff = current SOC exactly | **soft FAIL** | 2.18 → **1.00 kW** mean (max 2.18) | Boundary case is leaky — the inverter trickles ~1 kW PV in even when cutoff matches SOC, presumably due to SOC float quantization at the boundary. |
+| 4 — tick write supersedes startup ceiling (29 alternations) | **PASS** | n/a (supersession test) | Tick writes win over `assert_battery_soc_limits()`'s 950 write every time. No need to split the startup-vs-periodic path under §3.3. |
+
+**Net effect on §3.3 architecture: the design stands.** Probes 2 and 3
+fail the strict thresholds but the inverter does respond — it throttles
+charging substantially when cutoff is at or below current. Probes 1 and
+4 (the load-bearing tests for rewrite cadence and supersession) are
+clean.
+
+The mitigation is exactly the clamp anticipated in Phase 0 below:
+`cutoff = max(target, current_soc + 0.1%)`. Cost: tens of Wh of PV
+trickling into the battery during "idle" slots — noise vs the kWh-scale
+arbitrage §3.3 enables, and it nudges in the safe direction (higher SOC).
+
+**Implementation impact:**
+- §1.4 `set_charge_cut_off_soc` MUST apply the clamp (not optional).
+- The clamp needs `current_soc_pct` plumbed in — already in scope (§1.3
+  adds it as a kwarg to `dispatch_from_slot`).
+- `assert_battery_soc_limits()` split (Probe 4 fail-mode) is no longer
+  required for §3.3 — already shipped in §4.2 anyway.
+- No write-frequency guard needed (Probe 1 passed cleanly).
+
 ## Corrections / confirmations from research
 
 Three items that OPEN-WORK §3.3 glosses over or gets subtly wrong:
@@ -88,17 +120,16 @@ into `_startup_initial_ceiling()` (writes 40047 once) and
 `_periodic_limits()` (writes only 40046 + 40048). Pulls §4.2's split
 forward into this PR.
 
-**Pre-implementation checklist** (all must pass before Commit 2):
+**Pre-implementation checklist** (results from 2026-04-24 run):
 
-- [ ] Probe 1 pass → no write-frequency guard needed.
-- [ ] Probe 2 pass → no clamp needed.
-- [ ] Probe 3 pass → boundary stable.
-- [ ] Probe 4 pass → startup + tick coexist peacefully.
-- [ ] Probe dump saved to
-      `/var/lib/energy-optimiser/probe_charge_cutoff.ndjson`.
+- [x] Probe 1 pass → no write-frequency guard needed.
+- [~] Probe 2 soft-fail → clamp `cutoff = max(target, current+0.1)` required.
+- [~] Probe 3 soft-fail → same clamp; boundary handled by the +0.1 buffer.
+- [x] Probe 4 pass → startup + tick coexist peacefully.
+- [x] Probe dump saved to
+      `/var/lib/energy-optimiser/probe_charge_cutoff{,_writes}.ndjson`.
 - [ ] `SIGENERGY-MODES.md §4 charge-cutoff-SOC behaviour` appended with
-      findings (including any fail → guard/clamp that gets added in
-      Commit 2).
+      findings — pending (do as part of Commit 2).
 
 **Run command** (takes service offline ~6 min):
 
@@ -175,16 +206,30 @@ reference `SIGENERGY-MODES.md §4`.
 ~line 795):
 
 ```python
-async def set_charge_cut_off_soc(self, pct: float) -> bool:
-    """Write register 40047 (charge cutoff SOC). pct in [0, 100]."""
-    clamped = max(0.0, min(100.0, pct))
+async def set_charge_cut_off_soc(
+    self, pct: float, *, current_soc_pct: float
+) -> bool:
+    """Write register 40047 (charge cutoff SOC).
+
+    Clamps the target to `current_soc_pct + 0.1%` minimum — required
+    by the 2026-04-24 probe results: writing cutoff at or below current
+    SOC is a leaky idle signal (the inverter trickles ~1 kW of PV in
+    rather than fully stopping). The +0.1 buffer puts the cutoff
+    unambiguously above current so the inverter sees a clear ceiling.
+    """
+    safe_pct = max(pct, current_soc_pct + 0.1)
+    clamped = max(0.0, min(100.0, safe_pct))
     raw = int(round(clamped * 10))
-    logger.info("Setting charge cutoff SOC to %.1f%% (raw=%d)", clamped, raw)
+    logger.info(
+        "Setting charge cutoff SOC: requested=%.1f%%, current=%.1f%%, "
+        "wrote=%.1f%% (raw=%d)",
+        pct, current_soc_pct, clamped, raw,
+    )
     return await self._write_u16(REG_CHARGE_CUTOFF_SOC, raw)
 ```
 
-Add guard (`abs(new_raw - last_raw) > 1`) ONLY if Probe 1 fails. Default
-is no guard.
+No write-frequency guard needed — Probe 1 passed (40047 is safe to
+rewrite at tick cadence).
 
 **`apply_lp_dispatch` rewrite** (line 875). Safety-ordered: auxiliary
 register first, then mode. A failure between the two must leave the

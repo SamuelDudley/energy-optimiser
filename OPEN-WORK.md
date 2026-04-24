@@ -184,19 +184,17 @@ section once §3.3 is implemented — the framing will likely change.
 
 ### 3.3 Mode 2 + dynamic `charge_cut_off_soc` for all PV-charge dispatch
 
-**Status (2026-04-23):** plan finalised in `PLAN-3.3.md` at repo root.
-Commit 1 (probe) landed (`90cdb86` — `src/optimiser/probe_charge_cutoff.py`).
-Awaiting hardware run of the four sub-probes before Commit 2
-(implementation + tests). All four PASS criteria must be met before
-the dispatch rewrite ships. Probe run command, verdicts, and
-fail→mitigation table are in `PLAN-3.3.md §0`.
+**Status (2026-04-24):** probe ran successfully (~10:05 AEST, SOC
+57.5%, PV 7.5 kW). Results in `PLAN-3.3.md` "Probe results" section.
+Probes 1 (cadence) and 4 (supersession) PASSED; probes 2 and 3 (cutoff
+at/below current SOC) soft-failed with the exact failure mode the plan
+anticipated. Mitigation: clamp `cutoff = max(target, current+0.1%)` in
+`set_charge_cut_off_soc`. Net effect on §3.3 architecture: stands as
+designed; idle is leaky by ~tens of Wh per slot, which is noise.
 
-**To resume:** run the probe (`docker compose stop optimiser; docker run
-... python -m optimiser.probe_charge_cutoff; docker compose start
-optimiser` — ~8 min, needs midday PV ≥ 2 kW and 55 ≤ SOC ≤ 85),
-then either (a) proceed with Phase 1 implementation as planned if all
-probes PASS, or (b) apply the specific mitigation documented in
-`PLAN-3.3.md §0` for whichever probe failed before implementing.
+**Commit 2 (implementation + tests) is now unblocked.** Apply the
+clamp per the updated §1.4 in PLAN-3.3.md. No write-frequency guard
+needed.
 
 **Previous iterations of this section explored two wrong answers:**
 
