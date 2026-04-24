@@ -20,7 +20,8 @@ from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
 from .handlers.logs import logs as logs_handler
 from .handlers.metrics import metrics as metrics_handler
-from .probe import SERVICE_PROBE_KEY, ServiceProbe
+from .handlers.tables import table_rows
+from .probe import API_CONFIG_KEY, SERVICE_PROBE_KEY, ServiceProbe
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class APIServer:
             middlewares=[make_auth_middleware(token, _PUBLIC_PATHS)]
         )
         app[SERVICE_PROBE_KEY] = self._probe
+        app[API_CONFIG_KEY] = self._config
 
         app.router.add_get("/", root)
         app.router.add_get("/healthz", healthz)
@@ -57,6 +59,7 @@ class APIServer:
         app.router.add_get("/metrics", metrics_handler)
         app.router.add_get("/logs", logs_handler)
         app.router.add_get("/{table}/schema", table_schema)
+        app.router.add_get("/{table}", table_rows)
 
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()

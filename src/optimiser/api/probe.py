@@ -12,6 +12,7 @@ from typing import Protocol, runtime_checkable
 import duckdb
 from aiohttp import web
 
+from ..config import APIConfig
 from .log_buffer import RingBufferHandler
 from .metrics import Metrics
 
@@ -39,3 +40,8 @@ class ServiceProbe(Protocol):
 SERVICE_PROBE_KEY: web.AppKey[ServiceProbe] = web.AppKey(
     "service_probe", ServiceProbe
 )
+
+# Table-query handler reads the limit cap + timeout from this. Kept
+# off ServiceProbe because it's the API server's own config, not
+# something the Service computes.
+API_CONFIG_KEY: web.AppKey[APIConfig] = web.AppKey("api_config", APIConfig)

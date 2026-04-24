@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -21,9 +22,11 @@ from optimiser.api.handlers.discovery import TABLE_DESCRIPTIONS, root, table_sch
 from optimiser.api.handlers.health import healthz, readyz
 from optimiser.api.handlers.logs import logs as logs_handler
 from optimiser.api.handlers.metrics import metrics as metrics_handler
+from optimiser.api.handlers.tables import table_rows
 from optimiser.api.log_buffer import RingBufferHandler
 from optimiser.api.metrics import Metrics
-from optimiser.api.probe import SERVICE_PROBE_KEY
+from optimiser.api.probe import API_CONFIG_KEY, SERVICE_PROBE_KEY
+from optimiser.config import APIConfig
 
 TOKEN = "test-token-xyz"
 _PUBLIC = ("/", "/healthz", "/readyz")
@@ -61,15 +64,21 @@ def _stale_heartbeat(tmp_path: Path) -> Path:
     return p
 
 
-def _build_app(probe: _Probe) -> web.Application:
+def _build_app(
+    probe: _Probe, api_config: APIConfig | None = None
+) -> web.Application:
     app = web.Application(middlewares=[make_auth_middleware(TOKEN, _PUBLIC)])
     app[SERVICE_PROBE_KEY] = probe
+    app[API_CONFIG_KEY] = api_config or APIConfig(
+        bearer_token_env="EO_API_TOKEN", query_max_limit=100, query_timeout_s=5.0
+    )
     app.router.add_get("/", root)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", readyz)
     app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/logs", logs_handler)
     app.router.add_get("/{table}/schema", table_schema)
+    app.router.add_get("/{table}", table_rows)
     return app
 
 
@@ -530,3 +539,168 @@ class TestLogs:
         async with await _client(probe) as c:
             r = await c.get("/logs", headers=_auth())
             assert r.status == 503
+
+
+def _seed_telemetry(conn: duckdb.DuckDBPyConnection, n: int = 5) -> None:
+    """Insert n hourly telemetry rows starting at 2026-01-01T00:00 UTC."""
+    conn.execute(
+        "CREATE TABLE telemetry ("
+        "  ts TIMESTAMPTZ NOT NULL,"
+        "  soc_pct REAL,"
+        "  battery_kw REAL"
+        ")"
+    )
+    for i in range(n):
+        ts = f"2026-01-01 0{i}:00:00+00:00"
+        conn.execute(
+            "INSERT INTO telemetry VALUES (?, ?, ?)", [ts, 50.0 + i, float(i)]
+        )
+
+
+class TestTableQuery:
+    async def test_requires_auth(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 3)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry")
+            assert r.status == 401
+
+    async def test_returns_all_rows_when_no_filter(
+        self, tmp_path: Path
+    ) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 5)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry", headers=_auth())
+            body = await r.json()
+            assert body["table"] == "telemetry"
+            assert body["count"] == 5
+            # Sorted ASC by ts; first row is hour 0
+            assert body["rows"][0]["soc_pct"] == 50.0
+            assert body["rows"][-1]["soc_pct"] == 54.0
+
+    async def test_datetime_serialised_as_iso(
+        self, tmp_path: Path
+    ) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 1)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry", headers=_auth())
+            body = await r.json()
+            ts = body["rows"][0]["ts"]
+            # Should round-trip through datetime.fromisoformat without raising
+            datetime.fromisoformat(ts)
+
+    async def test_since_filter_excludes_earlier_rows(
+        self, tmp_path: Path
+    ) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 5)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            # `+` in query strings is a space — encode as %2B.
+            r = await c.get(
+                "/telemetry?since=2026-01-01T03:00:00%2B00:00",
+                headers=_auth(),
+            )
+            body = await r.json()
+            assert body["count"] == 2  # hours 3 and 4
+            assert body["rows"][0]["soc_pct"] == 53.0
+
+    async def test_until_is_exclusive(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 5)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get(
+                "/telemetry?until=2026-01-01T03:00:00%2B00:00",
+                headers=_auth(),
+            )
+            body = await r.json()
+            assert body["count"] == 3  # hours 0, 1, 2 — not 3
+            assert body["rows"][-1]["soc_pct"] == 52.0
+
+    async def test_limit_clamped_to_query_max_limit(
+        self, tmp_path: Path
+    ) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 10)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        # APIConfig in _build_app has query_max_limit=100, so a request
+        # for limit=99999 should clamp.
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry?limit=99999", headers=_auth())
+            body = await r.json()
+            # Capped to query_max_limit (100), so we get all 10 rows
+            assert body["count"] == 10
+
+    async def test_limit_three_returns_three(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 10)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry?limit=3", headers=_auth())
+            body = await r.json()
+            assert body["count"] == 3
+
+    async def test_unknown_table_404(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/not_a_real_table", headers=_auth())
+            assert r.status == 404
+
+    async def test_bad_since_400(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 1)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry?since=garbage", headers=_auth())
+            assert r.status == 400
+
+    async def test_paging_via_advancing_since(self, tmp_path: Path) -> None:
+        """Replicates the paging convention: ask for limit=2, advance
+        `since` past the last row, ask again, etc."""
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 5)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            seen = []
+            since = "2026-01-01T00:00:00+00:00"
+            for _ in range(5):
+                # Encode the `+` so it doesn't get treated as a space.
+                r = await c.get(
+                    f"/telemetry?since={since.replace('+', '%2B')}&limit=2",
+                    headers=_auth(),
+                )
+                body = await r.json()
+                if body["count"] == 0:
+                    break
+                seen.extend(body["rows"])
+                last_ts = datetime.fromisoformat(body["rows"][-1]["ts"])
+                since = (last_ts + timedelta(microseconds=1)).isoformat()
+            assert len(seen) == 5
+            assert [r["soc_pct"] for r in seen] == [50.0, 51.0, 52.0, 53.0, 54.0]
