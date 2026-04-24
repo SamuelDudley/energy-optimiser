@@ -405,6 +405,19 @@ def _add_scenario_to_problem(
             f"{prefix}pv_to_house_bounded_{t}",
         )
 
+        # Keep pv_to_export ≤ grid_export. The dropped house-balance
+        # constraint had the algebraic side-effect of forcing
+        # pv_to_export == grid_export; now they're independent unless we
+        # bound them. The semantic is "PV's share of total export
+        # cannot exceed total export". The implicit complement
+        # (grid_export − pv_to_export) is the battery's share of
+        # export, which is now allowed to be > 0 (the whole point of
+        # this fix).
+        prob += (
+            pv_to_export[t] <= grid_export[t],
+            f"{prefix}pv_to_export_bounded_{t}",
+        )
+
         # Soft operating-band constraints. `soc_pct[t]` is physically in
         # [0, 100] but should stay in [effective_floor, soc_ceiling_pct]
         # under normal operation. Slack activates only when the LP
