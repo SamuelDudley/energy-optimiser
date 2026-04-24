@@ -6,6 +6,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .hardware import PV_ARRAY_KW
 from .types import LoadCategory
 
 
@@ -59,11 +60,14 @@ class BatteryConfig:
     # max(soc_floor_pct, backup_soc_pct).
     backup_soc_pct: float = 15.0
     max_ac_charge_kw: float = 10.0  # Grid import limit (AC-coupled)
-    max_dc_charge_kw: float = 13.0  # Solar charge limit (DC-coupled, ~PV array size)
+    # Solar charge limit (DC-coupled). Defaults to the PV array
+    # nameplate — that's the real bottleneck for PV → battery in a
+    # hybrid-DC system. See hardware.PV_ARRAY_KW.
+    max_dc_charge_kw: float = PV_ARRAY_KW
     max_discharge_kw: float = 10.0
     round_trip_efficiency: float = 0.90
     export_limit_kw: float = 5.0
-    pv_array_kw: float = 13.0  # Nameplate PV capacity
+    pv_array_kw: float = PV_ARRAY_KW  # Nameplate PV capacity
 
 
 @dataclass(frozen=True, slots=True)

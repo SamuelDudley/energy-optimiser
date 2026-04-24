@@ -59,6 +59,10 @@ from pathlib import Path
 
 from pymodbus.client import AsyncModbusTcpClient
 
+# Hardware constants module has zero runtime deps (just literals), so
+# importing it doesn't increase the watchdog's failure surface.
+from .hardware import PV_ARRAY_KW
+
 # Register addresses — duplicated intentionally from clients/sigenergy.py so
 # the watchdog has no import dependency on the main service package. If
 # these ever change, both places need updating.
@@ -490,13 +494,16 @@ def main() -> None:
     parser.add_argument(
         "--max-charge-raw",
         type=int,
-        default=_getenv_int("EO_WATCHDOG_MAX_CHARGE_RAW", 13000),
+        default=_getenv_int(
+            "EO_WATCHDOG_MAX_CHARGE_RAW", int(round(PV_ARRAY_KW * 1000))
+        ),
         help=(
             "Value to write to reg 40032 (ESS_MAX_CHARGING_LIMIT) on "
-            "fallback. Raw = kW × 1000. Default 13000 (13 kW) matches "
-            "the PV array nameplate. Writing this keeps the battery "
-            "charge leg uncapped during fallback — otherwise a stale "
-            "small value from a prior mode-3 tick throttles PV absorption."
+            "fallback. Raw = kW × 1000. Default reads hardware.PV_ARRAY_KW "
+            "so the same nameplate value is used across the main service "
+            "and the watchdog. Writing this keeps the battery charge leg "
+            "uncapped during fallback — otherwise a stale small value from "
+            "a prior mode-3 tick throttles PV absorption."
         ),
     )
     args = parser.parse_args()
