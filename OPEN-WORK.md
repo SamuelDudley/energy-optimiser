@@ -184,17 +184,23 @@ section once §3.3 is implemented — the framing will likely change.
 
 ### 3.3 Mode 2 + dynamic `charge_cut_off_soc` for all PV-charge dispatch
 
-**Status (2026-04-24):** probe ran successfully (~10:05 AEST, SOC
-57.5%, PV 7.5 kW). Results in `PLAN-3.3.md` "Probe results" section.
-Probes 1 (cadence) and 4 (supersession) PASSED; probes 2 and 3 (cutoff
-at/below current SOC) soft-failed with the exact failure mode the plan
-anticipated. Mitigation: clamp `cutoff = max(target, current+0.1%)` in
-`set_charge_cut_off_soc`. Net effect on §3.3 architecture: stands as
-designed; idle is leaky by ~tens of Wh per slot, which is noise.
+**Status (2026-04-24): SHIPPED** in `acea3f5`. Mode 2 + per-tick
+dynamic `charge_cut_off_soc` rewrites are live. Verified on hardware
+(SOC 62.1%, mode=2, cutoff=62.5%, intent=+2.38 kW). 360 tests green.
 
-**Commit 2 (implementation + tests) is now unblocked.** Apply the
-clamp per the updated §1.4 in PLAN-3.3.md. No write-frequency guard
-needed.
+The §3.3 design landed as planned with the probe-mandated clamp
+(`cutoff = max(target, current_soc + 0.1%)`) in `dispatch_from_slot`.
+Idle dispatches (`|battery_kw| < deadband`) also write the cutoff each
+tick to keep the ceiling honest. Mode 4 retired from the dispatch
+path; the enum remains for historical-snapshot replay only.
+
+**Latent bug found and fixed alongside:** `apply_lp_dispatch`'s
+discharge-cap branch only handled mode 6, so mode-5 dispatches
+(introduced in `a450fd6`) were skipping their 40034 write. Now both
+mode 5 and mode 6 write the cap.
+
+**Pending:** legacy `SigenergyController.apply()` removal (Commit 3,
+optional cleanup — unrelated to behaviour).
 
 **Previous iterations of this section explored two wrong answers:**
 
