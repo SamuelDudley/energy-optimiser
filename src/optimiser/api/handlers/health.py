@@ -18,7 +18,9 @@ from aiohttp import web
 from ..probe import SERVICE_PROBE_KEY
 
 HEARTBEAT_STALE_S = 60
-READY_STATES = frozenset({"ACTIVE", "ACTIVE_NO_PRICE"})
+# StrEnum + auto() produces lowercase values ("active", "fallback", …);
+# the comparison must match.
+READY_STATES = frozenset({"active", "active_no_price"})
 
 
 async def healthz(request: web.Request) -> web.Response:

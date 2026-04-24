@@ -35,7 +35,8 @@ _PUBLIC = ("/", "/healthz", "/readyz")
 @dataclass
 class _Probe:
     heartbeat_path: Path
-    service_state: str = "ACTIVE"
+    # ServiceState values are lowercase (StrEnum + auto()).
+    service_state: str = "active"
     sigenergy_connected: bool = True
     version: str = "0.2.0-test"
     db_connection: duckdb.DuckDBPyConnection | None = None
@@ -166,7 +167,7 @@ class TestReadyz:
     async def test_active_and_connected_is_ok(self, tmp_path: Path) -> None:
         probe = _Probe(
             heartbeat_path=_fresh_heartbeat(tmp_path),
-            service_state="ACTIVE",
+            service_state="active",
             sigenergy_connected=True,
         )
         async with await _client(probe) as c:
@@ -178,7 +179,7 @@ class TestReadyz:
     async def test_fallback_is_503(self, tmp_path: Path) -> None:
         probe = _Probe(
             heartbeat_path=_fresh_heartbeat(tmp_path),
-            service_state="FALLBACK",
+            service_state="fallback",
             sigenergy_connected=True,
         )
         async with await _client(probe) as c:
@@ -188,7 +189,7 @@ class TestReadyz:
     async def test_disconnected_is_503(self, tmp_path: Path) -> None:
         probe = _Probe(
             heartbeat_path=_fresh_heartbeat(tmp_path),
-            service_state="ACTIVE",
+            service_state="active",
             sigenergy_connected=False,
         )
         async with await _client(probe) as c:
@@ -198,7 +199,7 @@ class TestReadyz:
     async def test_active_no_price_is_ready(self, tmp_path: Path) -> None:
         probe = _Probe(
             heartbeat_path=_fresh_heartbeat(tmp_path),
-            service_state="ACTIVE_NO_PRICE",
+            service_state="active_no_price",
             sigenergy_connected=True,
         )
         async with await _client(probe) as c:
@@ -371,7 +372,7 @@ class TestMetrics:
             current_import_price=20.0,
             current_export_price=5.0,
             sigenergy_connected=True,
-            service_state="ACTIVE",
+            service_state="active",
             circuit_breaker_open=False,
             heartbeat_age_s=None,
         )
@@ -381,8 +382,8 @@ class TestMetrics:
         async with await _client(probe) as c:
             r = await c.get("/metrics", headers=_auth())
             body = await r.text()
-            assert 'eo_state_machine_state{state="ACTIVE"} 1.0' in body
-            assert 'eo_state_machine_state{state="FALLBACK"} 0.0' in body
+            assert 'eo_state_machine_state{state="active"} 1.0' in body
+            assert 'eo_state_machine_state{state="fallback"} 0.0' in body
 
 
 def _seeded_buffer(capacity: int = 50) -> RingBufferHandler:

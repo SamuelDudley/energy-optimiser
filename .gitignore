@@ -8,3 +8,4 @@ __pycache__/
 *.ndjson.gz
 .pytest_cache/
 .ruff_cache/
+.env

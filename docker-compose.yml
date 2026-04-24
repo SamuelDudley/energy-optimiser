@@ -9,6 +9,12 @@ services:
     # Network: needs access to Sigenergy (Modbus), Shelly (HTTP),
     # UniFi (HTTPS), and external APIs (Amber, Solcast, BOM)
     network_mode: host
+    environment:
+      # Bearer token for the read-only HTTP API (port 8080). Sourced
+      # from the gitignored ./.env file. The API server in
+      # api/auth.py refuses to start if this is empty when
+      # config.toml's [api].enabled = true.
+      EO_API_TOKEN: ${EO_API_TOKEN}
     logging:
       driver: json-file
       options:

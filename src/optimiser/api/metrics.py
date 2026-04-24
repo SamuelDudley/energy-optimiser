@@ -26,11 +26,11 @@ if TYPE_CHECKING:
 # (one label value per state, 1/0) is the Prometheus canonical
 # representation of a categorical.
 _STATE_LABELS = (
-    "INITIALISE",
-    "ACTIVE",
-    "ACTIVE_NO_PRICE",
-    "DEGRADED",
-    "FALLBACK",
+    "initialise",
+    "active",
+    "active_no_price",
+    "degraded",
+    "fallback",
 )
 
 
