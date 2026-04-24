@@ -358,31 +358,51 @@ def _add_scenario_to_problem(
             load_vars[load.load_id].power_kw[t] for load in lp_loads if load.load_id in load_vars
         )
 
-        # House energy balance: inflows = outflows for the house bus
-        prob += (
-            pv_to_house[t] + bat_discharge[t] + grid_import[t]
-            == house_base + load_total + bat_charge_grid[t],
-            f"{prefix}house_balance_{t}",
-        )
-
-        # PV allocation: every kWh of PV goes somewhere (or is curtailed)
+        # PV allocation: every kWh of PV goes somewhere (or is curtailed).
         prob += (
             pv_to_house[t] + pv_to_battery[t] + pv_to_export[t] + pv_curtailed[t] == pv_avail[t],
             f"{prefix}pv_alloc_{t}",
         )
 
-        # Bind pv_to_battery to bat_charge_pv (they're the same flow)
+        # Bind pv_to_battery to bat_charge_pv (they're the same flow).
         prob += (
             bat_charge_pv[t] == pv_to_battery[t],
             f"{prefix}pv_to_bat_link_{t}",
         )
 
-        # System-wide balance: total sources = total sinks. This implicitly
-        # links grid_export to whatever battery+PV isn't absorbed by house.
+        # System-wide balance: total sources = total sinks. This is the
+        # single energy-conservation constraint.
+        #
+        # An earlier "house balance" constraint
+        #   `pv_to_house + bat_discharge + grid_import
+        #      == house_base + load_total + bat_charge_grid`
+        # also existed here. Combined with pv_alloc it had the algebraic
+        # consequence `grid_export == pv_to_export`, which meant battery
+        # energy could serve house load but **never** grid export —
+        # silently blocking evening-peak export arbitrage (discovered
+        # 2026-04-24 when the plan showed zero battery-to-export during
+        # 7-8c evening slots). Dropped.
         prob += (
             pv_avail[t] - pv_curtailed[t] + bat_discharge[t] + grid_import[t]
             == house_base + load_total + bat_charge_grid[t] + bat_charge_pv[t] + grid_export[t],
             f"{prefix}system_balance_{t}",
+        )
+
+        # Keep bat_charge_grid bookkeeping honest: grid-sourced battery
+        # charging can't exceed grid_import (otherwise LP could label a
+        # PV-sourced charge as "grid" arbitrarily, which would mislead
+        # the dispatch's mode-3-vs-mode-2 decision).
+        prob += (
+            bat_charge_grid[t] <= grid_import[t],
+            f"{prefix}grid_charge_source_{t}",
+        )
+
+        # Keep pv_to_house honest: can't allocate more PV to house than
+        # the house is actually consuming. Prevents the LP from padding
+        # the pv_to_house reporting variable.
+        prob += (
+            pv_to_house[t] <= house_base + load_total,
+            f"{prefix}pv_to_house_bounded_{t}",
         )
 
         # Soft operating-band constraints. `soc_pct[t]` is physically in
