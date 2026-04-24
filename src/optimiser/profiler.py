@@ -17,8 +17,16 @@ from .types import EventType, LoadProfile
 
 logger = logging.getLogger(__name__)
 
-# L0 defaults
-DEFAULT_OCCUPIED_KW = 2.0
+# L0 defaults.
+#
+# OCCUPIED was originally 2.0 kW — too high for this site's actual
+# baseload. 48 h of telemetry at install showed weighted hour-of-day
+# averages of 0.25-1.8 kW (morning HW-HP peak pulls the middle up;
+# evening runs ~1.3 kW; overnight ~0.4 kW). 1.0 kW is a better ballpark
+# for a small 2-3 person household with a heat-pump HWS. Only used at
+# maturity level 0 (< 7 days of data); L1+ uses real historical data
+# from the telemetry table, so this default sunsets automatically.
+DEFAULT_OCCUPIED_KW = 1.0
 DEFAULT_UNOCCUPIED_KW = 0.5
 
 

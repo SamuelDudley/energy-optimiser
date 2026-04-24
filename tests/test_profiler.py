@@ -85,7 +85,7 @@ class TestBuildLoadProfile:
         assert profile.maturity_level == 0
         assert profile.context == "L0 default"
         assert len(profile.slots) == 48
-        assert all(s == 2.0 for s in profile.slots)
+        assert all(s == 1.0 for s in profile.slots)
 
     def test_cold_start_unoccupied(self) -> None:
         store = _make_store()
