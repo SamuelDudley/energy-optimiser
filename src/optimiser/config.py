@@ -55,12 +55,26 @@ class SigenergyConfig:
 @dataclass(frozen=True, slots=True)
 class BatteryConfig:
     capacity_kwh: float = 40.0
-    soc_floor_pct: float = 15.0
-    soc_ceiling_pct: float = 95.0
-    # Backup SOC reserved for grid-outage. Hardware (reg 40046) refuses to
-    # discharge below this even when grid is present. Effective LP floor is
-    # max(soc_floor_pct, backup_soc_pct).
-    backup_soc_pct: float = 15.0
+    # LP planning band — soft constraints in the formulation, slack-
+    # penalised. The LP plans inside [soc_floor_pct, soc_ceiling_pct].
+    # These do NOT directly drive the hardware discharge backstop —
+    # see `discharge_cutoff_pct` below for that.
+    soc_floor_pct: float = 20.0
+    soc_ceiling_pct: float = 100.0
+    # Hardware discharge cut-off (reg 40048). This is the SOC at which
+    # the inverter physically refuses to discharge further on-grid.
+    # Decoupled from `soc_floor_pct` so the LP can plan to a higher
+    # floor (e.g. 20%) while the hardware leaves the bottom of the
+    # battery available for emergency / out-of-plan use. Default 0%
+    # — let the BMS protect the cells, not the EMS register.
+    discharge_cutoff_pct: float = 0.0
+    # Backup SOC reserved for grid-outage (reg 40046). Per Sigenergy
+    # V2.6+ semantics this is the floor the inverter holds in reserve
+    # for backup loads when grid is down. Set to 0 if you want all of
+    # the battery available on-grid; raise it if you have critical
+    # circuits wired to the backup port. The LP's effective floor is
+    # max(soc_floor_pct, backup_soc_pct, discharge_cutoff_pct).
+    backup_soc_pct: float = 0.0
     max_ac_charge_kw: float = 10.0  # Grid import limit (AC-coupled)
     # Solar charge limit (DC-coupled). Defaults to the PV array
     # nameplate — that's the real bottleneck for PV → battery in a

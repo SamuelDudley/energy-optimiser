@@ -748,17 +748,18 @@ class SigenergyController:
         never rewrites it (see SPEC-ENERGY-01.md §5.4).
         """
         ceiling_raw = int(self._battery.soc_ceiling_pct * 10)
-        floor_raw = int(self._battery.soc_floor_pct * 10)
+        discharge_cutoff_raw = int(self._battery.discharge_cutoff_pct * 10)
         backup_raw = int(self._battery.backup_soc_pct * 10)
         logger.info(
-            "Asserting battery SOC limits: ceiling=%.1f%% floor=%.1f%% backup=%.1f%%",
+            "Asserting battery SOC limits: ceiling=%.1f%% "
+            "discharge_cutoff=%.1f%% backup=%.1f%%",
             self._battery.soc_ceiling_pct,
-            self._battery.soc_floor_pct,
+            self._battery.discharge_cutoff_pct,
             self._battery.backup_soc_pct,
         )
         ok = True
         ok &= await self._write_u16(REG_CHARGE_CUTOFF_SOC, ceiling_raw)
-        ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, floor_raw)
+        ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, discharge_cutoff_raw)
         ok &= await self._write_u16(REG_BACKUP_SOC, backup_raw)
         return ok
 
@@ -775,15 +776,15 @@ class SigenergyController:
         defends against firmware resetting these limits silently (power
         cycle, firmware update, local EMS override).
         """
-        floor_raw = int(self._battery.soc_floor_pct * 10)
+        discharge_cutoff_raw = int(self._battery.discharge_cutoff_pct * 10)
         backup_raw = int(self._battery.backup_soc_pct * 10)
         logger.info(
-            "Re-asserting discharge SOC limits: floor=%.1f%% backup=%.1f%%",
-            self._battery.soc_floor_pct,
+            "Re-asserting discharge SOC limits: discharge_cutoff=%.1f%% backup=%.1f%%",
+            self._battery.discharge_cutoff_pct,
             self._battery.backup_soc_pct,
         )
         ok = True
-        ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, floor_raw)
+        ok &= await self._write_u16(REG_DISCHARGE_CUTOFF_SOC, discharge_cutoff_raw)
         ok &= await self._write_u16(REG_BACKUP_SOC, backup_raw)
         return ok
 

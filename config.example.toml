@@ -25,8 +25,19 @@ slave_id = 1
 
 [battery]
 capacity_kwh = 40.0
-soc_floor_pct = 10.0
-soc_ceiling_pct = 95.0
+# LP planning band — soft constraints in the formulation. The LP plans
+# inside [soc_floor_pct, soc_ceiling_pct] and pays a slack penalty for
+# excursions. These do NOT directly drive the hardware backstops.
+soc_floor_pct = 20.0
+soc_ceiling_pct = 100.0
+# Hardware discharge cut-off (reg 40048). Bottom of the battery the
+# inverter will physically refuse to discharge below on-grid. Decoupled
+# from soc_floor_pct so the LP can plan to a higher floor while leaving
+# the bottom of the pack available for emergency / out-of-plan use.
+discharge_cutoff_pct = 0.0
+# Backup SOC reserved for grid-outage (reg 40046). Set above 0 only if
+# you have critical loads wired to the inverter's backup port.
+backup_soc_pct = 0.0
 max_ac_charge_kw = 10.0                # Grid import limit (AC-coupled inverter)
 max_dc_charge_kw = 13.0                # Solar charge limit (DC-coupled, matches PV array)
 max_discharge_kw = 10.0                # Verify against inverter spec

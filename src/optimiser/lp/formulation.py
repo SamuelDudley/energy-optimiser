@@ -333,8 +333,15 @@ def _add_scenario_to_problem(
     soc_under_floor = [
         pulp.LpVariable(f"{prefix}soc_under_{t}", lowBound=0.0) for t in range(n)
     ]
+    # LP's soft lower bound is the highest of the three floors. Under
+    # normal config soc_floor_pct dominates (the LP planning floor sits
+    # above both hardware backstops); the max protects against a
+    # mis-configured value where backup or hw cutoff exceeds the
+    # planning floor.
     effective_floor = max(
-        battery_config.soc_floor_pct, battery_config.backup_soc_pct
+        battery_config.soc_floor_pct,
+        battery_config.backup_soc_pct,
+        battery_config.discharge_cutoff_pct,
     )
 
     # ── Add load variables (each load contributes its own vars) ──
@@ -457,6 +464,7 @@ def _add_scenario_to_problem(
     terminal_floor = max(
         battery_config.soc_floor_pct,
         battery_config.backup_soc_pct,
+        battery_config.discharge_cutoff_pct,
         TERMINAL_SOC_FLOOR_PCT,
     )
     soc_terminal_slack = pulp.LpVariable(
