@@ -31,8 +31,9 @@ from .result import LPSolution
 # This is what was *commanded*, not what the LP "wanted" pre-deadband.
 #
 # Mode 4 (CHARGE_PV_FIRST) stays in the table for historical-snapshot
-# replay only — §3.3 retired it from the live dispatch path. Mode 5
-# (DISCHARGE_PV_FIRST) maps to DISCHARGE_PV.
+# replay only — the dispatch path retired it 2026-04-24 (see
+# SPEC-ENERGY-01.md §5.4). Mode 5 (DISCHARGE_PV_FIRST) maps to
+# DISCHARGE_PV.
 _MODE_TO_ACTION: dict[RemoteEMSControlMode, BatteryAction] = {
     RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION: BatteryAction.SELF_CONSUME,
     RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST: BatteryAction.CHARGE_GRID,
@@ -50,9 +51,9 @@ def lp_solution_to_planner_output(
     """Translate an LP outcome to the snapshot-compatible PlannerOutput shape.
 
     Mode-keyed mapping covers the bulk of the cases via `_MODE_TO_ACTION`.
-    The one exception: under §3.3 a mode-2 dispatch can carry kind=CHARGE
-    (PV-charge via cutoff). Pure mode-keyed lookup would log it as
-    SELF_CONSUME, losing the LP's intent. Special-case it explicitly.
+    The one exception: a mode-2 dispatch can carry kind=CHARGE (the
+    PV-dominant adaptive-trim path). Pure mode-keyed lookup would log
+    it as SELF_CONSUME, losing the LP's intent. Special-case it explicitly.
     """
     if (
         dispatch.kind == DispatchKind.CHARGE

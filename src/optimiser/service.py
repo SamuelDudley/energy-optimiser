@@ -193,10 +193,11 @@ class Service:
             # silently by the inverter — firmware update, power cycle,
             # local EMS override — and we'd only notice at the next
             # restart. Idempotent write; no wake-up race risk.
-            # Deliberately skips 40047 (charge cutoff): §3.3 will make
-            # that register tick-managed at ~60s cadence, so any hourly
-            # overwrite would briefly push the ceiling back up and
-            # contradict the tick-time target.
+            # Deliberately skips 40047 (charge cutoff): pinned at
+            # `soc_ceiling_pct` by `assert_battery_soc_limits` at
+            # startup and never rewritten — see SPEC-ENERGY-01.md §5.4.
+            # Excluding it here keeps the hourly re-assertion idempotent
+            # against the startup write.
             WakeLoop("soc_limits", 3600, self._reassert_soc_limits),
         ]
         # BOM hourly forecast — separate cadence from current-obs. Only

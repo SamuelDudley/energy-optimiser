@@ -337,30 +337,36 @@ complete cleanly before the inverter is set to fallback.
 
 ### 5.1.1 Dual-resolution price usage
 
-The planner receives **two price arrays** with different roles:
+The planner receives **two price arrays** that are merged into a single
+LP input — `prices_planning = [*prices_5min, *prices_30min]`. The
+linear `_price_at` lookup returns the first matching interval, so 5-min
+entries take precedence within their coverage window (current + ~30 min
+ahead, where Amber publishes 5-min granularity), and 30-min fills the
+rest of the horizon.
 
-**5-min prices (`prices_5min`)** — used for *acute* decisions:
+**5-min prices (`prices_5min`)** — give the LP intra-30-min resolution:
 - Spike detection (`spike_status` on the current 5-min interval)
-- Negative export curtailment (export can flip negative for a single 5-min slot)
-- Negative import opportunism (charge from grid for one 5-min slot)
-- "Right now" pricing for current-tick cost calculations
+- Negative export sub-windows inside an otherwise-positive 30-min interval
+- Negative import sub-windows
+- "Right now" pricing for current-tick cost calculations and the
+  stale-price export guard
 
-**30-min prices (`prices_30min`)** — used for *planning* decisions:
+**30-min prices (`prices_30min`)** — fill the planning horizon beyond
+5-min coverage:
 - Future maximum import (charge value calculation)
 - Future minimum import (discharge threshold)
 - Cheapest contiguous window for shiftable loads (hot water)
 - Evening reserve sizing
 - Pre-conditioning windows (aircon)
 
-**Why split:** 5-min forecast is only meaningful for the current and next 30-min
-period (Amber only publishes 5-min granularity inside that window). Beyond that,
-30-min is the only reliable resolution. Mixing them in a single array would
-create false precision in the long-term forecast.
-
-**Priority:** when both arrays would influence the same decision, the 5-min
-data wins for the immediate interval. Example: 30-min price is +15c on average
-but the current 5-min slot is -2c export → curtail export now even though the
-30-min average is positive.
+**Why merge rather than alternate:** the LP plans on a single 5-min
+slot grid; without merging, every 5-min slot inside a 30-min interval
+would receive the same 30-min average price, hiding intra-interval
+spikes the LP could exploit (e.g. a brief negative-export sub-window
+inside a generally-expensive evening half-hour). The merge keeps
+5-min precision where Amber actually has it and falls through to 30-min
+elsewhere — no false long-horizon precision because 5-min entries
+don't extend past their coverage window.
 
 **Interval-boundary normalisation (NEM quirk).** Amber returns `startTime`
 offset by +1s from the NEM boundary (e.g. interval 0: `10:30:01 → 11:00:00`;
@@ -468,7 +474,7 @@ optimal reserve from the price forecast and PV/load projections. A terminal
 SOC floor (§5.2) guards against arriving at the end of the priced horizon
 empty and then facing an unpriced tail.
 
-### 5.4 Dispatch to Inverter (Mode 3/4/6 + Magnitude Cap)
+### 5.4 Dispatch to Inverter (Modes 2/3/5/6 + Adaptive Trim)
 
 The LP outputs a continuous signed `battery_kw` for slot 0. This maps to
 the Sigenergy's load-following EMS modes rather than mode 0 (continuous
@@ -477,34 +483,70 @@ setpoint). Mode 0 was rejected because it doesn't track dynamic house load
 
 **Mapping rules:**
 
-| LP output                   | Mode                       | Cap register | Cap value              |
-|-----------------------------|----------------------------|--------------|------------------------|
-| \|battery_kw\| < 100W      | SELF_CONSUME (mode 2)      | —            | —                      |
-| battery_kw > 0, grid-dom.  | CHARGE_GRID_FIRST (mode 3) | 40032        | battery_kw             |
-| battery_kw > 0, PV-dom.    | CHARGE_PV_FIRST (mode 4)   | 40032        | battery_kw             |
-| battery_kw < 0             | DISCHARGE_ESS_FIRST (mode 6)| 40034       | `max_discharge_kw`     |
+| LP output                   | Mode                          | Cap register | Cap value                                   |
+|-----------------------------|-------------------------------|--------------|---------------------------------------------|
+| \|battery_kw\| < 100W       | SELF_CONSUME (mode 2)         | 40032        | 0 (block PV charge; surplus exports)        |
+| battery_kw > 0, grid-dom.   | CHARGE_GRID_FIRST (mode 3)    | 40032        | battery_kw                                  |
+| battery_kw > 0, PV-dom.     | SELF_CONSUMPTION (mode 2)     | 40032        | adaptive trim (see below)                   |
+| battery_kw < 0, PV producing| DISCHARGE_PV_FIRST (mode 5)   | 40034        | `max_discharge_kw`                          |
+| battery_kw < 0, no PV       | DISCHARGE_ESS_FIRST (mode 6)  | 40034        | `max_discharge_kw`                          |
 
 "Grid-dominant" means the LP plans to source more charge from grid than PV
 in that slot. The mode's "first" preference tells the inverter which source
 to prefer.
 
-**Charge cap** uses the LP's intended rate. Charging is directly controllable
-and exceeding the plan (e.g. charging harder than the cheap window supports,
-or over-drawing from grid when PV was about to cover) wastes money.
+**Mode 4 (CHARGE_PV_FIRST) is no longer emitted.** Register 40032 under
+mode 4 is a *target*, not a ceiling — when PV droops mid-slot the
+inverter pulls grid to hit it (silent grid-draw hazard, see
+`SIGENERGY-MODES.md`). The PV-dominant charge path uses mode 2 with
+the adaptive trim below; mode 4 stays in `RemoteEMSControlMode` for
+historical-snapshot replay only.
+
+**Mode-2 adaptive trim** (`clients/sigenergy.py::_apply_mode2_adaptive_charge`).
+Mode 2's cascade is `PV → house → battery (up to 40032) → export → curtail`.
+With 40032 set to `max_dc_charge_kw`, the battery soaks all surplus PV
+before any export flows — losing the daytime split where a mixed
+battery+export slot would be more profitable. The dispatch handles this
+in two phases:
+
+1. **Phase A**: write `40032 = max_dc_charge_kw, mode = 2`. The cascade
+   absorbs all surplus PV. Wait `MODE2_PROBE_SECONDS` (5 s) for steady
+   state, read `pv_power_kw` and `house_load_kw`.
+2. **Phase B**: compute and write
+   `40032 = max(LP_rate, surplus − export_cap_kw − headroom)`, clamped
+   to `[0, max_dc_charge_kw]`. Cascade now splits: battery up to trim,
+   export up to DNSP, no curtail unless surplus exceeds both.
+
+The LP rate is a floor: a transient PV droop during the 5 s probe
+window cannot collapse the trim toward zero. Validated by
+`probe_two_phase.py` (P1 split, P2 under-trim, P3 over-trim curtail).
+
+**Charge cutoff (40047) is pinned at the configured `soc_ceiling_pct`**
+by `assert_battery_soc_limits` at startup; no tick-path code touches
+it. Earlier designs rewrote 40047 to `slot_0.soc_pct_end` each tick,
+but probe_no_cutoff.py confirmed 40032 alone is a sufficient rate
+knob for both charge (adaptive trim) and idle (`40032 = 0`).
+`LPDispatch.target_soc_pct` carries the LP's planned end-of-slot SOC
+as advisory data only, for snapshot replay and Prometheus
+observability.
 
 **Discharge cap** uses the *physical* `battery_config.max_discharge_kw`
 (typically 10 kW), **not** `|battery_kw|`. The LP's `battery_kw` is its
 point estimate of required discharge (e.g. 2 kW from the L0 default load
 profile). Writing that as a hard cap meant any house transient above the
 forecast (kettle, AC, oven) leaked to grid import at retail price while
-the battery sat idle. Writing the physical max lets mode 6 load-follow up
-to that limit; the inverter discharges exactly what the house consumes,
-no more. The LP's signed magnitude is preserved on the dispatch as
-`signed_intent_kw` for the watcher's direction check.
+the battery sat idle. Writing the physical max lets the load-following
+discharge mode supply exactly what the house consumes, no more. The LP's
+signed magnitude is preserved on the dispatch as `signed_intent_kw` for
+the watcher's direction check.
 
-Mode 5 (DISCHARGE_PV_FIRST) is intentionally not used: it lets the inverter
-skip battery discharge entirely if PV happens to cover house load, which
-contradicts the LP's intent when it commands discharge.
+**Discharge mode selection (5 vs 6).** `dispatch_from_slot` reads live
+`measured_pv_kw` and picks mode 5 when PV is producing
+(`> PV_PRODUCING_THRESHOLD_KW = 0.2 kW`), mode 6 otherwise. Mode 6
+zeroes PV generation entirely (verified on hardware, see
+`SIGENERGY-MODES.md`), so any meaningful PV surplus is worth routing
+through mode 5 instead — mode 5 load-follows, using PV first and
+topping up from battery if short.
 
 #### 5.4.1 Post-write verification (watcher)
 
@@ -1420,12 +1462,12 @@ deployments but differ in multi-inverter setups.
 | 40001–02 | Active power fixed adj.  | S32  | 1000 | kW   | Continuous plant setpoint (mode 0)  | **Not used** — see note |
 | 40029    | Remote EMS enable        | U16  | 1    | –    | 0=disabled, 1=enabled               | `enable_remote_ems()` |
 | 40031    | Remote EMS control mode  | U16  | 1    | –    | See §7.3 RemoteEMSControlMode       | `apply_lp_dispatch()` |
-| 40032–33 | ESS max charging limit   | U32  | 1000 | kW   | Max charge rate (modes 3, 4)        | `apply_lp_dispatch()` |
+| 40032–33 | ESS max charging limit   | U32  | 1000 | kW   | Charge-rate cap honoured in modes 2/3 (in mode 2 it caps the cascade's battery leg; 0 = block charge / idle) | `apply_lp_dispatch()` |
 | 40034–35 | ESS max discharging limit| U32  | 1000 | kW   | Max discharge rate (modes 5, 6)     | `apply_lp_dispatch()` |
 | 40038–39 | Grid export limit        | U32  | 1000 | kW   | Max grid export (5kW DNSP limit)    | `set_export_limit_kw()` |
-| 40046    | ESS backup SOC           | U16  | 10   | %    | Backup SOC reserve (V2.6+)          | —       |
-| 40047    | Charge cut-off SOC       | U16  | 10   | %    | SOC ceiling for charging            | —       |
-| 40048    | Discharge cut-off SOC    | U16  | 10   | %    | SOC floor for discharging           | —       |
+| 40046    | ESS backup SOC           | U16  | 10   | %    | Backup SOC reserve (V2.6+)          | `assert_battery_soc_limits()` (startup) + `assert_discharge_soc_limits()` (hourly) |
+| 40047    | Charge cut-off SOC       | U16  | 10   | %    | SOC ceiling for charging — pinned at `soc_ceiling_pct` at startup, never rewritten in tick path | `assert_battery_soc_limits()` (startup only) |
+| 40048    | Discharge cut-off SOC    | U16  | 10   | %    | SOC floor for discharging           | `assert_battery_soc_limits()` (startup) + `assert_discharge_soc_limits()` (hourly) |
 
 **Register 40001 (deliberately not used):** Per Sigenergy V2.7 §5.2 note,
 registers without an explicit "Comment" field (including 40001) only take
@@ -1439,31 +1481,36 @@ the codebase as a documented constant with rationale, but is never in the
 write path.
 
 **Registers 40032/40034 semantics:** per Sigenergy V2.7 §5.2, register
-40032 (ESS max charging limit) takes effect only when 40031 is 3 or 4;
-register 40034 (ESS max discharging limit) takes effect only when 40031
-is 5 or 6. Writing to the "wrong" register is silently ignored, so
-stale values from a previous tick don't affect behaviour after a mode
-switch. The optimiser writes both the mode and the relevant cap atomically
-each tick.
+40032 (ESS max charging limit) is documented as taking effect in modes
+3 and 4. **Empirically (verified on hardware) it also caps the battery
+leg of mode 2's cascade** — `PV → house → battery (up to 40032) → export
+→ curtail`. This is the basis for the mode-2 adaptive trim (§5.4) and
+the mode-2 idle path (`40032 = 0` blocks PV-to-battery charge). Register
+40034 takes effect only in modes 5 and 6; writing to the "wrong" register
+is silently ignored, so stale values don't bleed across mode switches.
+The optimiser writes both the relevant cap and the mode atomically each
+tick.
 
 ### 7.3 Remote EMS Control Modes (Appendix 6 in Sigenergy V2.7)
 
-| Value | Mode                            | Our usage                          |
-|-------|----------------------------------|------------------------------------|
-| 0     | PCS Remote Control              | **Not used** — doesn't track load  |
-| 1     | Standby                         | Not used                           |
-| 2     | Maximum Self Consumption        | Fallback / deadband (< 100W)       |
-| 3     | Command Charging (Grid First)   | LP charge, grid-dominant source    |
-| 4     | Command Charging (PV First)     | LP charge, PV-dominant source      |
-| 5     | Command Discharging (PV First)  | **Not used** — skips ESS discharge |
-| 6     | Command Discharging (ESS First) | LP discharge (all discharges)      |
+| Value | Mode                            | Our usage                                                         |
+|-------|----------------------------------|-------------------------------------------------------------------|
+| 0     | PCS Remote Control              | **Not used** — doesn't track load                                 |
+| 1     | Standby                         | Not used                                                          |
+| 2     | Maximum Self Consumption        | Fallback, idle (40032=0), and PV-dominant charge (adaptive trim)  |
+| 3     | Command Charging (Grid First)   | LP charge, grid-dominant source                                   |
+| 4     | Command Charging (PV First)     | **Not emitted** — kept in enum for replay; see §5.4               |
+| 5     | Command Discharging (PV First)  | LP discharge when PV is producing                                 |
+| 6     | Command Discharging (ESS First) | LP discharge when no PV                                           |
 
-**Mode 5 omission rationale:** DISCHARGE_PV_FIRST lets the inverter skip
-battery discharge entirely if PV happens to cover house load. This
-contradicts the LP's intent when it commands discharge — the LP has
-already accounted for PV in its allocation and wants the battery to
-discharge at the specified cap. Mode 6 (ESS first) gives deterministic
-control over battery direction.
+**Mode-5-vs-mode-6 selection** is driven by live `measured_pv_kw`. Mode
+6 zeroes PV generation (verified on hardware), so any PV producing
+above 0.2 kW is worth routing through mode 5 instead. Mode 5
+load-follows: PV serves the load and export first, battery covers any
+shortfall, and if PV alone can do the job the battery idles (zero
+wear for the same revenue). Earlier versions of this spec marked mode
+5 as "not used" — that was a misreading of the LP's "discharge"
+intent. See `SIGENERGY-MODES.md` mode 5 section.
 
 ---
 

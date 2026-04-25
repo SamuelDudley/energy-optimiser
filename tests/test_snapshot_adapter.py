@@ -1,9 +1,10 @@
 """Tests for the LP→PlannerOutput snapshot adapter.
 
-Critical for §3.3 + replay continuity: the dispatch path now sends
-mode 2 with kind=CHARGE for PV-charge intent, but the snapshot needs
-to record that as `BatteryAction.CHARGE_PV` so historical replay
-analyses (vs the old mode-4 snapshots) compare apples to apples.
+Critical for replay continuity: the dispatch path sends mode 2 with
+kind=CHARGE for PV-dominant charge intent (adaptive trim), but the
+snapshot needs to record that as `BatteryAction.CHARGE_PV` so
+historical replay analyses (vs the older mode-4 snapshots) compare
+apples to apples.
 
 Historical mode-4 snapshots also still need to map → CHARGE_PV
 (the enum value lingers in `RemoteEMSControlMode` for exactly this

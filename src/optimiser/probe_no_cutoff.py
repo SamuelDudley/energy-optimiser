@@ -1,7 +1,8 @@
 """Hardware probe: cutoff-pinned-at-ceiling dispatch.
 
 Follow-on to the two-phase adaptive-dispatch work (see
-``PLAN-MODE2-ADAPTIVE.md``). The user-proposed simplification:
+``probe_two_phase.py`` and ``SPEC-ENERGY-01.md §5.4``). The
+user-proposed simplification:
 
     Leave ``charge_cut_off_soc`` (reg 40047) pinned at the configured
     ceiling (e.g. 95%). Don't rewrite it per tick. Manage SOC entirely

@@ -240,7 +240,7 @@ class TestMode2Adaptive:
     """The PV-dominant charge path runs a Phase-A measure / Phase-B trim
     sequence to split surplus PV between the battery and export rather
     than cascade-saturating the battery first. See
-    `_apply_mode2_adaptive_charge` and PLAN-MODE2-ADAPTIVE.md."""
+    `_apply_mode2_adaptive_charge` and SPEC-ENERGY-01.md §5.4."""
 
     @staticmethod
     def _state(pv_kw: float, load_kw: float):

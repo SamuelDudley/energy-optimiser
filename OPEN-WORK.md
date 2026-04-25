@@ -119,11 +119,14 @@ formulation.
 
 ### 3.2 Reconsider `battery_net[0]` tie
 
-**Status:** analysis pending user direction. My recommendation: don't
-untie as a *standalone* change under the current mode-4 dispatch. But
-with §3.3 below (mode 2 + dynamic charge cutoff) in place, the
-charge-magnitude question changes shape significantly — worth
-re-analysing after §3.3 lands, not before.
+**Status:** analysis deferred — needs a fresh pass under the post-
+2026-04-25 dispatch (mode 2 adaptive trim + cutoff retire). The
+original framing assumed the live mode-4 cap was a target, so untying
+charge magnitude would re-introduce a grid-draw hazard. Mode 4 is now
+retired; under mode 2 + adaptive trim, every charge is physically
+bounded by 40032 to a value the dispatch derives at apply time from
+live telemetry. The "untying loses the safeguard" argument no longer
+applies — the safeguard moved to the dispatch layer.
 
 **Current code:**
 
@@ -133,222 +136,48 @@ other_net = other.bat_charge_grid[0] + other.bat_charge_pv[0] - other.bat_discha
 prob += (other_net == base_net, f"nonanti_bat_net_{other_name}")
 ```
 
-**What we actually commit to at slot 0.** Dispatch mapping in
-`lp/dispatch.py::dispatch_from_slot`:
+**Re-evaluation should consider:**
 
-| LP slot-0 intent       | Mode (40031) | Charge cap (40032)         | Discharge cap (40034)              |
-|------------------------|--------------|----------------------------|------------------------------------|
-| \|bat\| < 0.1 kW       | 2            | (ignored in mode 2)        | (ignored in mode 2)                |
-| bat > 0 (charge)       | 3 or 4       | **= bat (target in mode 4)** | (ignored)                        |
-| bat < 0 (discharge)    | 5 or 6       | (ignored)                  | = `max_discharge_kw` (physical)    |
+- Direction is still a hard commitment (one mode register written per
+  tick). Tying the SIGN of `battery_net[0]` across scenarios stays
+  essential.
+- Magnitude is no longer a commitment on either side. Charge magnitude
+  is bounded by the adaptive trim's Phase-B write at apply time;
+  discharge magnitude is bounded by `max_discharge_kw` on 40034. The
+  LP's tied magnitude is purely advisory for the LP's forward SOC
+  trajectory.
+- Untying magnitude means each scenario plans its own rate; the
+  expected battery_net feeds the LP's cost model. Whether the savings
+  vs the tied formulation are material is a replay question.
 
-Two observations with different implications:
-
-**(a) Direction is a hard physical commitment.** Scenarios must agree
-on sign of `battery_net[0]` — we write one mode register. If P10 wants
-discharge and P90 wants charge, the inverter can't do both. Tying
-direction is essential.
-
-**(b) Discharge magnitude is NOT a commitment.** We write
-`max_discharge_kw` to register 40034 *regardless* of the LP's intent.
-The LP's magnitude ends up as `signed_intent_kw` for the watcher, but
-the inverter load-follows. So tying the magnitude across scenarios is
-advisory — it affects the LP's forward SOC trajectory but doesn't affect
-what gets executed at slot 0.
-
-**(c) Charge magnitude IS a commitment (mode 4 cap = target).** Untying
-would let P10 want 1 kW charge and P90 want 5 kW charge; whatever single
-value we write, someone over- or under-charges via grid. This is where
-the current tie has real protective value — it prevents mode 4's
-"target, not ceiling" hazard from being triggered by scenarios with
-low PV.
-
-**Why I don't recommend untying battery_net as a standalone change:**
-
-- **Discharge:** untying helps only with advisory planning, not
-  execution. LP's reported `battery_kw` becomes a weighted average of
-  scenario outcomes; replay gets slightly more accurate; real-world
-  behaviour unchanged. Low value.
-- **Charge:** untying without another safeguard *worsens* the mode-4
-  grid-draw hazard we documented in `SIGENERGY-MODES.md`. Don't.
-
-**If we did want to untie charge magnitude, §3.3's approach (mode 2 +
-dynamic charge cutoff) provides the safeguard.** Under §3.3, each
-scenario can plan its own charge rate; the LP's tied decision becomes
-"target SOC at end of slot 0" (implied by whichever scenario's plan
-translates to what we write); mode 2's physics-bounded execution
-prevents any plan from translating into grid draw. Re-analyse this
-section once §3.3 is implemented — the framing will likely change.
+Defer until there's a concrete behaviour-shaped reason to revisit.
 
 ---
 
-### 3.3 Mode 2 + dynamic `charge_cut_off_soc` for all PV-charge dispatch
+### 3.3 Mode 2 + dynamic `charge_cut_off_soc` — superseded
 
-**Status (2026-04-24): SHIPPED** in `acea3f5`. Mode 2 + per-tick
-dynamic `charge_cut_off_soc` rewrites are live. Verified on hardware
-(SOC 62.1%, mode=2, cutoff=62.5%, intent=+2.38 kW). 360 tests green.
+**Status (2026-04-24 → 2026-04-25): SHIPPED then SUPERSEDED.** The
+per-tick `charge_cut_off_soc` rewrite landed in commit `acea3f5`, then
+was retired in commit `1f363a7` (cutoff-pinned-at-ceiling + adaptive
+trim on 40032). The dispatch behaviour now lives in
+`SPEC-ENERGY-01.md §5.4` and `clients/sigenergy.py::_apply_mode2_adaptive_charge`.
+Authoritative empirical record in `SIGENERGY-MODES.md` (mode 2 section
++ banner at top). Validation probes: `probe_two_phase.py`,
+`probe_no_cutoff.py`. Nothing pending here.
 
-The §3.3 design landed as planned with the probe-mandated clamp
-(`cutoff = max(target, current_soc + 0.1%)`) in `dispatch_from_slot`.
-Idle dispatches (`|battery_kw| < deadband`) also write the cutoff each
-tick to keep the ceiling honest. Mode 4 retired from the dispatch
-path; the enum remains for historical-snapshot replay only.
-
-**Latent bug found and fixed alongside:** `apply_lp_dispatch`'s
-discharge-cap branch only handled mode 6, so mode-5 dispatches
-(introduced in `a450fd6`) were skipping their 40034 write. Now both
-mode 5 and mode 6 write the cap.
-
-**Pending:** legacy `SigenergyController.apply()` removal (Commit 3,
-optional cleanup — unrelated to behaviour).
-
-**Previous iterations of this section explored two wrong answers:**
-
-1. "Mode 2 + export_cap expresses export-first by splitting PV between
-   battery and export concurrently" — **false**. Mode 2 priority is
-   strictly `PV → load → battery (up to physical rate) → export →
-   curtail`. Battery absorbs before export sees flow.
-2. "Mode 4 + live-telemetry charge-cap clamp" — workable but inherits
-   mode 4's grid-draw hazard (bounded, not eliminated) and requires a
-   transient-margin tuning knob.
-
-**The right approach: use `charge_cut_off_soc` (reg 40047) as a per-tick
-charge ceiling under mode 2.**
-
-The inverter stops charging when SOC reaches `charge_cut_off_soc`
-regardless of available PV. If we rewrite that register each tick to
-`current_soc + desired_charge_this_slot`, mode 2's native priority
-cascade does the rest: charge until cutoff, then divert to export,
-then curtail.
-
-```
-target_soc_pct = current_soc_pct + (LP_charge_kw × slot_hours × eta
-                                    / capacity × 100)
-write  40047 = target_soc_pct × 10    # charge cut-off SOC
-write  40038 = DNSP_max × 1000        # export cap (full DNSP)
-write  40031 = 2                      # mode 2
-```
-
-**Why this is better than mode 4 + clamp:**
-
-| Property | Mode 4 + clamp | Mode 2 + dynamic cutoff |
-|---|---|---|
-| Grid-draw on PV droop | Bounded by margin, still possible | **Impossible** — mode 2 never grid-charges |
-| Load-spike transient → grid | Bounded, still possible | **Impossible** — mode 2 is transient-safe |
-| Mid-slot PV windfall (above forecast) | Curtailed above cap | **Captured** — battery charges further or export takes it |
-| Mid-slot PV shortfall | Grid draws to hit cap | Battery stops earlier; export caps lower; no grid |
-| Requires live PV/load reads at dispatch | Yes (`measured_pv_kw`, `measured_load_kw`) | No (only current SOC, already in `SystemState`) |
-| Tuning knob | `transient_margin_kw` (needs calibration) | None |
-| Mode 4 needed | Yes | **No** — retires entirely |
-
-Mode 2 + dynamic cutoff eliminates both mode-4 hazards from
-`SIGENERGY-MODES.md` by construction. There's nothing to calibrate, no
-transient margin, no live-load read.
-
-**What this CAN'T do (and needs other modes):**
-
-- **Grid-charging** (cheap-overnight windows). Mode 2 never grid-charges.
-  Mode 3 still required for explicit `CHARGE_GRID` dispatch. Unchanged.
-- **Discharging.** Mode 2 discharges only passively to load. Mode 5 /
-  mode 6 still required for discharge dispatch. Already implemented via
-  §4's PV-threshold selection.
-
-**Resulting dispatch table** (simpler than today's):
-
-| LP intent | Mode | Key register |
-|---|---|---|
-| \|battery\| < deadband (idle) | 2 | `40047 = current_soc` (hold) |
-| battery > 0, grid-dominant (rare, cheap window) | 3 | `40032 = LP rate` |
-| battery > 0, any PV-driven charge | **2** | `40047 = current_soc + Δ` |
-| battery < 0, measured_pv > 0.2 kW | 5 | `40034 = max_discharge` |
-| battery < 0, measured_pv ≤ 0.2 kW | 6 | `40034 = max_discharge` |
-
-Mode 4 row drops out.
-
-**Edge cases to verify empirically before deploy (probe-style):**
-
-1. **Write frequency safety.** Is reg 40047 safe to rewrite every 60 s
-   indefinitely? It's a standard holding register per the Sigenergy
-   Modbus spec, so should be, but some firmware internally gates
-   parameter changes on flash writes. Proposed probe: write 40047 in
-   a loop for 5–10 min, read back, watch for errors or drift. If any
-   concern, add a guard: only write when `abs(new_target - last_written)
-   > 0.1%` (the register's resolution).
-2. **Cutoff below current SOC.** If we write cutoff=80% while SOC=81%,
-   does the inverter ignore it, try to discharge, or error? Standard
-   semantics say "charge cutoff = don't charge above"; discharging is
-   governed by mode. Expected: idle. Probe with a 60-s dwell and
-   observe battery power.
-3. **Cutoff at exactly current SOC.** Boundary case — does mode 2
-   attempt zero-Wh charge cycling? Or does it cleanly skip to the
-   next priority? Expected: clean skip. Confirm.
-4. **Interaction with `assert_battery_soc_limits()` startup write.**
-   Startup currently writes 40047 = `soc_ceiling_pct` (95%). Tick-time
-   write will supersede. The periodic re-assertion wake loop (§4.2)
-   needs to *not* re-assert 40047 — only 40046 (backup) and 40048
-   (discharge cutoff). Alternatively: split the method so startup
-   writes 40046/48 only and 40047 is tick-managed entirely.
-
-**Implementation sketch:**
-
-1. Add `SigenergyController.set_charge_cut_off_soc(pct: float) -> bool`
-   — a thin wrapper around `_write_u16(REG_CHARGE_CUTOFF_SOC, int(pct*10))`.
-2. Remove 40047 from `assert_battery_soc_limits()` (or keep writing at
-   startup for the initial safe state, then let the tick path manage
-   it). Simplest: keep startup write as "95% initial ceiling"; ticks
-   overwrite.
-3. Rewrite `dispatch_from_slot` charge branch:
-   - Keep direction/mode selection as today.
-   - Instead of returning `cap_kw = LP_intent`, compute
-     `target_soc_pct_end = slot_0.soc_pct_end`  ← LP already computes
-     this! Nothing new to calculate.
-   - Return mode 2 + `target_soc_pct` in a new `LPDispatch` field.
-4. `apply_lp_dispatch` writes:
-   - `40031 = 2`
-   - `40047 = target_soc × 10`
-   - `40038 = DNSP_max × 1000` (or 0 if LP wants zero export for
-     price-negative slot)
-   - No charge/discharge-cap write needed for mode-2 path.
-5. Mode 5 and mode 6 paths unchanged.
-6. Mode 3 path kept for explicit grid-charge intent (detect by
-   `slot_0.grid_to_battery_kw > 0`? — sanity check: does the LP
-   model grid-vs-PV charge contribution? see `bat_charge_grid` var).
-7. Tests:
-   - Unit: charge intent → mode 2 + correct cutoff.
-   - Unit: discharge intent → mode 5 or 6 (unchanged).
-   - Integration: a multi-slot simulation where SOC trajectory matches
-     `slot_0.soc_pct_end` when executing via mode 2 + cutoff (verify
-     the LP's model and the execution model agree).
-
-**Interaction with §3.1 (export-untie):** synergistic. §3.1 lets each
-scenario pick its own export flow; §3.3 makes execution safe regardless
-of which flow actually materialises. Combined, the LP can plan
-aggressive export in P90 and conservative in P10, and the inverter just
-does the right thing across the realised PV.
-
-**Interaction with §3.2 (battery-net tie):** likely becomes a different
-conversation. With §3.3, "what we write for charge" is a *target SOC*
-(a scalar integrating over the slot), not a *rate*. The tie may want to
-be on target SOC rather than net kW — but let's re-analyse after §3.3
-lands; until then the battery-net tie stays.
+**Interaction with §3.2 (battery-net tie):** the magnitude question
+changed shape again. With adaptive trim, charge rate is dispatch-
+bounded at apply time rather than determined by the LP's plan, so the
+LP's tied magnitude is purely advisory. See §3.2 above for the
+deferred-analysis note.
 
 ---
 
 ### 3.4 Cosmetic: exclude SOC slack penalty from reported `cost`
 
-**Status:** ✅ shipped 2026-04-23 (commit `d38956b`). Reported cost now
+**Status:** ✅ shipped 2026-04-23 (commit `d38956b`). Reported cost
 excludes the `SOC_BOUND_PENALTY * slack` internal regulariser; log
 lines append `(penalty=NNNc)` when the penalty is non-trivial.
-
-`tick_complete` events log `cost=NNNc` which is the LP's objective
-value, including `SOC_BOUND_PENALTY * slack`. When SOC is above ceiling,
-this inflates reported costs by 100s of thousands of cents — misleading
-for dashboards.
-
-**Fix:** in `lp/solver.py` where `cost = pulp.value(prob.objective)` is
-computed, subtract the slack-penalty term so the reported cost is the
-"true economic expected cost" and the slack penalty is internal to the
-solver only.
 
 ## 4. Smaller queued items
 
@@ -415,20 +244,11 @@ probe script (see §3 of `SIGENERGY-MODES.md` for pattern).
 - `KNOWN-ISSUES.md` — existing issue tracker; worth a read before
   starting each session.
 
-## 6. Code map for active items
+## 6. Code map
 
-| Item | File(s) | Lines to touch |
-|------|---------|----------------|
-| §3.1 untie export | `lp/formulation.py` | `_add_non_anticipativity` (line ~440) |
-| §3.1 untie export | `lp/solver.py` | 287-290 (export_limit derivation — read max across scenarios) |
-| §3.1 untie export | `lp/snapshot_adapter.py`, `replay.py` | any `base.grid_export[0]` reads |
-| §3.3 mode 2 + cutoff | `lp/dispatch.py` | rewrite `dispatch_from_slot` charge branch to return mode 2 + `target_soc_pct` |
-| §3.3 mode 2 + cutoff | `lp/dispatch.py` | add `target_soc_pct` field to `LPDispatch` dataclass |
-| §3.3 mode 2 + cutoff | `clients/sigenergy.py` | new `set_charge_cut_off_soc(pct)`; update `apply_lp_dispatch` write path for mode 2 |
-| §3.3 mode 2 + cutoff | `clients/sigenergy.py` | ensure §4.2 periodic reassertion doesn't fight the tick-time cutoff writes |
-| §3.4 cost exclude slack | `lp/solver.py` | ~line 292 (`cost = pulp.value(...)`) |
-| §4.1 watchdog connect | `watchdog.py` | startup; add retry loop |
-| §4.2 periodic SOC | `service.py` | add `WakeLoop` to startup list; skip 40047 if §3.3 lands |
+All §3.1 / §3.3 / §3.4 / §4.1 / §4.2 entries previously in this table
+are shipped. The only active item (§3.2 battery-net tie) is a deferred
+analysis with no code-map entry until a fresh pass is scheduled.
 
 ## 7. Testing / validation checklist per change
 

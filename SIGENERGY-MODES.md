@@ -10,9 +10,23 @@ at 192.168.2.220, 40 kWh battery, 13 kW PV array). Firmware version not
 recorded at the probe timestamp — if firmware is updated, re-run the
 probes before trusting this document.
 
+**Mode 4 retired from the dispatch path 2026-04-24** (commit `acea3f5`,
+the §3.3 cutoff dispatch). Mode 4's grid-draw hazard documented below
+was the rationale; PV-dominant charge now uses mode 2 with the adaptive
+trim on register 40032 (see SPEC-ENERGY-01.md §5.4). The mode 4 sections
+in this document are retained as the empirical record that drove the
+decision. Mode 4 stays in `RemoteEMSControlMode` for historical-snapshot
+replay only.
+
+**Charge-cutoff register (40047) retired from the tick path 2026-04-25**
+(commit `1f363a7`). It's now pinned at `soc_ceiling_pct` by
+`assert_battery_soc_limits` at startup and never rewritten per tick;
+40032 alone governs charge rate. Validated by `probe_no_cutoff.py`.
+
 **Probe scripts:** `src/optimiser/probe_mode4.py`, `probe_mode5.py`,
-`probe_mode6.py`. Raw samples dumped to
-`/var/lib/energy-optimiser/probe_mode{4,5,6}.ndjson`.
+`probe_mode6.py`, `probe_two_phase.py` (mode-2 adaptive trim),
+`probe_no_cutoff.py` (cutoff-pinned-at-ceiling). Raw samples dumped
+under `/var/lib/energy-optimiser/probe_*.ndjson`.
 
 ---
 
@@ -81,23 +95,40 @@ Fields captured per sample: `ts`, `phase`, `ems_mode`, `soc_pct`,
 
 ## Mode 2 — MAXIMUM_SELF_CONSUMPTION
 
-**Not directly probed** (it's the default fallback state; its behaviour
-is observable from normal operation and corroborated by every probe's
-recovery phase). Behaviour is consistent with industry convention:
+**Probed indirectly** via `probe_two_phase.py` (mode-2 cascade with
+varied 40032 caps) and `probe_no_cutoff.py` (idle behaviour with
+`40032 = 0` and cutoff held at ceiling). Cascade priority:
 
-- Priority: `load → battery (up to physical rate & SOC ceiling) → export (to 40038 cap) → MPPT curtail`
-- Register 40032 is **ignored**. Inverter uses the battery's own
-  physical charge rate, which may taper with SOC or temperature.
-- Never grid-charges.
+`PV → house → battery (up to 40032) → export (up to 40038) → MPPT curtail`
+
+- **Register 40032 IS honoured** as a cap on the cascade's battery leg.
+  Earlier docs claimed it was ignored — verified false on hardware
+  2026-04-24. Setting `40032 = 0` cleanly idles the battery (probe
+  P1: bat = -0.02 kW with surplus 5.0 kW, all routed to export).
+- **Register 40047 (charge-cutoff SOC)** sets the upper SOC bound for
+  the cascade's battery leg. Pinned at `soc_ceiling_pct` at startup
+  and never rewritten in the tick path
+  (`probe_no_cutoff.py` P3: 5 readbacks across 256 s of unrelated
+  40032 writes all returned raw=950, no firmware drift).
+- **Never grid-charges.**
 - Export cap 40038 is respected.
 
-**When to use:** the default "use PV efficiently" dispatch. Covers the
-scenario "battery-first, overflow export" cleanly. Only curtails PV when
-total PV > `load + battery_physical_rate + export_cap`, which on a 13 kW
-array basically never happens.
+**Three usage patterns in the dispatch:**
 
-**Limitation:** always battery-first. Cannot express "export 5 kW at
-peak feed-in while battery is not yet full."
+1. **Idle**: `40032 = 0`, `mode = 2`. Battery doesn't charge from PV;
+   surplus exports up to DNSP. Discharge still allowed (40032 caps
+   charge only — discharge floor is 40048).
+2. **PV-dominant charge (adaptive trim)**: Phase A `40032 = max_dc`
+   for 5 s + read surplus, Phase B `40032 = trim` so battery + export
+   split rather than cascade-saturate. See SPEC-ENERGY-01.md §5.4.
+3. **Fallback**: `40032 = max_dc, 40038 = 0` (or DNSP, depending on
+   export-price sign). Battery soaks all PV; never grid-charges.
+
+**Limitation (resolved by adaptive trim):** the cascade is
+sequential, so without an explicit cap, surplus PV saturates the
+battery before any export flows. The trim formula
+`max(LP_rate, surplus − export_cap − headroom)` lets the LP plan and
+execute mixed battery+export slots cleanly.
 
 ---
 

@@ -742,11 +742,10 @@ class SigenergyController:
         - 40048 discharge cutoff SOC: hard lower bound on on-grid
           discharge (also a safety stop).
 
-        For the hourly re-assertion loop (§4.2), use
-        `assert_discharge_soc_limits()` instead. That one skips 40047
-        because §3.3 will make reg 40047 tick-managed at ~60s cadence;
-        an hourly overwrite of the tick-time target would briefly
-        push charging back up to the ceiling.
+        For the hourly re-assertion loop, use
+        `assert_discharge_soc_limits()` instead. It skips 40047 because
+        the charge cutoff is set ONCE at startup here and the tick path
+        never rewrites it (see SPEC-ENERGY-01.md §5.4).
         """
         ceiling_raw = int(self._battery.soc_ceiling_pct * 10)
         floor_raw = int(self._battery.soc_floor_pct * 10)
@@ -767,10 +766,10 @@ class SigenergyController:
         """Re-assert the two SOC limits that are NOT tick-managed.
 
         Writes 40046 (backup SOC) and 40048 (discharge cutoff) only.
-        Reg 40047 (charge cutoff) is deliberately skipped so we don't
-        fight the tick-time dispatch path once §3.3 lands — until then
-        40047 is write-once-at-startup and this method is a strict
-        subset of `assert_battery_soc_limits()`.
+        Reg 40047 (charge cutoff) is deliberately skipped: it's written
+        once by `assert_battery_soc_limits()` at startup and pinned at
+        `soc_ceiling_pct` for the lifetime of the service. See
+        SPEC-ENERGY-01.md §5.4.
 
         Use this from the periodic re-assertion loop — idempotent and
         defends against firmware resetting these limits silently (power
@@ -972,7 +971,7 @@ class SigenergyController:
         is the trim floor so a transient PV droop during Phase A
         doesn't collapse the trim toward zero.
 
-        See PLAN-MODE2-ADAPTIVE.md and probe_two_phase.py.
+        See SPEC-ENERGY-01.md §5.4 and probe_two_phase.py.
         """
         max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
         if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw):
