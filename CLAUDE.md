@@ -194,6 +194,16 @@ duckdb -c "
 
 **Rule:** never deploy a config change that shows negative delta (costs more) over the historical window without understanding why. Also check `solve_ms` for performance regressions — the stochastic solve must stay under 10s mean.
 
+## Slash commands (project skills)
+
+These live in `.claude/skills/<name>/SKILL.md` and run read-only against the deployed container. Lead with the right one before grep'ing the codebase — the framing they enforce (snapshot-and-query for DB locks, host-side `jq` because the image has none, etc.) is hard-won.
+
+- **`/explain-plan`** — *"why is the system doing X right now?"* Reads the current `TickSnapshot` from `/plan/current` plus the live 5-min Amber row, decodes mode 2/3/5/6 dispatch, flags red flags (battery→export at non-negative price, stale price guard, fallback active). Doesn't re-solve.
+- **`/diagnose-lp-decision <ts>`** — *"why did the LP do X at HH:MM yesterday?"* Historical post-mortem on one tick. Walks H1 (numerical) → H4 (SOC sensitivity) → H2 (stochastic hedge via non-anti) using `replay_cli --filter-timestamp/--override-soc` and `optimiser.lp.diagnose_cli --force-bat-net`. Surfaces which scenario / future slot is binding the slot-0 choice. Worked example in `INVESTIGATION-evening-slot-skip.md`.
+- **`/review-replay`** — snapshot inventory + 7-day replay solve against the current `config.toml`. Catches gap days, daily-tick deficits (<1400 = service was down), and per-day cost delta from the deployed config. Read this before tuning constants or shipping LP changes.
+- **`/review-db`** — DuckDB sanity audit: data freshness, null rates, 5-min gap detection, load-profile health. Uses the snapshot-and-query pattern (the live service holds the DB lock).
+- **`/review-services`** — Docker health check on `energy-optimiser` + `energy-optimiser-watchdog`. State machine, circuit breaker, recent fallback / `EXPORT_BLOCKED_STALE_PRICE` events from logs.
+
 ## Environment
 
 - **Runtime:** Docker on Proxmox (host network mode for Modbus/LAN access)
