@@ -22,16 +22,28 @@ logger = logging.getLogger(__name__)
 UTC = UTC
 
 
-def next_aligned_wake(period_s: int, now: datetime | None = None) -> datetime:
+def next_aligned_wake(
+    period_s: int,
+    now: datetime | None = None,
+    *,
+    offset_s: int = 0,
+) -> datetime:
     """Compute the next wake time aligned to UTC second boundaries.
 
     For period_s=60: returns the next minute boundary.
     For period_s=300: returns the next 5-min boundary on the UTC clock.
+
+    `offset_s` shifts every fire by N seconds relative to the natural
+    boundary. period_s=300, offset_s=150 fires at :02:30/:07:30/:12:30…
+    UTC — useful for landing mid-slot when the data source publishes at
+    slot boundaries (e.g. Amber 5-min prices) and we want a few seconds
+    of settle before reading.
     """
     if now is None:
         now = datetime.now(UTC)
     epoch_s = int(now.timestamp())
-    next_s = ((epoch_s // period_s) + 1) * period_s
+    k = ((epoch_s - offset_s) // period_s) + 1
+    next_s = offset_s + k * period_s
     return datetime.fromtimestamp(next_s, UTC)
 
 
@@ -50,9 +62,12 @@ class WakeLoop:
         name: str,
         period_s: int,
         target: Callable[[], Awaitable[None]],
+        *,
+        offset_s: int = 0,
     ) -> None:
         self._name = name
         self._period_s = period_s
+        self._offset_s = offset_s
         self._target = target
         self._running = False
         self._task_in_flight = False
@@ -65,10 +80,13 @@ class WakeLoop:
     async def run(self) -> None:
         """Run the wake loop until stopped. Awaitable forever."""
         self._running = True
-        logger.info("Wake loop '%s' started (period=%ds)", self._name, self._period_s)
+        logger.info(
+            "Wake loop '%s' started (period=%ds, offset=%ds)",
+            self._name, self._period_s, self._offset_s,
+        )
 
         while self._running:
-            next_wake = next_aligned_wake(self._period_s)
+            next_wake = next_aligned_wake(self._period_s, offset_s=self._offset_s)
             delay = (next_wake - datetime.now(UTC)).total_seconds()
             if delay > 0:
                 try:

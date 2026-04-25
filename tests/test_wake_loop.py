@@ -32,6 +32,30 @@ class TestNextAlignedWake:
         wake = next_aligned_wake(1800, now)
         assert wake == datetime(2026, 4, 12, 10, 30, 0, tzinfo=UTC)
 
+    def test_300s_with_offset_150_aligns_mid_slot(self) -> None:
+        # Mid-window Amber poll lands at :02:30, :07:30, :12:30… UTC
+        now = datetime(2026, 4, 25, 13, 35, 5, tzinfo=UTC)
+        wake = next_aligned_wake(300, now, offset_s=150)
+        assert wake == datetime(2026, 4, 25, 13, 37, 30, tzinfo=UTC)
+
+    def test_300s_with_offset_skips_current_slot_when_just_past_mid(
+        self,
+    ) -> None:
+        now = datetime(2026, 4, 25, 13, 37, 30, 1, tzinfo=UTC)
+        wake = next_aligned_wake(300, now, offset_s=150)
+        assert wake == datetime(2026, 4, 25, 13, 42, 30, tzinfo=UTC)
+
+    def test_300s_offset_at_exact_mid_jumps_to_next(self) -> None:
+        # On boundary should still go to next, like the no-offset case
+        now = datetime(2026, 4, 25, 13, 37, 30, tzinfo=UTC)
+        wake = next_aligned_wake(300, now, offset_s=150)
+        assert wake == datetime(2026, 4, 25, 13, 42, 30, tzinfo=UTC)
+
+    def test_300s_offset_before_first_offset_of_minute_zero(self) -> None:
+        now = datetime(2026, 4, 25, 13, 30, 30, tzinfo=UTC)
+        wake = next_aligned_wake(300, now, offset_s=150)
+        assert wake == datetime(2026, 4, 25, 13, 32, 30, tzinfo=UTC)
+
 
 class TestWakeLoopExecution:
     async def test_target_runs_and_loop_continues_on_exception(self) -> None:

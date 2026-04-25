@@ -102,6 +102,27 @@ class AmberClient:
     def last_5min_prices(self) -> list[PriceInterval] | None:
         return self._last_5min_prices
 
+    def current_5min_price(self, t: datetime) -> PriceInterval | None:
+        """Return the cached 5-min interval whose [start, end) contains `t`.
+
+        Returns None if we have no cached prices yet, or if cached prices
+        are stale enough that none cover `t`. Callers must treat None as
+        "no current 5-min price available" and fall back to 30-min data
+        or skip the price-conditional logic.
+
+        Why time-based rather than `[0]`: Amber returns `previous + current
+        + next`, so `[0]` is one of the previous intervals, not current.
+        And after a poll failure, the cached list ages off the wall clock
+        — `[0]` then points to a slot deep in the past. Time-based lookup
+        is correct in both the fresh and the stale case.
+        """
+        if not self._last_5min_prices:
+            return None
+        for p in self._last_5min_prices:
+            if p.start <= t < p.end:
+                return p
+        return None
+
     async def get_current_prices(self) -> list[PriceInterval]:
         """Fetch 30-min forecast prices (planning horizon)."""
         if self._should_defer_fetch():
