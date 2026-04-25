@@ -25,6 +25,7 @@ from ..config import BatteryConfig
 from ..types import LoadProfile, ManagedLoadStatus, PriceInterval, PVForecast, SystemState
 from .constants import (
     DEFAULT_SCENARIO_WEIGHTS,
+    EXPORT_TIE_BREAK_PENALTY_PER_KWH,
     HORIZON_HOURS,
     PV_CURTAIL_PENALTY_PER_KWH,
     SLOT_MINUTES,
@@ -480,6 +481,17 @@ def _add_scenario_to_problem(
         ep = price.export_per_kwh
         cost_terms.append(weight * grid_import[t] * ip * slot_hours)
         cost_terms.append(-weight * grid_export[t] * ep * slot_hours)
+        # Export tie-break: at non-positive export prices, add a tiny
+        # penalty per kWh exported so the LP deterministically prefers
+        # storing over indifferent-export. Doesn't affect positive
+        # prices — the term is conditional on ep ≤ 0.
+        if ep <= 0:
+            cost_terms.append(
+                weight
+                * grid_export[t]
+                * EXPORT_TIE_BREAK_PENALTY_PER_KWH
+                * slot_hours
+            )
         cost_terms.append(
             weight
             * (bat_charge_grid[t] + bat_charge_pv[t] + bat_discharge[t])

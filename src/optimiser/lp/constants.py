@@ -103,6 +103,22 @@ WEAR_COST_PER_KWH: float = 2.5
 PV_CURTAIL_PENALTY_PER_KWH: float = 1.0
 
 
+# ── Export tie-break penalty ─────────────────────────────────────
+#
+# At non-positive export prices (ep ≤ 0), exporting earns no revenue
+# (or costs money) and the LP is left to choose between export-and-
+# break-even-or-lose and store-for-later-use purely on future-use
+# value. In tied or near-tied cases, HiGHS picks arbitrarily and the
+# slot-0 plan can flip between exporting at 0c and storing across
+# successive ticks — noisy with no economic upside.
+#
+# This tiny penalty (0.05 c/kWh, just above zero) breaks the tie
+# deterministically toward storing. Doesn't touch positive export
+# prices at all (the penalty only applies when ep ≤ 0), so peak-
+# period revenue is unaffected.
+EXPORT_TIE_BREAK_PENALTY_PER_KWH: float = 0.05
+
+
 # ── SOC out-of-band penalty ──────────────────────────────────────
 #
 # Applied per %-slot of slack when SOC is outside [effective_floor,
