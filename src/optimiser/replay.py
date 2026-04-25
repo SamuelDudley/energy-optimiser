@@ -96,6 +96,7 @@ def _reconstruct_price_interval(d: dict) -> PriceInterval:
         descriptor=d["descriptor"],
         forecast_low=d.get("forecast_low"),
         forecast_high=d.get("forecast_high"),
+        forecast_predicted=d.get("forecast_predicted"),
     )
 
 
@@ -392,7 +393,11 @@ def _solve_candidate(
             solution.solve_time_ms,
         )
 
-    dispatch = dispatch_from_slot(solution.slot_0, battery_config)
+    dispatch = dispatch_from_slot(
+        solution.slot_0,
+        battery_config,
+        current_soc_pct=snap.system_state.soc_pct,
+    )
     output = lp_solution_to_planner_output(solution, dispatch)
     return (
         output.battery_action,
