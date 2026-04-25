@@ -25,10 +25,12 @@ slave_id = 1
 
 [battery]
 capacity_kwh = 40.0
-# LP planning band — soft constraints in the formulation. The LP plans
-# inside [soc_floor_pct, soc_ceiling_pct] and pays a slack penalty for
-# excursions. These do NOT directly drive the hardware backstops.
-soc_floor_pct = 20.0
+# LP planning band. The ceiling is slack-penalised; the lower band is
+# unenforced per-slot — the LP doesn't grid-charge to "satisfy a floor"
+# at a loss. Sub-floor SOC is allowed mid-horizon; the terminal-floor
+# constraint at end-of-horizon (separate slack) is the only long-horizon
+# recovery pressure. These do NOT drive the hardware backstops directly.
+soc_floor_pct = 15.0
 soc_ceiling_pct = 100.0
 # Hardware discharge cut-off (reg 40048). Bottom of the battery the
 # inverter will physically refuse to discharge below on-grid. Decoupled

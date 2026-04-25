@@ -219,16 +219,21 @@ class TestLPDischargeDecisions:
         assert disp.kind == DispatchKind.DISCHARGE
         assert sol.slot_0.battery_kw < -0.5
 
-    def test_does_not_discharge_below_floor(self) -> None:
-        """SOC at floor — LP should not discharge even if price is high."""
+    def test_discharges_below_floor_when_economic(self) -> None:
+        """Sub-floor discharge is allowed under the post-2026-04-25
+        design: the per-slot SOC floor penalty was retired so the LP
+        plans economically against arbitrage + wear, not against an
+        artificial below-floor barrier. With an 80c import spike at
+        slot 0 and 10c rest, discharging the battery to cover load is
+        the right call even at the floor."""
         cfg = BatteryConfig(soc_floor_pct=10.0)
         sol, disp = _solve(
             soc=10.0,
             prices=_prices(slot_0_import=80.0, rest_import=10.0),
             battery_config=cfg,
         )
-        # At floor: battery_kw should be ≥ 0 (charge or idle)
-        assert sol.slot_0.battery_kw >= -0.1
+        assert disp.kind == DispatchKind.DISCHARGE
+        assert sol.slot_0.battery_kw < -0.5
 
     def test_spike_price_triggers_discharge(self) -> None:
         """Very expensive current slot (100c) with cheap future (15c).

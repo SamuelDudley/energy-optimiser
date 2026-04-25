@@ -14,7 +14,13 @@ from .types import LoadCategory
 class AmberConfig:
     api_key: str
     site_id: str
-    poll_5min_interval_s: int = 60
+    # 5-min poll: one fetch per Amber slot, fired 150s into the slot
+    # (`:02:30/:07:30/…` UTC). The earlier per-tick cadence (60s) hit
+    # Amber's 50/300s bucket and caused mid-slot LP plan flips when
+    # prices wobbled. See CLAUDE.md decision-log entry on slot-aligned
+    # Amber poll.
+    poll_5min_interval_s: int = 300
+    poll_5min_offset_s: int = 150
     poll_30min_interval_s: int = 300
     forecast_intervals_5min: int = 12
     previous_intervals_5min: int = 2
@@ -55,16 +61,20 @@ class SigenergyConfig:
 @dataclass(frozen=True, slots=True)
 class BatteryConfig:
     capacity_kwh: float = 40.0
-    # LP planning band — soft constraints in the formulation, slack-
-    # penalised. The LP plans inside [soc_floor_pct, soc_ceiling_pct].
-    # These do NOT directly drive the hardware discharge backstop —
-    # see `discharge_cutoff_pct` below for that.
-    soc_floor_pct: float = 20.0
+    # LP planning band — soft constraints in the formulation. Only the
+    # CEILING is slack-penalised; the lower band is unenforced per-slot
+    # so the LP doesn't grid-charge to "satisfy a floor" at a loss.
+    # Sub-floor SOC is allowed mid-horizon; the terminal-floor
+    # constraint at end-of-horizon (separate slack) is the only
+    # long-horizon recovery pressure. These fields do NOT directly
+    # drive the hardware discharge backstop — see `discharge_cutoff_pct`
+    # below for that.
+    soc_floor_pct: float = 15.0
     soc_ceiling_pct: float = 100.0
     # Hardware discharge cut-off (reg 40048). This is the SOC at which
     # the inverter physically refuses to discharge further on-grid.
     # Decoupled from `soc_floor_pct` so the LP can plan to a higher
-    # floor (e.g. 20%) while the hardware leaves the bottom of the
+    # floor (e.g. 15%) while the hardware leaves the bottom of the
     # battery available for emergency / out-of-plan use. Default 0%
     # — let the BMS protect the cells, not the EMS register.
     discharge_cutoff_pct: float = 0.0
