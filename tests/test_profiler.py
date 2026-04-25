@@ -9,7 +9,7 @@ from freezegun import freeze_time
 from optimiser.config import StorageConfig
 from optimiser.profiler import assess_maturity, build_load_profile
 from optimiser.store import TelemetryStore
-from optimiser.types import TelemetryRow
+from optimiser.types import LoadTelemetryRow, TelemetryRow
 
 UTC = UTC
 # All test data starts from this date
@@ -113,3 +113,56 @@ class TestBuildLoadProfile:
         profile = build_load_profile(store, outdoor_temp_c=5.0, occupied=True, timestamp=ts)
         assert profile.maturity_level >= 0
         assert len(profile.slots) == 48
+
+    @freeze_time("2026-01-15")
+    def test_managed_load_is_subtracted_from_profile(self) -> None:
+        """The LP adds its planned managed-load draw to the energy
+        balance, so the profile we hand it must already exclude the
+        historical managed-load contribution — otherwise the heat pump
+        appears twice. Build a flat 1.5 kW house_load with a parallel
+        1.0 kW managed load and assert the profile lands at ~0.5 kW."""
+        store = _make_store()
+        base = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for day in range(10):
+            for interval in range(288):
+                ts = base + timedelta(days=day, minutes=interval * 5)
+                store.write_telemetry(
+                    TelemetryRow(
+                        ts=ts,
+                        soc_pct=50.0,
+                        battery_kw=0.0,
+                        pv_kw=0.0,
+                        grid_kw=1.5,
+                        grid_kw_shelly=1.5,
+                        house_load_kw=1.5,
+                        import_price=20.0,
+                        export_price=5.0,
+                        spot_price=6.0,
+                        renewables_pct=40.0,
+                        spike_status="none",
+                        pv_forecast_kw=0.0,
+                        outdoor_temp_c=20.0,
+                        occupied=True,
+                        ems_mode=2,
+                        planner_action="self_consume",
+                        planner_reason="test",
+                    )
+                )
+                store.write_load_telemetry(
+                    LoadTelemetryRow(
+                        ts=ts,
+                        load_id="hot_water",
+                        category="signal_driven",
+                        power_kw=1.0,
+                        energy_today_kwh=None,
+                        cycle_state=None,
+                        relay_on=True,
+                    )
+                )
+
+        ts = datetime(2026, 1, 15, 2, 0, 0, tzinfo=UTC)
+        profile = build_load_profile(
+            store, outdoor_temp_c=20.0, occupied=True, timestamp=ts
+        )
+        # 1.5 (house) − 1.0 (managed) = 0.5 kW residual baseload, every slot.
+        assert all(abs(s - 0.5) < 1e-3 for s in profile.slots), profile.slots

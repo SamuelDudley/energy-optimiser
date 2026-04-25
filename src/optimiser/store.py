@@ -672,33 +672,40 @@ class TelemetryStore:
     ) -> list[float] | None:
         """Query a load profile with optional context filters.
 
-        Returns 48 slots (30-min averages) or None if insufficient data.
+        Returns 48 slots (30-min averages) of *non-managed* baseload —
+        i.e. `house_load_kw` minus the sum of measured managed-load
+        power at the same timestamp. Subtraction happens per-row before
+        averaging and is floored at zero. The LP later adds its own
+        forward managed-load plan back into the energy balance, so
+        leaving managed loads in the profile would double-count them.
+
+        Returns None if insufficient samples (< min_samples).
         Excludes pre-fix (schema_version < CURRENT) rows.
         """
         ref = as_of or datetime.now(UTC)
         conditions = [
-            "house_load_kw IS NOT NULL",
-            "schema_version >= ?",
-            "ts > ?::TIMESTAMPTZ - INTERVAL '90 days'",
+            "t.house_load_kw IS NOT NULL",
+            "t.schema_version >= ?",
+            "t.ts > ?::TIMESTAMPTZ - INTERVAL '90 days'",
         ]
         params: list = [CURRENT_SCHEMA_VERSION, ref]
 
         if weekday is not None:
             if weekday:
-                conditions.append("EXTRACT(DOW FROM ts) BETWEEN 1 AND 5")
+                conditions.append("EXTRACT(DOW FROM t.ts) BETWEEN 1 AND 5")
             else:
-                conditions.append("EXTRACT(DOW FROM ts) IN (0, 6)")
+                conditions.append("EXTRACT(DOW FROM t.ts) IN (0, 6)")
 
         if occupied is not None:
-            conditions.append("occupied = ?")
+            conditions.append("t.occupied = ?")
             params.append(occupied)
 
         if temp_bucket is not None:
             bucket_map = {
-                "cold": "outdoor_temp_c < 10",
-                "mild": "outdoor_temp_c >= 10 AND outdoor_temp_c < 20",
-                "warm": "outdoor_temp_c >= 20 AND outdoor_temp_c < 30",
-                "hot": "outdoor_temp_c >= 30",
+                "cold": "t.outdoor_temp_c < 10",
+                "mild": "t.outdoor_temp_c >= 10 AND t.outdoor_temp_c < 20",
+                "warm": "t.outdoor_temp_c >= 20 AND t.outdoor_temp_c < 30",
+                "hot": "t.outdoor_temp_c >= 30",
             }
             if temp_bucket in bucket_map:
                 conditions.append(f"({bucket_map[temp_bucket]})")
@@ -707,17 +714,30 @@ class TelemetryStore:
 
         # Check sample count
         count_result = self._db.execute(
-            f"SELECT COUNT(*) FROM telemetry WHERE {where}", params
+            f"SELECT COUNT(*) FROM telemetry t WHERE {where}", params
         ).fetchone()
         if not count_result or count_result[0] < min_samples:
             return None
 
-        # Query 48-slot profile
+        # Per-ts sum of measured managed-load power, then JOIN onto
+        # telemetry rows in the filtered window. LEFT JOIN + COALESCE
+        # makes pre-managed-load history (empty load_telemetry) a no-op:
+        # managed_kw resolves to 0 and the average collapses to the
+        # historical house_load_kw — the previous behaviour.
+        # GREATEST(...,0) guards against rare cases where the heat-pump
+        # CT briefly reports more than the inverter's house derivation
+        # (sign jitter, transient mis-reads).
         result = self._db.execute(
-            f"""SELECT
-                (EXTRACT(HOUR FROM ts) * 2 + EXTRACT(MINUTE FROM ts) / 30)::INT AS slot,
-                AVG(house_load_kw) AS mean_kw
-            FROM telemetry
+            f"""WITH managed_per_ts AS (
+                SELECT ts, SUM(COALESCE(power_kw, 0.0)) AS managed_kw
+                FROM load_telemetry
+                GROUP BY ts
+            )
+            SELECT
+                (EXTRACT(HOUR FROM t.ts) * 2 + EXTRACT(MINUTE FROM t.ts) / 30)::INT AS slot,
+                AVG(GREATEST(t.house_load_kw - COALESCE(m.managed_kw, 0.0), 0.0)) AS mean_kw
+            FROM telemetry t
+            LEFT JOIN managed_per_ts m ON m.ts = t.ts
             WHERE {where}
             GROUP BY slot
             ORDER BY slot""",

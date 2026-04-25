@@ -149,6 +149,35 @@ class TestDispatchFromSlot:
         )
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
 
+    def test_charge_grid_lead_below_hysteresis_stays_on_mode_2(self) -> None:
+        # HiGHS routinely returns near-equal charge-source decompositions
+        # at flat midday prices. A bare `>` flips mode 2 ↔ mode 3 from
+        # tick to tick on sub-watt noise; the hysteresis margin (50 W)
+        # keeps the dispatch on mode 2 unless grid genuinely leads PV.
+        d = dispatch_from_slot(
+            _slot(
+                battery_kw=4.0,
+                pv_to_battery_kw=2.0,
+                grid_to_battery_kw=2.04,  # grid leads by 40 W < 50 W hysteresis
+                soc_pct_end=70.0,
+            ),
+            current_soc_pct=60.0,
+        )
+        assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+        assert d.kind == DispatchKind.CHARGE
+
+    def test_charge_grid_lead_past_hysteresis_picks_mode_3(self) -> None:
+        # Same shape, but grid now leads PV by more than the hysteresis
+        # margin → mode 3 fires.
+        d = dispatch_from_slot(
+            _slot(
+                battery_kw=4.0,
+                pv_to_battery_kw=2.0,
+                grid_to_battery_kw=2.06,  # grid leads by 60 W > 50 W hysteresis
+            )
+        )
+        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
+
     def test_charge_equal_split_prefers_pv(self) -> None:
         # Tie-breaker: when grid == pv, prefer the mode-2 (PV) path.
         # Slightly under-executes the grid portion but avoids mode 4's

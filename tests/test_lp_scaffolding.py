@@ -394,6 +394,57 @@ class TestEconomicBehaviour:
             f"expected no charging in flat 20c slots after spike; got {flat_bat}"
         )
 
+    def test_negative_import_tie_break_prefers_charging(self) -> None:
+        """Symmetric counterpart to the negative-export tie-break. At
+        ip = 0 the LP is indifferent between idle and grid-charge once
+        wear-cost is overcome by future use; with the import reward
+        active, the LP deterministically prefers to charge from a free
+        grid into the battery rather than discharge-into-free-import.
+
+        Setup: 4h of zero-priced import inside a flat 20c day. SOC
+        starts at 30% so charging has clear future use; the test checks
+        that grid-side battery charge during the free window strictly
+        exceeds discharge.
+        """
+        # Flat 20c import, 5c export — typical day. Insert a 4h ip=0
+        # window starting at hour 6.
+        prices = _flat_prices(import_c=20.0, export_c=5.0)
+        for i in range(12, 20):  # 8 × 30-min = 4h, indices 12..19
+            old = prices[i]
+            prices[i] = PriceInterval(
+                start=old.start,
+                end=old.end,
+                import_per_kwh=0.0,
+                export_per_kwh=5.0,
+                spot_per_kwh=0.0,
+                renewables_pct=80.0,
+                spike_status="none",
+                descriptor="free",
+            )
+        sol = solve(
+            state=_state(soc=30.0),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        slot_hours = SLOT_MINUTES / 60.0
+        free_window_start = NOW + timedelta(hours=6)
+        free_window_end = NOW + timedelta(hours=10)
+        grid_charge = sum(
+            d.grid_to_battery_kw * slot_hours
+            for d in sol.forward_trajectory
+            if free_window_start <= d.slot_start < free_window_end
+        )
+        assert grid_charge > 1.0, (
+            f"with ip=0 the LP should soak free grid into battery; "
+            f"only saw {grid_charge:.2f} kWh of grid_to_battery"
+        )
+
     def test_negative_export_drives_pv_to_battery(self) -> None:
         """Negative export price + PV available → LP should soak PV into
         battery rather than export it.
@@ -458,14 +509,17 @@ class TestLoadFactory:
         assert len(loads) == 1
         assert isinstance(loads[0], ObservableLoad)
 
-    def test_unknown_category_skipped(self) -> None:
+    def test_unknown_category_skipped(self, caplog) -> None:
         cfg = ManagedLoadConfig(
             load_id="oven",
             category=LoadCategory.PRECONDITIONABLE,
             shelly_host="test",
         )
-        loads = build_lp_loads([cfg])
+        with caplog.at_level("WARNING", logger="optimiser.lp.loads"):
+            loads = build_lp_loads([cfg])
         assert loads == []
+        assert any("oven" in r.message for r in caplog.records), \
+            "expected a warning naming the skipped load"
 
 
 # ── Horizon truncation + terminal SOC ────────────────────────────

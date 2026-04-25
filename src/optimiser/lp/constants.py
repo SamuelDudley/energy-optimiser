@@ -119,6 +119,25 @@ PV_CURTAIL_PENALTY_PER_KWH: float = 1.0
 EXPORT_TIE_BREAK_PENALTY_PER_KWH: float = 0.05
 
 
+# ── Import tie-break reward ──────────────────────────────────────
+#
+# Mirror of EXPORT_TIE_BREAK_PENALTY_PER_KWH on the import side. At
+# non-positive import prices (ip ≤ 0; Amber occasionally pays
+# customers to take wholesale electricity), importing is free or
+# revenue-positive — but at exactly the wear-cost-equivalent
+# threshold the LP becomes indifferent between import-and-charge
+# and discharge-into-the-free-import. Without a tie-break, HiGHS
+# arbitrarily resolves the indifference and slot-0 charge magnitude
+# flips across successive ticks at the same conditions.
+#
+# Subtracted from the cost objective (i.e. an extra 0.05 c/kWh of
+# nominal revenue) when ip ≤ 0, biasing the LP toward soaking up
+# free electricity. Sized symmetrically with the export penalty;
+# well below WEAR_COST_PER_KWH so it cannot drive a charge that
+# wear-cost otherwise rejects.
+IMPORT_TIE_BREAK_REWARD_PER_KWH: float = 0.05
+
+
 # ── SOC out-of-band penalty ──────────────────────────────────────
 #
 # Applied per %-slot of slack when SOC is outside [effective_floor,

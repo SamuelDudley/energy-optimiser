@@ -314,12 +314,12 @@ def _extract_solution(
     # well-behaved in recovery scenarios (initial SOC outside the band)
     # but should not show up in dashboards as a huge cost — it's an
     # internal regulariser, not a real grid bill. Penalty per-scenario:
-    #   weight * SOC_BOUND_PENALTY * (Σ soc_over + Σ soc_under + terminal)
-    # Deterministic: single LPVars with weight=1. Stochastic: sum over
-    # scenario LPVars, each carrying its own weight.
+    #   weight * SOC_BOUND_PENALTY * (Σ soc_over + terminal)
+    # (Lower-band slack was retired 2026-04-25.) Deterministic: single
+    # LPVars with weight=1. Stochastic: sum over scenario LPVars, each
+    # carrying its own weight.
     def _penalty_for(v: LPVars) -> float:
         parts = [_v(x) for x in v.soc_over_ceiling]
-        parts += [_v(x) for x in v.soc_under_floor]
         if v.soc_terminal_slack is not None:
             parts.append(_v(v.soc_terminal_slack))
         return v.weight * SOC_BOUND_PENALTY * sum(parts)

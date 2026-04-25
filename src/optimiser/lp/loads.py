@@ -12,6 +12,7 @@ code doesn't change.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -22,6 +23,8 @@ from ..config import ManagedLoadConfig
 from ..time_utils import local_to_utc, utc_to_local
 from ..types import LoadCommand, ManagedLoadStatus
 from .constants import RELAX_FUTURE_BINARIES, ROLL_FORWARD_CAP_MULTIPLIER
+
+logger = logging.getLogger(__name__)
 
 # ── Protocol ─────────────────────────────────────────────────────
 
@@ -313,7 +316,17 @@ def build_lp_loads(configs: list[ManagedLoadConfig]) -> list[LPLoad]:
             loads.append(BinarySignalDrivenLoad(cfg))
         elif cfg.category == LoadCategory.OBSERVABLE:
             loads.append(ObservableLoad(cfg))
-        # SHIFTABLE / PRECONDITIONABLE / DEADLINE_BIDIR: deferred to v2
+        else:
+            # SHIFTABLE / PRECONDITIONABLE / DEADLINE_BIDIR: deferred
+            # to v2. Surface skipped configs at startup so an
+            # operator who configures one of these doesn't have it
+            # silently disappear from the LP.
+            logger.warning(
+                "Skipping managed load %r: category %r has no LPLoad "
+                "implementation (deferred to v2)",
+                cfg.load_id,
+                cfg.category.value,
+            )
     return loads
 
 

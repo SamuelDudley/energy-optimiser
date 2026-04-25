@@ -34,6 +34,17 @@ DEADBAND_KW: float = 0.1
 # load-follows, using PV first and topping up from battery if short.
 PV_PRODUCING_THRESHOLD_KW: float = 0.2
 
+# Hysteresis margin for the mode-3-vs-mode-2 charge-source split. The LP
+# decomposes a charge into `grid_to_battery_kw` and `pv_to_battery_kw`;
+# their relative magnitudes pick the dispatch path (grid-dominant ⇒ mode
+# 3, otherwise mode 2 + adaptive trim). HiGHS often returns near-equal
+# decompositions where the two values differ by sub-watt numerical
+# noise — without a margin, two ticks with effectively identical inputs
+# can flip mode and change the entire write path. Require grid to lead
+# PV by at least this margin before switching to mode 3; ties (and
+# near-ties) stay on mode 2.
+MODE_SWITCH_HYSTERESIS_KW: float = 0.05
+
 # Buffer above current SOC, retained for backwards compatibility on the
 # advisory `target_soc_pct` field (snapshot / metrics consumers). No
 # longer written to a register — the 2026-04-25 cutoff-pinned-at-ceiling
@@ -181,7 +192,10 @@ def dispatch_from_slot(
         # pv-only), use mode 2 with adaptive trim so the inverter charges
         # from PV at a rate that lets surplus also flow to export rather
         # than cascade-saturating the battery first.
-        if slot_0.grid_to_battery_kw > slot_0.pv_to_battery_kw:
+        if (
+            slot_0.grid_to_battery_kw
+            > slot_0.pv_to_battery_kw + MODE_SWITCH_HYSTERESIS_KW
+        ):
             return LPDispatch(
                 mode=RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST,
                 cap_kw=battery_kw,
