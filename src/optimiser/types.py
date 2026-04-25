@@ -84,6 +84,7 @@ class EventType(StrEnum):
     MODBUS_ERROR = auto()
     PRICE_UPDATE = auto()
     PRICE_STALE = auto()
+    EXPORT_BLOCKED_STALE_PRICE = auto()  # Export clamped to 0 because 5-min prices aged out
     HW_CYCLE_START = auto()
     HW_CYCLE_COMPLETE = auto()
     HW_CYCLE_FAULT = auto()

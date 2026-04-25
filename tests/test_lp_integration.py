@@ -110,10 +110,10 @@ class TestDispatchFromSlot:
         assert d.target_soc_pct is None
 
     def test_charge_pv_dominant_picks_mode_2_with_cutoff(self) -> None:
-        # 5 kW charge, PV contributes more than grid → mode 2 + cutoff =
-        # planned end-of-slot SOC. The §3.3 swap from mode 4 → mode 2
-        # eliminates mode 4's silent grid-draw hazard when PV droops
-        # mid-slot.
+        # 5 kW charge, PV contributes more than grid → mode 2 with the LP
+        # rate as `cap_kw` (used as the trim floor under the adaptive
+        # dispatch). target_soc_pct is advisory (snapshot/metrics) and
+        # carries the planned end-of-slot SOC.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=5.0,
@@ -125,8 +125,8 @@ class TestDispatchFromSlot:
         )
         assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
         assert d.kind == DispatchKind.CHARGE
-        assert d.cap_kw == 0.0  # mode 2 doesn't use 40032
-        assert d.target_soc_pct == 72.0  # already > current + 0.1, no clamp
+        assert d.cap_kw == 5.0  # LP rate; trim floor under adaptive trim
+        assert d.target_soc_pct == 72.0  # advisory, > current + 0.1, no clamp
 
     def test_charge_pv_only_picks_mode_2_with_cutoff(self) -> None:
         # All charge from PV (e.g. midday surplus) → mode 2 + cutoff
@@ -284,12 +284,12 @@ class TestVerifyBatteryResponse:
         assert verify_battery_response(d, measured_kw=4.0) == DeviationKind.OVER_CAP
 
     def test_mode2_charge_skips_over_cap_check(self) -> None:
-        # Mode-2 PV-charge has cap_kw = 0 (the LP doesn't bound the
-        # instantaneous rate; PV produces what it produces, bounded by
-        # the physical 13 kW DC limit). The over-cap check is
-        # meaningless — the cutoff (40047) bounds total *energy* via
-        # SOC, not instantaneous power. The watcher should still flag
-        # wrong direction but accept any positive measurement.
+        # Mode-2 PV-charge under adaptive trim: cap_kw is the LP rate
+        # (used as the Phase-B trim floor) but the trim formula
+        # intentionally lets the inverter charge faster than LP_rate when
+        # measured surplus exceeds LP_rate + export_cap. The watcher must
+        # not false-positive on this — physical rate is bounded by 40032
+        # (set by the trim itself). Direction check still applies.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=3.0,
@@ -300,13 +300,13 @@ class TestVerifyBatteryResponse:
             current_soc_pct=60.0,
         )
         assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
-        assert d.cap_kw == 0.0
+        assert d.cap_kw == 3.0  # LP rate — trim floor
         # Wrong direction still caught
         assert (
             verify_battery_response(d, measured_kw=-2.0)
             == DeviationKind.WRONG_DIRECTION
         )
-        # High charge rate is OK — no instantaneous cap under mode 2
+        # Charging above LP rate is OK under mode-2 adaptive trim
         assert verify_battery_response(d, measured_kw=8.0) == DeviationKind.OK
         assert verify_battery_response(d, measured_kw=12.5) == DeviationKind.OK
 

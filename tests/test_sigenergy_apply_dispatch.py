@@ -61,12 +61,16 @@ def _self_consume_dispatch(target_soc_pct: float | None = None) -> LPDispatch:
     )
 
 
-def _mode2_charge_dispatch(target_soc_pct: float = 70.0) -> LPDispatch:
-    """A §3.3 PV-charge dispatch: mode 2, no cap, cutoff carries intent."""
+def _mode2_charge_dispatch(
+    target_soc_pct: float = 70.0, signed_intent_kw: float = 3.0
+) -> LPDispatch:
+    """Adaptive mode-2 PV-charge dispatch (post 2026-04-25). cap_kw is the
+    LP rate, used as the Phase-B trim floor; target_soc_pct is advisory
+    only."""
     return LPDispatch(
         mode=RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION,
-        cap_kw=0.0,
-        signed_intent_kw=3.0,
+        cap_kw=signed_intent_kw,
+        signed_intent_kw=signed_intent_kw,
         kind=DispatchKind.CHARGE,
         target_soc_pct=target_soc_pct,
     )
@@ -139,76 +143,31 @@ class TestWriteOrdering:
             RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST.value,
         )
 
-    async def test_self_consume_without_target_soc_writes_cap_then_mode(
+    async def test_mode2_idle_writes_cap_zero_then_mode(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Defensive path: a mode-2 dispatch missing target_soc_pct (e.g.
-        # constructed by tests, or hypothetically by a code path that
-        # doesn't go through dispatch_from_slot) still writes 40032
-        # (uncap the charge leg) and the mode register; it skips the
-        # cutoff write. Production dispatches always carry target_soc_pct
-        # under §3.3 — see TestMode2Idle below.
-        ctrl = _controller()
-        rec = _WriteRecorder()
-        _install_recorder(ctrl, monkeypatch, rec)
-
-        assert await ctrl.apply_lp_dispatch(_self_consume_dispatch())
-
-        assert len(rec.calls) == 2
-        assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
-        assert rec.calls[1] == (
-            "u16",
-            REG_REMOTE_EMS_CONTROL_MODE,
-            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
-        )
-
-    async def test_mode2_charge_writes_cap_and_cutoff_before_mode(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The §3.3 PV-charge path writes three registers in order:
-        (1) reg 40032 = max_dc_charge_kw so the battery leg can accept
-        PV at the physical DC max (otherwise a stale small value from a
-        prior mode-3 tick throttles charge and surplus PV curtails —
-        verified on hardware 2026-04-24), (2) reg 40047 (cutoff SOC) to
-        bound charging by SOC, (3) reg 40031 (mode). All aux writes
-        must precede the mode write so a half-failed apply leaves the
-        inverter in its prior known state."""
-        ctrl = _controller()
-        rec = _WriteRecorder()
-        _install_recorder(ctrl, monkeypatch, rec)
-
-        assert await ctrl.apply_lp_dispatch(_mode2_charge_dispatch(target_soc_pct=72.0))
-
-        assert len(rec.calls) == 3
-        assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
-        assert rec.calls[1] == ("u16", REG_CHARGE_CUTOFF_SOC, 720)  # 72.0% × 10
-        assert rec.calls[2] == (
-            "u16",
-            REG_REMOTE_EMS_CONTROL_MODE,
-            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
-        )
-
-    async def test_mode2_idle_writes_cap_cutoff_mode(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Idle (kind=SELF_CONSUME) under §3.3 writes the same three
-        registers as mode-2 charge: 40032 uncapped, 40047 at current+
-        buffer, then mode. Re-asserting 40032 every tick keeps stale
-        small values from a previous mode-3 dispatch from throttling
-        the battery the next time PV is available."""
+        """Idle dispatch under the post-2026-04-25 design: write
+        40032 = 0 (block PV-to-battery charge), then mode = 2. The
+        cascade routes surplus to export at the DNSP cap (already
+        written by service.py before this call) and discharges battery
+        if PV < load. No cutoff (40047) write — that's pinned at the
+        startup ceiling."""
         ctrl = _controller()
         rec = _WriteRecorder()
         _install_recorder(ctrl, monkeypatch, rec)
 
         assert await ctrl.apply_lp_dispatch(_self_consume_dispatch(target_soc_pct=58.5))
 
-        assert len(rec.calls) == 3
-        assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
-        assert rec.calls[1] == ("u16", REG_CHARGE_CUTOFF_SOC, 585)
-        assert rec.calls[2][:2] == ("u16", REG_REMOTE_EMS_CONTROL_MODE)
+        assert len(rec.calls) == 2
+        assert rec.calls[0] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 0)
+        assert rec.calls[1] == (
+            "u16",
+            REG_REMOTE_EMS_CONTROL_MODE,
+            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
+        )
+        # No cutoff write
+        assert all(addr != REG_CHARGE_CUTOFF_SOC for _, addr, _ in rec.calls)
 
 
 class TestWriteFailureSafety:
@@ -232,27 +191,28 @@ class TestWriteFailureSafety:
         assert len(rec.calls) == 1
         assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
 
-    async def test_mode2_cutoff_failure_aborts_before_mode_write(
+    async def test_mode2_charge_cap_failure_aborts_before_mode(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Symmetric with cap-failure-aborts: if 40047 (cutoff) write
-        fails on a mode-2 dispatch, we must NOT proceed to write mode.
-        The cap write to 40032 (which precedes cutoff) does fire; the
-        mode register is left unchanged so the inverter stays in
-        whatever known-good mode the previous tick left it in."""
+        """Mode-2 adaptive charge writes 40032=max FIRST, then mode=2.
+        If the 40032 write fails, the mode write must NOT happen — the
+        inverter stays in whatever known-good mode the previous tick
+        left it in."""
         ctrl = _controller()
         rec = _WriteRecorder(
-            u16_returns={REG_CHARGE_CUTOFF_SOC: False},  # cutoff fails
+            u32_returns={REG_ESS_MAX_CHARGING_LIMIT: False},  # cap fails
         )
         _install_recorder(ctrl, monkeypatch, rec)
 
-        result = await ctrl.apply_lp_dispatch(_mode2_charge_dispatch())
+        result = await ctrl.apply_lp_dispatch(
+            _mode2_charge_dispatch(), export_cap_kw=0.0
+        )
 
         assert result is False
-        assert len(rec.calls) == 2
+        # Only the 40032 attempt happened — no mode write
+        assert len(rec.calls) == 1
         assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
-        assert rec.calls[1][:2] == ("u16", REG_CHARGE_CUTOFF_SOC)
 
     async def test_mode_failure_after_successful_cap_returns_false(
         self,
@@ -271,6 +231,147 @@ class TestWriteFailureSafety:
 
         assert result is False
         # Both writes attempted, cap before mode
+        assert len(rec.calls) == 2
+        assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
+        assert rec.calls[1][:2] == ("u16", REG_REMOTE_EMS_CONTROL_MODE)
+
+
+class TestMode2Adaptive:
+    """The PV-dominant charge path runs a Phase-A measure / Phase-B trim
+    sequence to split surplus PV between the battery and export rather
+    than cascade-saturating the battery first. See
+    `_apply_mode2_adaptive_charge` and PLAN-MODE2-ADAPTIVE.md."""
+
+    @staticmethod
+    def _state(pv_kw: float, load_kw: float):
+        from datetime import UTC, datetime
+
+        from optimiser.types import SystemState
+
+        return SystemState(
+            timestamp=datetime.now(UTC),
+            soc_pct=50.0,
+            battery_power_kw=0.0,
+            pv_power_kw=pv_kw,
+            grid_power_kw=-(pv_kw - load_kw),
+            house_load_kw=load_kw,
+            ems_mode=2,
+            outdoor_temp_c=None,
+            occupied=True,
+        )
+
+    async def test_phase_b_trims_surplus_minus_export_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """surplus=8, export_cap=5, headroom=0.5 → trim ≈ 2.5 kW.
+        Phase-A writes 40032=max + mode=2; Phase-B writes 40032=trim."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _no_sleep(_seconds: float) -> None:
+            return None
+
+        async def _read_state():
+            return self._state(pv_kw=9.0, load_kw=1.0)  # surplus 8
+
+        monkeypatch.setattr("asyncio.sleep", _no_sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+
+        assert await ctrl.apply_lp_dispatch(
+            _mode2_charge_dispatch(signed_intent_kw=1.0),
+            export_cap_kw=5.0,
+        )
+
+        # 1) 40032 = max (uncap), 2) mode = 2, 3) 40032 = trim
+        assert len(rec.calls) == 3
+        assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
+        # Phase-A uncap should be the configured max_dc_charge_kw
+        assert rec.calls[0][2] == int(round(ctrl._battery.max_dc_charge_kw * 1000))
+        assert rec.calls[1] == (
+            "u16",
+            REG_REMOTE_EMS_CONTROL_MODE,
+            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
+        )
+        # surplus 8 - export 5 - headroom 0.5 = 2.5 kW → 2500
+        assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 2500)
+
+    async def test_phase_b_lp_rate_is_trim_floor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If measured surplus is below LP rate, trim collapses to the
+        LP rate — protects against transient PV droop during Phase A."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _no_sleep(_seconds: float) -> None:
+            return None
+
+        async def _read_state():
+            return self._state(pv_kw=2.0, load_kw=1.0)  # surplus 1
+
+        monkeypatch.setattr("asyncio.sleep", _no_sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+
+        assert await ctrl.apply_lp_dispatch(
+            _mode2_charge_dispatch(signed_intent_kw=4.0),  # LP wanted 4 kW
+            export_cap_kw=5.0,
+        )
+
+        # max(LP_rate=4, max(0, 1-5) - 0.5) = 4 → 4000
+        assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 4000)
+
+    async def test_phase_b_clamped_to_max_dc_charge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Trim never exceeds the physical DC charge limit, even with
+        absurdly high measured surplus."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _no_sleep(_seconds: float) -> None:
+            return None
+
+        async def _read_state():
+            return self._state(pv_kw=50.0, load_kw=0.0)  # impossible surplus
+
+        monkeypatch.setattr("asyncio.sleep", _no_sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+
+        assert await ctrl.apply_lp_dispatch(
+            _mode2_charge_dispatch(signed_intent_kw=2.0),
+            export_cap_kw=5.0,
+        )
+
+        max_raw = int(round(ctrl._battery.max_dc_charge_kw * 1000))
+        assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, max_raw)
+
+    async def test_phase_a_telemetry_failure_leaves_uncapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If read_state returns None during Phase A, the path returns
+        True with Phase-A state in force (40032=max). Equivalent to the
+        fallback's 'uncapped charge' behaviour — safe."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _no_sleep(_seconds: float) -> None:
+            return None
+
+        async def _read_state():
+            return None
+
+        monkeypatch.setattr("asyncio.sleep", _no_sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+
+        assert await ctrl.apply_lp_dispatch(
+            _mode2_charge_dispatch(), export_cap_kw=5.0,
+        )
+
+        # Phase A only: 40032=max, mode=2. No Phase-B trim.
         assert len(rec.calls) == 2
         assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
         assert rec.calls[1][:2] == ("u16", REG_REMOTE_EMS_CONTROL_MODE)

@@ -81,6 +81,28 @@ ROLL_FORWARD_CAP_MULTIPLIER: float = 2.0
 WEAR_COST_PER_KWH: float = 2.5
 
 
+# ── PV curtail penalty ───────────────────────────────────────────
+#
+# Per-kWh cost charged when the LP allocates surplus PV to `pv_curtailed`
+# instead of `bat_charge_pv`. Without this term, curtail is free in the
+# objective while charging carries `WEAR_COST_PER_KWH` — so on a flat-
+# pricing day the LP prefers to throw surplus PV away rather than store
+# it. That's a real failure mode on cheap-wholesale midday slots.
+#
+# Sizing:
+#   - 0 c/kWh: today's behaviour, prefers curtail over charge in flat
+#     pricing.
+#   - 1 c/kWh: between zero and wear (2.5). LP chooses charge over
+#     curtail unless future-use value of the stored kWh is *negative*.
+#   - >= 2.5 c/kWh: would override legitimate curtail (battery hard-
+#     full, scenario PV beats battery+export+house). Pathological.
+#
+# 1 c/kWh is roughly the implicit value of stored PV under "no current
+# use, future imports cheap" — a hedge against forecast error. Tune via
+# replay if the wear cost moves or pricing patterns shift.
+PV_CURTAIL_PENALTY_PER_KWH: float = 1.0
+
+
 # ── SOC out-of-band penalty ──────────────────────────────────────
 #
 # Applied per %-slot of slack when SOC is outside [effective_floor,

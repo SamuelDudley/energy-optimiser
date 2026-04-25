@@ -6,6 +6,7 @@ for async TCP communication.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,7 @@ from pymodbus.client import AsyncModbusTcpClient
 
 from ..config import BatteryConfig, SigenergyConfig
 from ..logging_utils import emit
+from ..lp.dispatch import DispatchKind
 from ..time_utils import now_utc
 from ..types import (
     EventType,
@@ -116,6 +118,19 @@ REG_DISCHARGE_CUTOFF_SOC = 40048  # U16, gain=10, %
 # Modbus function codes: input registers use FC=4, holding use FC=3/6/16
 # pymodbus read_input_registers for 30xxx, read_holding_registers for 40xxx
 # Offset: Modbus addresses are 0-based, so 30003 → address=30003 for input regs
+
+
+# ── Mode-2 adaptive dispatch tunables ────────────────────────────
+# See `_apply_mode2_adaptive_charge`. Phase A uncaps 40032 so the cascade
+# soaks all surplus PV and we can read true MPP from telemetry; Phase B
+# trims 40032 so the battery + export cascade splits rather than the
+# battery saturating before any export flows. Validated by
+# probe_two_phase.py and probe_no_cutoff.py.
+MODE2_PROBE_SECONDS: float = 5.0
+# Trim safety floor: never trim below the LP's intended charge rate even
+# if measured surplus says we could. Protects against transient PV droop
+# during the Phase-A window collapsing the trim toward zero.
+MODE2_TRIM_FLOOR_HEADROOM_KW: float = 0.5
 
 
 class SigenergyController:
@@ -846,93 +861,69 @@ class SigenergyController:
     #
     # The LP outputs a continuous signed `battery_kw` for slot 0 (+ charge,
     # − discharge). We map that to one of the inverter's load-following
-    # modes (2/3/5/6) plus the relevant auxiliary register (cap or
-    # cutoff), rather than mode 0 + a fixed plant-level setpoint.
-    # Reason: mode 0 holds whatever number we last wrote and doesn't react
-    # to actual house load — every load transient leaks as unintended
-    # grid import or export. The load-following modes let the inverter
-    # handle real-time response within our magnitude cap (modes 3/5/6) or
-    # SOC ceiling (mode 2); the LP supplies intent, the inverter supplies
+    # modes (2/3/5/6) plus a charge or discharge cap, rather than mode 0
+    # + a fixed plant-level setpoint. Reason: mode 0 holds whatever number
+    # we last wrote and doesn't react to actual house load — every load
+    # transient leaks as unintended grid import or export. The load-
+    # following modes let the inverter handle real-time response within
+    # our magnitude cap; the LP supplies intent, the inverter supplies
     # sub-second response.
     #
-    # Mode mapping (post §3.3):
-    #   Idle (|battery|<deadband)      → mode 2, write cutoff = current+0.1%
-    #   Charge, grid > pv              → mode 3, write cap (40032) = battery_kw
-    #   Charge, pv ≥ grid              → mode 2, write cutoff (40047) = soc_end
-    #   Discharge, PV producing        → mode 5, write cap (40034) = max_discharge_kw
-    #   Discharge, no PV               → mode 6, write cap (40034) = max_discharge_kw
-    # Mode 4 (COMMAND_CHARGING_PV_FIRST) is no longer emitted — its
-    # cap (40032) is a target, not a ceiling, so any PV droop mid-slot
-    # leaks as grid draw. Mode 2 + dynamic cutoff achieves "PV-charge
-    # up to a ceiling" with no grid-draw risk.
+    # Mode mapping (post 2026-04-25 cutoff retire):
+    #   Idle (|battery|<deadband)      → mode 2, write 40032 = 0
+    #   Charge, grid > pv              → mode 3, write 40032 = battery_kw
+    #   Charge, pv ≥ grid              → mode 2 ADAPTIVE: phase A
+    #                                     40032=max + measure, phase B
+    #                                     40032 = trim so battery+export
+    #                                     split rather than cascade-saturate
+    #   Discharge, PV producing        → mode 5, write 40034 = max_discharge
+    #   Discharge, no PV               → mode 6, write 40034 = max_discharge
+    #
+    # The charge cutoff (40047) is NOT written per tick. It's pinned at
+    # the configured `soc_ceiling_pct` by `assert_battery_soc_limits`
+    # at startup, and stays there. 40032 alone governs charge rate —
+    # validated by probe_no_cutoff.py (mode-2 idle via 40032=0 produced
+    # bat=-0.02 kW; cutoff held at 950 across 256s of unrelated writes).
 
-    async def apply_lp_dispatch(self, dispatch: LPDispatch) -> bool:
-        """Apply the LP's slot-0 decision via mode + auxiliary registers.
+    async def apply_lp_dispatch(
+        self, dispatch: LPDispatch, *, export_cap_kw: float = 0.0
+    ) -> bool:
+        """Apply the LP's slot-0 decision via mode + cap registers.
 
-        **Write order: auxiliary first, then mode.** If any write fails
-        partway, the inverter must never be in (new mode, stale aux).
+        `export_cap_kw` is the resolved DNSP export cap currently in force
+        (caller is responsible for writing 40038 BEFORE this call so the
+        Phase-A surplus measurement reflects the real export window).
 
-        - Auxiliary write fails → mode still unchanged, so the half-written
-          aux isn't in force yet. Fallback will overwrite mode to
-          SELF_CONSUME, which still uses 40047 — but that one was just
-          written successfully (or wasn't needed for the prior mode).
-        - Auxiliary succeeds, mode fails → aux has been updated but mode
-          is the old one. For mode 2's cutoff: the old mode either was
-          mode 2 (so the cutoff was already in scope) or was a charge/
-          discharge mode (which doesn't consult 40047) — never a worse
-          state than before. For modes 3/5/6's cap: same argument with
-          40032 / 40034.
+        **Write order: cap first, then mode.** If any write fails partway,
+        the inverter must never be in (new mode, stale cap). Cap-first
+        means a mid-apply failure leaves the inverter in (old mode, new
+        cap) — always safe.
 
-        Mode write is still unconditional every tick (even when unchanged)
-        as a defensive re-assertion against the inverter quietly reverting
-        mode after a comms drop.
-
-        Returns True if all writes succeeded. On False the caller must
-        trigger fallback — partial application is never safe.
+        Returns True if all writes succeeded. False on any failure; the
+        caller must trigger fallback — partial application is never safe.
         """
         if not self._remote_ems_enabled:
             if not await self.enable_remote_ems():
                 return False
 
         mode = dispatch.mode
+        kind_name = dispatch.kind.name if dispatch.kind is not None else "?"
 
-        # Write the relevant auxiliary register FIRST. Failure here aborts
-        # the apply; the mode register is left untouched so the inverter
-        # stays in its previous (known-good) configuration until fallback
-        # or the next tick.
+        # Adaptive mode-2 charge has its own multi-phase path because it
+        # requires a mid-apply telemetry read between writes.
+        if (
+            mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+            and dispatch.kind == DispatchKind.CHARGE
+        ):
+            return await self._apply_mode2_adaptive_charge(
+                dispatch, export_cap_kw=export_cap_kw
+            )
+
+        # Mode 2 idle: write 40032 = 0 to block PV charge; surplus exports
+        # via the cascade up to the DNSP cap (already written by caller).
         if mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION:
-            # Mode 2 writes two auxiliary registers before mode:
-            #
-            # 1. reg 40032 (ESS_MAX_CHARGING_LIMIT) = physical DC max.
-            #    Mode 2's cascade is `PV → load → battery up to cutoff →
-            #    export → curtail`. The inverter honours 40032 as a cap on
-            #    the battery leg even in mode 2 — if 40032 is left at a
-            #    stale low value from a previous mode-3/4 dispatch, the
-            #    battery gets throttled and surplus PV curtails instead
-            #    of DC-charging. Verified on hardware 2026-04-24: with
-            #    40032 at 2.38 kW (left over from a prior mode-3 tick),
-            #    blocking export dropped PV to ~2.7 kW instead of soaking
-            #    into battery.  Writing max_dc_charge_kw uncaps the leg
-            #    so the battery accepts whatever PV provides.
-            # 2. reg 40047 (CHARGE_CUTOFF_SOC) — bounds charging by SOC.
-            #
-            # `target_soc_pct` is set by `dispatch_from_slot` and already
-            # clamped to be safely above current SOC. If it's somehow
-            # None on a mode-2 dispatch (programmer error), skip the
-            # cutoff write — the prior cutoff stays in force, which is
-            # safe but not ideal. Log loudly.
-            max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
-            if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw):
+            if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, 0):
                 return False
-            if dispatch.target_soc_pct is None:
-                logger.warning(
-                    "apply_lp_dispatch: mode 2 dispatch missing target_soc_pct; "
-                    "leaving cutoff (40047) untouched"
-                )
-            else:
-                cutoff_raw = max(0, min(1000, int(round(dispatch.target_soc_pct * 10))))
-                if not await self._write_u16(REG_CHARGE_CUTOFF_SOC, cutoff_raw):
-                    return False
         elif mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST:
             cap_raw = max(0, int(round(dispatch.cap_kw * 1000)))
             if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, cap_raw):
@@ -945,28 +936,80 @@ class SigenergyController:
             if not await self._write_u32(REG_ESS_MAX_DISCHARGING_LIMIT, cap_raw):
                 return False
         else:
-            # Should never happen — dispatch_from_slot only produces the
-            # modes handled above. Bail loudly rather than write mode
-            # over a missing-aux state.
             logger.error(
                 "apply_lp_dispatch: unexpected mode %s; refusing to write",
                 mode.name,
             )
             return False
 
-        # THEN assert the mode register. Always written (even if unchanged)
-        # so a mode reset from a brief comms drop gets re-asserted.
         if not await self._write_u16(REG_REMOTE_EMS_CONTROL_MODE, mode.value):
             return False
 
         logger.info(
-            "Applied LP dispatch: mode=%s cap=%.2fkW target_soc=%s intent=%+.2fkW",
-            mode.name,
-            dispatch.cap_kw,
-            f"{dispatch.target_soc_pct:.1f}%" if dispatch.target_soc_pct is not None else "n/a",
-            dispatch.signed_intent_kw,
+            "Applied LP dispatch: mode=%s kind=%s cap=%.2fkW intent=%+.2fkW",
+            mode.name, kind_name, dispatch.cap_kw, dispatch.signed_intent_kw,
         )
         return True
+
+    async def _apply_mode2_adaptive_charge(
+        self, dispatch: LPDispatch, *, export_cap_kw: float
+    ) -> bool:
+        """Two-phase mode-2 dispatch for PV-dominant charge.
+
+        Phase A: write 40032 = max_dc_charge_kw, mode = 2. Cascade soaks
+        all surplus PV into the battery so we can read true MPP from
+        telemetry. Sleep `MODE2_PROBE_SECONDS` for the cascade to settle.
+
+        Phase B: read state, compute trim:
+
+            surplus_a = max(0, pv_kw - house_load_kw)
+            trim_kw   = max(LP_rate, surplus_a - export_cap_kw - headroom)
+            trim_kw   = min(trim_kw, max_dc_charge_kw)
+
+        Write 40032 = trim_kw. The mode-2 cascade now splits surplus
+        between battery (up to trim) and export (up to DNSP cap),
+        avoiding the "battery first, then export" flip-flop. LP_rate
+        is the trim floor so a transient PV droop during Phase A
+        doesn't collapse the trim toward zero.
+
+        See PLAN-MODE2-ADAPTIVE.md and probe_two_phase.py.
+        """
+        max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
+        if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw):
+            return False
+        if not await self._write_u16(
+            REG_REMOTE_EMS_CONTROL_MODE,
+            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
+        ):
+            return False
+
+        await asyncio.sleep(MODE2_PROBE_SECONDS)
+
+        state = await self.read_state()
+        if state is None or state.pv_power_kw is None or state.house_load_kw is None:
+            # Telemetry blind — leave Phase-A state in force (uncapped
+            # charge). Equivalent to fallback behaviour. Log so we know.
+            logger.warning(
+                "mode-2 adaptive: phase-A telemetry unavailable; "
+                "staying uncapped (40032=max)"
+            )
+            return True
+        surplus_a = max(0.0, state.pv_power_kw - state.house_load_kw)
+
+        lp_rate = abs(dispatch.signed_intent_kw) if dispatch.signed_intent_kw else 0.0
+        trim_kw = max(
+            lp_rate,
+            max(0.0, surplus_a - export_cap_kw) - MODE2_TRIM_FLOOR_HEADROOM_KW,
+        )
+        trim_kw = min(trim_kw, self._battery.max_dc_charge_kw)
+        trim_raw = int(round(trim_kw * 1000))
+        logger.info(
+            "Mode-2 adaptive: phaseA pv=%.2fkW load=%.2fkW surplus=%.2fkW "
+            "→ phaseB trim=%.2fkW (lp_rate=%.2fkW, export_cap=%.2fkW)",
+            state.pv_power_kw, state.house_load_kw, surplus_a,
+            trim_kw, lp_rate, export_cap_kw,
+        )
+        return await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, trim_raw)
 
     async def read_battery_power_kw(self) -> float | None:
         """Fast-path read of register 30037 (ESS power) only.

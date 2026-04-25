@@ -53,6 +53,16 @@ class AmberClient:
         self._rate_limit: int | None = None
         self._rate_remaining: int | None = None
         self._rate_reset_seconds: int | None = None
+        # Wall-clock time at which the current rate-limit window is
+        # expected to reset. Computed when we parse RateLimit-Reset so
+        # we can answer "is the window still open?" without relying on
+        # a raw second-count that doesn't tick down on its own.
+        self._rate_window_resets_at: datetime | None = None
+        # If Amber 429s us, we record when it's safe to try again and
+        # skip outbound calls until then. Returning cached data is
+        # preferable to hammering the API — retrying just re-triggers
+        # the same 5-min bucket and extends the lockout.
+        self._rate_limited_until: datetime | None = None
         self._warned_rate_low: bool = False
 
     async def close(self) -> None:
@@ -94,6 +104,8 @@ class AmberClient:
 
     async def get_current_prices(self) -> list[PriceInterval]:
         """Fetch 30-min forecast prices (planning horizon)."""
+        if self._should_defer_fetch():
+            return self._last_prices or []
         prices, log_rows = await self._fetch(
             next_count=self._config.forecast_intervals_30min,
             previous=0,
@@ -111,6 +123,8 @@ class AmberClient:
         Returns ~14 intervals: 2 previous + current + ~12 forward.
         Used for acute decisions (spike, neg export, neg import).
         """
+        if self._should_defer_fetch():
+            return self._last_5min_prices or []
         prices, log_rows = await self._fetch(
             next_count=self._config.forecast_intervals_5min,
             previous=self._config.previous_intervals_5min,
@@ -121,6 +135,28 @@ class AmberClient:
         self._last_log_rows_5min = log_rows
         logger.info("Fetched %d 5-min price intervals from Amber", len(prices))
         return prices
+
+    def _should_defer_fetch(self) -> bool:
+        """Skip this Amber call if we're in a post-429 cool-down, or if
+        the last response's RateLimit-Remaining hit zero and the window
+        hasn't rolled over yet. Callers fall back to cached data, which
+        `prices_age` / `prices_5min_age` will still flag as stale once
+        the cool-down runs long enough to matter to the state machine.
+        """
+        now = now_utc()
+        if (
+            self._rate_limited_until is not None
+            and now < self._rate_limited_until
+        ):
+            return True
+        if (
+            self._rate_remaining is not None
+            and self._rate_remaining <= 0
+            and self._rate_window_resets_at is not None
+            and now < self._rate_window_resets_at
+        ):
+            return True
+        return False
 
     def drain_log_rows(self) -> list[PriceForecastLogRow]:
         """Drain pending price_forecast_log rows from both cadences.
@@ -155,10 +191,20 @@ class AmberClient:
         url = f"/sites/{self._config.site_id}/prices/current"
         params = {"next": next_count, "previous": previous, "resolution": resolution}
 
-        async for attempt in amber_retry():
-            with attempt:
-                resp = await self._client.get(url, params=params)
-                resp.raise_for_status()
+        try:
+            async for attempt in amber_retry():
+                with attempt:
+                    resp = await self._client.get(url, params=params)
+                    resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # 429 is non-retryable (would re-trigger the same bucket).
+            # Parse the rate-limit headers on the error response so we
+            # can compute when it's safe to try again, then re-raise so
+            # the caller's failure path runs.
+            if exc.response is not None and exc.response.status_code == 429:
+                self._update_rate_limits(exc.response)
+                self._note_rate_limited(exc.response)
+            raise
 
         self._update_rate_limits(resp)
         data = resp.json()
@@ -266,7 +312,15 @@ class AmberClient:
             reset = headers.get("RateLimit-Reset")
             self._rate_limit = int(limit) if limit is not None else self._rate_limit
             self._rate_remaining = int(remaining) if remaining is not None else self._rate_remaining
-            self._rate_reset_seconds = int(reset) if reset is not None else self._rate_reset_seconds
+            if reset is not None:
+                self._rate_reset_seconds = int(reset)
+                # Project the seconds-from-now header onto a wall-clock
+                # timestamp so stale values don't keep us deferred
+                # forever — the raw header number doesn't tick down on
+                # its own.
+                self._rate_window_resets_at = now_utc() + timedelta(
+                    seconds=max(self._rate_reset_seconds, 0)
+                )
         except (ValueError, TypeError, AttributeError):
             # Header not present / unparseable / headers object not dict-like.
             return
@@ -289,6 +343,37 @@ class AmberClient:
                 self._warned_rate_low = True
         else:
             self._warned_rate_low = False
+
+    def _note_rate_limited(self, resp: httpx.Response) -> None:
+        """Record a 429 and the wall-clock time it's safe to retry.
+
+        Prefers `Retry-After` (seconds) when present — it's the
+        canonical RFC 7231 header and Amber honours it. Falls back to
+        `RateLimit-Reset` from the rate-limit draft, and finally to a
+        conservative 60 s when neither is parseable.
+        """
+        headers = getattr(resp, "headers", {}) or {}
+        reset_s: int | None = None
+        raw_retry_after = headers.get("Retry-After") if hasattr(headers, "get") else None
+        if raw_retry_after is not None:
+            try:
+                reset_s = int(raw_retry_after)
+            except (ValueError, TypeError):
+                pass
+        if reset_s is None and self._rate_reset_seconds is not None:
+            reset_s = self._rate_reset_seconds
+        if reset_s is None or reset_s <= 0:
+            reset_s = 60
+
+        self._rate_limited_until = now_utc() + timedelta(seconds=reset_s)
+        emit(EventType.PRICE_STALE, {
+            "message": "Amber 429 — deferring fetches",
+            "defer_seconds": reset_s,
+        })
+        logger.warning(
+            "Amber returned 429 — skipping fetches for %ss (until %s)",
+            reset_s, self._rate_limited_until.isoformat(),
+        )
 
     async def get_usage(
         self,

@@ -71,38 +71,33 @@ def emit(
 
 
 class SnapshotWriter:
-    """Writes tick snapshots to daily NDJSON files, gzipped."""
+    """Writes tick snapshots to daily NDJSON files, gzipped.
+
+    Each write is a self-contained gzip member (concatenated multi-member
+    gzip — a standard format readable by gzip, zcat, and Python's
+    ``gzip.open`` without any special handling). This means the file is
+    always in a fully-terminated state on disk: SIGKILL, OOM, or power loss
+    can only lose the in-flight write, never truncate previously-written
+    snapshots into an unreadable (no-trailer) gzip stream.
+    """
 
     def __init__(self, snapshot_dir: str | Path) -> None:
         self._dir = Path(snapshot_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._current_date: date | None = None
-        self._file: gzip.GzipFile | None = None
 
     def _path_for(self, d: date) -> Path:
         return self._dir / f"{d.isoformat()}.ndjson.gz"
 
-    def _ensure_file(self, d: date) -> gzip.GzipFile:
-        if self._current_date != d:
-            self.close()
-            self._current_date = d
-            self._file = gzip.open(self._path_for(d), "at", encoding="utf-8")
-        assert self._file is not None
-        return self._file
-
     def write(self, snapshot: TickSnapshot) -> None:
-        """Append a snapshot to today's NDJSON file."""
-        d = snapshot.timestamp.date()
-        f = self._ensure_file(d)
-        line = json.dumps(asdict(snapshot), default=_serialise)
-        f.write(line + "\n")
-        f.flush()
+        """Append a snapshot to today's NDJSON file as its own gzip member."""
+        path = self._path_for(snapshot.timestamp.date())
+        line = json.dumps(asdict(snapshot), default=_serialise) + "\n"
+        with gzip.open(path, "ab") as f:
+            f.write(line.encode("utf-8"))
 
     def close(self) -> None:
-        if self._file:
-            self._file.close()
-            self._file = None
-            self._current_date = None
+        # Each write is self-contained; nothing to flush on shutdown.
+        return
 
 
 def setup_logging() -> None:

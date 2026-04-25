@@ -288,6 +288,56 @@ class TestEconomicBehaviour:
         # Should have charged at least a few kWh during the cheap window
         assert cheap_charge > 5.0, f"only charged {cheap_charge:.1f} kWh in cheap window"
 
+    def test_curtail_penalty_prefers_charge_over_curtail_in_flat_pricing(
+        self,
+    ) -> None:
+        """Without a curtail penalty, the LP charges wear-cost (2.5c/kWh)
+        while curtailing is free — on a flat-priced midday it would
+        rather throw surplus PV away than store it. The penalty
+        (PV_CURTAIL_PENALTY_PER_KWH = 1c/kWh) flips the tie so the LP
+        prefers charging up to the soft ceiling.
+
+        Setup: flat 20c import, 1c export (positive but tiny), 5kW PV
+        for 4h, 1kW house load, battery starts at 60%. The 4h surplus
+        produces ~16 kWh of PV-side energy beyond the export cap; the
+        LP could absorb most of it into the battery up to the ceiling
+        before falling back on curtail.
+        """
+        prices = _flat_prices(import_c=20.0, export_c=1.0)
+        pv_forecast = [
+            PVForecast(
+                start=NOW,
+                end=NOW + timedelta(hours=4),
+                pv_estimate_kw=5.0,
+                pv_estimate10_kw=4.0,
+                pv_estimate90_kw=6.0,
+            ),
+        ]
+        sol = solve(
+            state=_state(soc=60.0),
+            prices_planning=prices,
+            pv_forecast=pv_forecast,
+            load_profile=_flat_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        slot_hours = SLOT_MINUTES / 60.0
+        pv_to_bat = sum(
+            d.pv_to_battery_kw * slot_hours
+            for d in sol.forward_trajectory
+            if NOW <= d.slot_start < NOW + timedelta(hours=4)
+        )
+        # Under the curtail penalty the LP should prefer charge over
+        # curtail for any kWh whose stored value is non-negative.
+        # Expect at least a couple kWh of PV → battery during the window.
+        assert pv_to_bat > 2.0, (
+            f"with curtail penalty, expected meaningful pv→battery "
+            f"during flat-priced PV surplus; got {pv_to_bat:.2f} kWh"
+        )
+
     def test_negative_export_drives_pv_to_battery(self) -> None:
         """Negative export price + PV available → LP should soak PV into
         battery rather than export it.

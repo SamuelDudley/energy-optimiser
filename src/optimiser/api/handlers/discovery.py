@@ -19,6 +19,7 @@ from typing import Any
 from aiohttp import web
 
 from ..probe import SERVICE_PROBE_KEY
+from .tables import TABLE_TIME_COLUMNS
 
 # Table → one-line description, surfaced by GET /{table}/schema so agents
 # have a reason to reach for a given table. Keep these short; agents can
@@ -55,6 +56,7 @@ TABLE_DESCRIPTIONS: dict[str, str] = {
 def _endpoints_index() -> list[dict[str, Any]]:
     table_entries: list[dict[str, Any]] = []
     for name in TABLE_DESCRIPTIONS:
+        time_col = TABLE_TIME_COLUMNS[name]
         table_entries.append(
             {
                 "path": f"/{name}",
@@ -62,12 +64,18 @@ def _endpoints_index() -> list[dict[str, Any]]:
                 "auth": True,
                 "description": (
                     f"Range-query {name!r} rows. Returns JSON array sorted "
-                    "ascending by ts. Page by advancing `since` to the last "
-                    "row's ts plus one microsecond."
+                    f"ascending by {time_col}. Page by advancing `since` to "
+                    f"the last row's {time_col} plus one microsecond."
                 ),
                 "params": {
-                    "since": "ISO 8601 timestamp (inclusive) — required if until unset",
-                    "until": "ISO 8601 timestamp (exclusive) — optional",
+                    "since": (
+                        f"ISO 8601 timestamp (inclusive, filters on "
+                        f"{time_col}) — required if until unset"
+                    ),
+                    "until": (
+                        f"ISO 8601 timestamp (exclusive, filters on "
+                        f"{time_col}) — optional"
+                    ),
                     "limit": "int ≤ query_max_limit (default 1000)",
                 },
                 "schema": f"/{name}/schema",
@@ -124,6 +132,35 @@ def _endpoints_index() -> list[dict[str, Any]]:
                 "until": "ISO 8601 timestamp (exclusive) — optional",
                 "level": "DEBUG|INFO|WARNING|ERROR|CRITICAL — minimum level",
                 "limit": "int ≤ 1000 (default 200)",
+            },
+        },
+        {
+            "path": "/plan/current",
+            "method": "GET",
+            "auth": True,
+            "description": (
+                "Most recent TickSnapshot in memory — the full LP plan "
+                "(forward slot trajectory, dispatch, prices, forecasts) "
+                "as produced by the tick loop. 503 until the first tick "
+                "completes. Same shape as one line of a snapshot .ndjson.gz."
+            ),
+        },
+        {
+            "path": "/snapshots",
+            "method": "GET",
+            "auth": True,
+            "description": (
+                "Range-query historical TickSnapshots from the NDJSON "
+                "snapshot glob via DuckDB. Small default/cap limit — "
+                "each row carries the full LP forward trajectory and is "
+                "large. Returns JSON array sorted ascending by "
+                "`timestamp`. Page by advancing `since` to the last "
+                "row's timestamp plus one microsecond."
+            ),
+            "params": {
+                "since": "ISO 8601 timestamp (inclusive, filters on timestamp) — optional",
+                "until": "ISO 8601 timestamp (exclusive, filters on timestamp) — optional",
+                "limit": "int ≤ 200 (default 20)",
             },
         },
         *table_entries,

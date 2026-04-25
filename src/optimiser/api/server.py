@@ -20,6 +20,8 @@ from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
 from .handlers.logs import logs as logs_handler
 from .handlers.metrics import metrics as metrics_handler
+from .handlers.plan import plan_current
+from .handlers.snapshots import snapshots
 from .handlers.tables import table_rows
 from .probe import API_CONFIG_KEY, SERVICE_PROBE_KEY, ServiceProbe
 
@@ -58,6 +60,10 @@ class APIServer:
         app.router.add_get("/readyz", readyz)
         app.router.add_get("/metrics", metrics_handler)
         app.router.add_get("/logs", logs_handler)
+        # /plan/current and /snapshots are concrete paths, registered
+        # before the /{table} catch-all so they don't get routed there.
+        app.router.add_get("/plan/current", plan_current)
+        app.router.add_get("/snapshots", snapshots)
         app.router.add_get("/{table}/schema", table_schema)
         app.router.add_get("/{table}", table_rows)
 

@@ -10,9 +10,10 @@ Shared handler for all five tables the service writes. Each request:
 4. Serialises the result rows into JSON-safe dicts (datetimes → ISO
    strings).
 
-Paging convention: rows are returned ascending by `ts`, up to `limit`.
-If you get exactly `limit` rows back, advance `since` to the last
-row's `ts` plus 1 microsecond for the next page.
+Paging convention: rows are returned ascending by the table's time
+column (see TABLE_TIME_COLUMNS), up to `limit`. If you get exactly
+`limit` rows back, advance `since` to the last row's timestamp plus
+1 microsecond for the next page.
 """
 
 from __future__ import annotations
@@ -28,17 +29,19 @@ from ..probe import API_CONFIG_KEY, SERVICE_PROBE_KEY
 
 logger = logging.getLogger(__name__)
 
-# Whitelist of queryable tables. Mirrors the entries in
-# `handlers.discovery.TABLE_DESCRIPTIONS` — kept in sync by convention.
-QUERYABLE_TABLES = frozenset(
-    [
-        "telemetry",
-        "load_telemetry",
-        "pv_forecast_log",
-        "price_forecast_log",
-        "weather_forecast_log",
-    ]
-)
+# Per-table time column used for since/until filtering and ORDER BY.
+# Telemetry tables use `ts` (write-time); forecast logs use `fetched_at`
+# (fetch-time), which is the append-order column for deterministic paging.
+# Also acts as the whitelist of queryable tables — mirrors entries in
+# `handlers.discovery.TABLE_DESCRIPTIONS`, kept in sync by convention.
+TABLE_TIME_COLUMNS: dict[str, str] = {
+    "telemetry": "ts",
+    "load_telemetry": "ts",
+    "pv_forecast_log": "fetched_at",
+    "price_forecast_log": "fetched_at",
+    "weather_forecast_log": "fetched_at",
+}
+QUERYABLE_TABLES = frozenset(TABLE_TIME_COLUMNS)
 
 DEFAULT_LIMIT = 1000
 
@@ -81,19 +84,20 @@ def _run_query(
     Uses `conn.cursor()` so this runs on a separate DuckDB query
     handle and doesn't serialise behind the tick loop's writes.
     """
+    time_col = TABLE_TIME_COLUMNS[table]
     where = []
     params: list[Any] = []
     if since is not None:
-        where.append("ts >= ?")
+        where.append(f"{time_col} >= ?")
         params.append(since)
     if until is not None:
-        where.append("ts < ?")
+        where.append(f"{time_col} < ?")
         params.append(until)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
 
-    # `table` is taken straight from the URL path. Safe because the
-    # caller has already validated against QUERYABLE_TABLES.
-    sql = f"SELECT * FROM {table} {where_sql} ORDER BY ts ASC LIMIT ?"  # noqa: S608 — interpolation is whitelisted
+    # `table` and `time_col` are taken from the whitelist above — safe to
+    # interpolate. Filter values are still parameterised.
+    sql = f"SELECT * FROM {table} {where_sql} ORDER BY {time_col} ASC LIMIT ?"  # noqa: S608 — interpolation is whitelisted
     params.append(limit)
 
     cur = conn.cursor()

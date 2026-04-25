@@ -13,6 +13,7 @@ import duckdb
 from aiohttp import web
 
 from ..config import APIConfig
+from ..types import TickSnapshot
 from .log_buffer import RingBufferHandler
 from .metrics import Metrics
 
@@ -32,6 +33,12 @@ class ServiceProbe(Protocol):
     db_connection: duckdb.DuckDBPyConnection
     metrics: Metrics
     log_buffer: RingBufferHandler | None
+    # Most recent TickSnapshot — None until the first tick completes.
+    # Powers /plan/current so it can avoid re-reading the NDJSON file.
+    last_snapshot: TickSnapshot | None
+    # Directory where NDJSON snapshots live (daily .ndjson.gz). Powers
+    # /snapshots range queries via DuckDB read_json over a glob.
+    snapshot_dir: Path
 
 
 # Typed app key — handlers retrieve the probe via

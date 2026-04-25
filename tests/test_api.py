@@ -7,6 +7,7 @@ protocol, so these tests don't stand up a Service.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from optimiser.api.handlers.discovery import TABLE_DESCRIPTIONS, root, table_sch
 from optimiser.api.handlers.health import healthz, readyz
 from optimiser.api.handlers.logs import logs as logs_handler
 from optimiser.api.handlers.metrics import metrics as metrics_handler
+from optimiser.api.handlers.plan import plan_current
+from optimiser.api.handlers.snapshots import snapshots as snapshots_handler
 from optimiser.api.handlers.tables import table_rows
 from optimiser.api.log_buffer import RingBufferHandler
 from optimiser.api.metrics import Metrics
@@ -42,10 +45,16 @@ class _Probe:
     db_connection: duckdb.DuckDBPyConnection | None = None
     metrics: Metrics | None = None
     log_buffer: RingBufferHandler | None = None
+    last_snapshot: object = None  # Actual type: TickSnapshot | None
+    snapshot_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.metrics is None:
             self.metrics = Metrics()
+        if self.snapshot_dir is None:
+            # Default to a path that doesn't exist — /snapshots treats
+            # this as an empty result, which is what most tests want.
+            self.snapshot_dir = Path("/nonexistent-snapshot-dir")
 
 
 def _fresh_heartbeat(tmp_path: Path) -> Path:
@@ -78,6 +87,8 @@ def _build_app(
     app.router.add_get("/readyz", readyz)
     app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/logs", logs_handler)
+    app.router.add_get("/plan/current", plan_current)
+    app.router.add_get("/snapshots", snapshots_handler)
     app.router.add_get("/{table}/schema", table_schema)
     app.router.add_get("/{table}", table_rows)
     return app
@@ -705,3 +716,395 @@ class TestTableQuery:
                 since = (last_ts + timedelta(microseconds=1)).isoformat()
             assert len(seen) == 5
             assert [r["soc_pct"] for r in seen] == [50.0, 51.0, 52.0, 53.0, 54.0]
+
+
+class TestForecastLogTableQuery:
+    """Regression: forecast log tables have no `ts` column — they key on
+    `fetched_at`. The range handler must use the per-table time column."""
+
+    @staticmethod
+    def _seed_pv(conn: duckdb.DuckDBPyConnection) -> None:
+        conn.execute(
+            "CREATE TABLE pv_forecast_log ("
+            "  fetched_at TIMESTAMPTZ NOT NULL,"
+            "  period_end TIMESTAMPTZ NOT NULL,"
+            "  pv_estimate_kw REAL"
+            ")"
+        )
+        for i in range(4):
+            conn.execute(
+                "INSERT INTO pv_forecast_log VALUES (?, ?, ?)",
+                [
+                    f"2026-01-01 0{i}:00:00+00:00",
+                    f"2026-01-01 0{i}:30:00+00:00",
+                    float(i),
+                ],
+            )
+
+    @staticmethod
+    def _seed_price(conn: duckdb.DuckDBPyConnection) -> None:
+        conn.execute(
+            "CREATE TABLE price_forecast_log ("
+            "  fetched_at TIMESTAMPTZ NOT NULL,"
+            "  resolution INTEGER NOT NULL,"
+            "  interval_start TIMESTAMPTZ NOT NULL,"
+            "  per_kwh REAL"
+            ")"
+        )
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO price_forecast_log VALUES (?, ?, ?, ?)",
+                [
+                    f"2026-01-01 0{i}:00:00+00:00",
+                    5,
+                    f"2026-01-01 0{i}:05:00+00:00",
+                    10.0 + i,
+                ],
+            )
+
+    @staticmethod
+    def _seed_weather(conn: duckdb.DuckDBPyConnection) -> None:
+        conn.execute(
+            "CREATE TABLE weather_forecast_log ("
+            "  fetched_at TIMESTAMPTZ NOT NULL,"
+            "  period_end TIMESTAMPTZ NOT NULL,"
+            "  temp_c REAL"
+            ")"
+        )
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO weather_forecast_log VALUES (?, ?, ?)",
+                [
+                    f"2026-01-01 0{i}:00:00+00:00",
+                    f"2026-01-01 0{i}:59:00+00:00",
+                    20.0 + i,
+                ],
+            )
+
+    async def test_pv_forecast_log_range_query(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        self._seed_pv(conn)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/pv_forecast_log", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 4
+            assert [row["pv_estimate_kw"] for row in body["rows"]] == [0.0, 1.0, 2.0, 3.0]
+
+            r = await c.get(
+                "/pv_forecast_log?since=2026-01-01T02:00:00%2B00:00",
+                headers=_auth(),
+            )
+            body = await r.json()
+            assert body["count"] == 2
+            assert body["rows"][0]["pv_estimate_kw"] == 2.0
+
+    async def test_price_forecast_log_range_query(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        self._seed_price(conn)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get(
+                "/price_forecast_log?until=2026-01-01T02:00:00%2B00:00",
+                headers=_auth(),
+            )
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 2
+            assert body["rows"][-1]["per_kwh"] == 11.0
+
+    async def test_weather_forecast_log_range_query(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        self._seed_weather(conn)
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/weather_forecast_log?limit=2", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 2
+            assert [row["temp_c"] for row in body["rows"]] == [20.0, 21.0]
+
+
+def _make_snapshot(timestamp: datetime, soc_pct: float = 50.0, action: str = "self_consume"):
+    """Build a minimal TickSnapshot with one forward slot for tests."""
+    from optimiser.lp.result import LPSolution, SlotDecision, SolveStatus
+    from optimiser.types import (
+        BatteryAction,
+        LoadProfile,
+        PlannerOutput,
+        SystemState,
+        TickSnapshot,
+    )
+
+    state = SystemState(
+        timestamp=timestamp,
+        soc_pct=soc_pct,
+        battery_power_kw=0.0,
+        pv_power_kw=1.5,
+        grid_power_kw=0.3,
+        house_load_kw=1.8,
+        ems_mode=2,
+        outdoor_temp_c=18.0,
+        occupied=True,
+    )
+    slot0 = SlotDecision(
+        slot_start=timestamp,
+        battery_kw=-2.0,
+        grid_import_kw=0.0,
+        grid_export_kw=0.0,
+        pv_to_house_kw=1.5,
+        pv_to_battery_kw=0.0,
+        pv_to_export_kw=0.0,
+        soc_pct_end=soc_pct - 0.5,
+        grid_to_battery_kw=0.0,
+        load_kw={},
+    )
+    solution = LPSolution(
+        status=SolveStatus.OPTIMAL,
+        slot_0=slot0,
+        forward_trajectory=[slot0],
+        load_commands=[],
+        grid_export_limit_kw=None,
+        expected_total_cost_cents=-12.5,
+        solve_time_ms=42.0,
+        reason="test plan",
+    )
+    output = PlannerOutput(
+        battery_action=BatteryAction(action),
+        charge_limit_kw=0.0,
+        discharge_limit_kw=10.0,
+        target_soc=soc_pct,
+        load_commands=[],
+        grid_export_limit_kw=None,
+        reason="test",
+    )
+    profile = LoadProfile(slots=[0.0] * 48, maturity_level=0, context="test")
+    return TickSnapshot(
+        tick_id="test-tick",
+        timestamp=timestamp,
+        version="0.0.0-test",
+        system_state=state,
+        price_forecast=[],
+        pv_forecast=None,
+        load_profile=profile,
+        managed_loads=[],
+        maturity_level=0,
+        output=output,
+        lp_solution=solution,
+        lp_dispatch=None,
+    )
+
+
+class TestPlanCurrent:
+    async def test_requires_auth(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/plan/current")
+            assert r.status == 401
+
+    async def test_503_before_first_tick(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), last_snapshot=None)
+        async with await _client(probe) as c:
+            r = await c.get("/plan/current", headers=_auth())
+            assert r.status == 503
+            body = await r.json()
+            assert "error" in body
+
+    async def test_returns_snapshot_after_tick(self, tmp_path: Path) -> None:
+        ts = datetime.fromisoformat("2026-04-24T10:00:00+00:00")
+        snapshot = _make_snapshot(ts, soc_pct=72.5, action="discharge_ess")
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path), last_snapshot=snapshot
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/plan/current", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["tick_id"] == "test-tick"
+            assert body["system_state"]["soc_pct"] == 72.5
+            assert body["lp_solution"]["status"] == "optimal"
+            assert len(body["lp_solution"]["forward_trajectory"]) == 1
+            assert body["lp_solution"]["forward_trajectory"][0]["battery_kw"] == -2.0
+            assert body["output"]["battery_action"] == "discharge_ess"
+
+
+class TestSnapshots:
+    """The /snapshots endpoint reads the NDJSON glob via DuckDB. The
+    files on disk are newline-delimited JSON, one TickSnapshot per line
+    — same format `SnapshotWriter` writes live."""
+
+    async def test_requires_auth(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/snapshots")
+            assert r.status == 401
+
+    async def test_empty_when_dir_missing(self, tmp_path: Path) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            snapshot_dir=tmp_path / "no-such-dir",
+            db_connection=duckdb.connect(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/snapshots", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 0
+            assert body["rows"] == []
+
+    async def test_empty_when_dir_exists_but_has_no_files(
+        self, tmp_path: Path
+    ) -> None:
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            snapshot_dir=snap_dir,
+            db_connection=duckdb.connect(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/snapshots", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 0
+
+    async def test_reads_snapshots_from_ndjson(self, tmp_path: Path) -> None:
+        # DuckDB's read_json_auto accepts uncompressed NDJSON via the
+        # same code path; tests use .ndjson (plain) to skip the gzip
+        # round-trip. The handler's glob is '*.ndjson.gz', so we point
+        # it directly at a *.ndjson file by parking a subclass — easier
+        # to use a plain file and adjust the glob for the test.
+        from dataclasses import asdict
+
+        from optimiser.logging_utils import _serialise
+
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        ts1 = datetime.fromisoformat("2026-04-24T09:00:00+00:00")
+        ts2 = datetime.fromisoformat("2026-04-24T09:01:00+00:00")
+        ts3 = datetime.fromisoformat("2026-04-24T09:02:00+00:00")
+        snaps = [
+            _make_snapshot(ts1, soc_pct=60.0),
+            _make_snapshot(ts2, soc_pct=61.0),
+            _make_snapshot(ts3, soc_pct=62.0),
+        ]
+        # Write as plain .ndjson.gz via gzip — matches production.
+        import gzip
+
+        with gzip.open(snap_dir / "2026-04-24.ndjson.gz", "wt", encoding="utf-8") as f:
+            for s in snaps:
+                f.write(json.dumps(asdict(s), default=_serialise) + "\n")
+
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            snapshot_dir=snap_dir,
+            db_connection=duckdb.connect(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/snapshots", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 3
+            assert [row["system_state"]["soc_pct"] for row in body["rows"]] == [
+                60.0,
+                61.0,
+                62.0,
+            ]
+
+            # since filter
+            r = await c.get(
+                "/snapshots?since=2026-04-24T09:01:30%2B00:00",
+                headers=_auth(),
+            )
+            body = await r.json()
+            assert body["count"] == 1
+            assert body["rows"][0]["system_state"]["soc_pct"] == 62.0
+
+            # limit
+            r = await c.get("/snapshots?limit=2", headers=_auth())
+            body = await r.json()
+            assert body["count"] == 2
+
+    async def test_bad_limit_400(self, tmp_path: Path) -> None:
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            snapshot_dir=snap_dir,
+            db_connection=duckdb.connect(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/snapshots?limit=garbage", headers=_auth())
+            assert r.status == 400
+
+    async def test_skips_corrupt_gzip(self, tmp_path: Path) -> None:
+        """A torn/truncated .ndjson.gz (e.g. from an abrupt service
+        exit mid-flush) must not poison the whole query — the handler
+        skips the bad file and reports it under skipped_files."""
+        import gzip
+        from dataclasses import asdict
+
+        from optimiser.logging_utils import _serialise
+
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        base = datetime.fromisoformat("2026-04-24T00:00:00+00:00")
+        snaps = [_make_snapshot(base + timedelta(seconds=i)) for i in range(3)]
+
+        # File 1: clean
+        with gzip.open(snap_dir / "2026-04-23.ndjson.gz", "wt", encoding="utf-8") as f:
+            for s in snaps:
+                f.write(json.dumps(asdict(s), default=_serialise) + "\n")
+
+        # File 2: truncated gzip stream — only a partial gzip magic,
+        # exactly what an abrupt mid-flush append leaves on disk.
+        (snap_dir / "2026-04-24.ndjson.gz").write_bytes(b"\x1f\x8b\x08\x00garbage")
+
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            snapshot_dir=snap_dir,
+            db_connection=duckdb.connect(),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/snapshots", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 3  # from the clean file
+            assert "skipped_files" in body
+            assert len(body["skipped_files"]) == 1
+            assert "2026-04-24" in body["skipped_files"][0]["path"]
+
+    async def test_limit_capped(self, tmp_path: Path) -> None:
+        """Default cap is 200, regardless of what the caller asks for."""
+        import gzip
+        from dataclasses import asdict
+
+        from optimiser.logging_utils import _serialise
+
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        base = datetime.fromisoformat("2026-04-24T00:00:00+00:00")
+        snaps = [
+            _make_snapshot(base + timedelta(seconds=i)) for i in range(5)
+        ]
+        with gzip.open(snap_dir / "2026-04-24.ndjson.gz", "wt", encoding="utf-8") as f:
+            for s in snaps:
+                f.write(json.dumps(asdict(s), default=_serialise) + "\n")
+
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            snapshot_dir=snap_dir,
+            db_connection=duckdb.connect(),
+        )
+        async with await _client(probe) as c:
+            # Request 999; cap is 200, seed has 5 → returns 5.
+            r = await c.get("/snapshots?limit=999", headers=_auth())
+            body = await r.json()
+            assert body["count"] == 5

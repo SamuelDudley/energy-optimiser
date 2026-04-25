@@ -131,6 +131,142 @@ class TestAmberRetry:
         await client.close()
 
 
+class TestAmberRateLimitDefer:
+    """Amber 429 handling: client records the cool-down window and
+    skips subsequent fetches until the window has expired, rather than
+    re-triggering the same 50/5-min bucket with every tick."""
+
+    @staticmethod
+    def _err_response_with_headers(status: int, headers: dict[str, str]) -> MagicMock:
+        resp = _err_response(status)
+        resp.headers = headers
+        # The HTTPStatusError built by _http_status_error carries its
+        # own minimal response with no headers, so attach ours to the
+        # error too — that's what the client reads on the except path.
+        resp.raise_for_status.side_effect.response = resp
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_429_sets_defer_window_from_retry_after(self) -> None:
+        client = AmberClient(AmberConfig(api_key="k", site_id="s"))
+        client._client.get = AsyncMock(
+            return_value=self._err_response_with_headers(
+                429,
+                {"Retry-After": "45", "RateLimit-Reset": "300"},
+            )
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._fetch(next_count=1, previous=0, resolution=30)
+        # Retry-After (45s) wins over RateLimit-Reset (300s).
+        assert client._rate_limited_until is not None
+        from datetime import timedelta as _td
+
+        from optimiser.time_utils import now_utc as _now
+        remaining = (client._rate_limited_until - _now()).total_seconds()
+        assert 40 <= remaining <= 46
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_429_falls_back_to_rate_limit_reset(self) -> None:
+        client = AmberClient(AmberConfig(api_key="k", site_id="s"))
+        client._client.get = AsyncMock(
+            return_value=self._err_response_with_headers(
+                429, {"RateLimit-Reset": "120"}
+            )
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._fetch(next_count=1, previous=0, resolution=30)
+        from optimiser.time_utils import now_utc as _now
+
+        remaining = (client._rate_limited_until - _now()).total_seconds()
+        assert 110 <= remaining <= 121
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_429_defaults_when_headers_missing(self) -> None:
+        client = AmberClient(AmberConfig(api_key="k", site_id="s"))
+        client._client.get = AsyncMock(
+            return_value=self._err_response_with_headers(429, {})
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._fetch(next_count=1, previous=0, resolution=30)
+        from optimiser.time_utils import now_utc as _now
+
+        remaining = (client._rate_limited_until - _now()).total_seconds()
+        # Conservative 60s default.
+        assert 55 <= remaining <= 61
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_get_5min_prices_skips_http_during_defer(self) -> None:
+        """Pre-flight defer returns cached prices without making an
+        HTTP call — the whole point is to stop hammering Amber."""
+        from datetime import timedelta as _td
+
+        from optimiser.time_utils import now_utc as _now
+
+        client = AmberClient(AmberConfig(api_key="k", site_id="s"))
+        cached = [object()]  # Sentinel — we only care that it's returned.
+        client._last_5min_prices = cached  # type: ignore[assignment]
+        client._rate_limited_until = _now() + _td(seconds=120)
+        client._client.get = AsyncMock()
+
+        result = await client.get_5min_prices()
+
+        assert result is cached
+        client._client.get.assert_not_awaited()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_get_current_prices_skips_http_during_defer(self) -> None:
+        from datetime import timedelta as _td
+
+        from optimiser.time_utils import now_utc as _now
+
+        client = AmberClient(AmberConfig(api_key="k", site_id="s"))
+        cached = [object()]
+        client._last_prices = cached  # type: ignore[assignment]
+        client._rate_limited_until = _now() + _td(seconds=120)
+        client._client.get = AsyncMock()
+
+        result = await client.get_current_prices()
+
+        assert result is cached
+        client._client.get.assert_not_awaited()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_defer_expires_and_next_call_goes_through(self) -> None:
+        from datetime import timedelta as _td
+
+        from optimiser.time_utils import now_utc as _now
+
+        client = AmberClient(AmberConfig(api_key="k", site_id="s"))
+        client._rate_limited_until = _now() - _td(seconds=1)  # already expired
+        client._client.get = AsyncMock(return_value=_ok_response([]))
+
+        await client.get_5min_prices()
+        client._client.get.assert_awaited_once()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_defers_when_rate_remaining_zero(self) -> None:
+        """Proactive: even without a 429, if the last response said
+        remaining=0 and the window hasn't rolled yet, skip."""
+        from datetime import timedelta as _td
+
+        from optimiser.time_utils import now_utc as _now
+
+        client = AmberClient(AmberConfig(api_key="k", site_id="s"))
+        client._rate_remaining = 0
+        client._rate_window_resets_at = _now() + _td(seconds=30)
+        client._client.get = AsyncMock()
+
+        await client.get_5min_prices()
+        client._client.get.assert_not_awaited()
+        await client.close()
+
+
 # ── Solcast retry behaviour ──────────────────────────────────────
 
 

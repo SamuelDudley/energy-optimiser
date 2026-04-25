@@ -168,7 +168,9 @@ band on top of strict need; may need bumping if relay chatter is observed.
 
 **Implementation:** New `wake_loop.py` module with `WakeLoop` class and `next_aligned_wake()`. Service refactored from single while-loop to N concurrent wake loops via `asyncio.gather()`. Independent loops for tick (60s), prices_30min (300s), telemetry, BOM, UniFi, and Solcast. `AmberClient.get_5min_prices()` added with shared `_fetch()` helper. `Planner.plan()` accepts optional `prices_30min` (back-compat default). Telemetry writes gated to 5-min boundaries (or on action change). 4 wake loop tests + 5 micro-arbitrage tests added. Total: 82/82 tests passing.
 
-**Outstanding:** still need to verify Amber API rate limits in production (1440 fast + 288 slow polls/day). The `solcast_age` and `bom_data_age` checks were removed from the inline tick — they're now driven solely by their wake loops.
+**Outstanding:** the `solcast_age` and `bom_data_age` checks were removed from the inline tick — they're now driven solely by their wake loops.
+
+**Follow-up (2026-04-24):** observed ≥4× Amber 429s on the slow-price path in a 20-minute window — the 50/5-min bucket was clearly being pressured in the wild, likely from a transient spike or shared-account consumption. `AmberClient` now parses the `Retry-After` / `RateLimit-Reset` headers on a 429 and records a wall-clock defer window; subsequent `get_5min_prices` / `get_current_prices` return cached data until the window elapses instead of re-triggering the bucket. A proactive defer also skips the call when the last response left `RateLimit-Remaining == 0`. Covered by `TestAmberRateLimitDefer` (7 tests).
 
 
 ### ~~0. Export curtailment on negative feed-in~~ — Resolved

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .api import APIServer
@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 
 _VERSION = "0.2.0"
 
+# If the most recent 5-min Amber fetch is older than this, we no longer trust
+# the cached export price for the *current* slot. Wholesale feed-in prices can
+# flip sign within minutes during solar-glut windows, so once we lose recency
+# we clamp the export limit to 0 — choosing "miss revenue" over "pay to export
+# while blind". 15 min is ~3 missed Amber update cycles, well beyond any
+# transient 429 cool-down (≤300s observed in production).
+EXPORT_PRICE_STALE_THRESHOLD = timedelta(minutes=15)
+
 
 class Service:
     """Main energy optimiser service."""
@@ -98,6 +106,10 @@ class Service:
         self._last_export_limit_kw: float | None = None
         self._curtailment_state = CurtailmentState()
         self._wake_loops: list = []
+        # Freshest snapshot kept in-memory so /plan/current can return
+        # it without re-reading the NDJSON file. Set at the end of every
+        # successful tick; stays None until the first snapshot is written.
+        self._last_snapshot: TickSnapshot | None = None
 
     async def start(self) -> None:
         """Start the service: connect, initialise, then run wake loops."""
@@ -397,7 +409,20 @@ class Service:
             and lp_solution is not None
             and lp_dispatch is not None
         ):
-            apply_ok = await self._sigenergy.apply_lp_dispatch(lp_dispatch)
+            # Resolve and apply the export cap BEFORE the dispatch — the
+            # mode-2 adaptive trim path reads live PV/load with the cap
+            # already in force, and uses (export_cap_kw) directly when
+            # computing the Phase-B trim.
+            export_limit_kw = self._resolve_export_limit_kw(
+                output.grid_export_limit_kw, tick_id
+            )
+            if export_limit_kw is not None:
+                await self._sigenergy.set_export_limit_kw(export_limit_kw)
+                self._last_export_limit_kw = export_limit_kw
+            apply_ok = await self._sigenergy.apply_lp_dispatch(
+                lp_dispatch,
+                export_cap_kw=export_limit_kw or 0.0,
+            )
             self._metrics.record_dispatch_write(apply_ok)
             if apply_ok:
                 self._metrics.record_dispatch(lp_dispatch)
@@ -439,11 +464,6 @@ class Service:
                     tick_id=tick_id,
                 )
 
-            # Apply export limit (independent of battery dispatch).
-            if output.grid_export_limit_kw is not None:
-                await self._sigenergy.set_export_limit_kw(output.grid_export_limit_kw)
-                self._last_export_limit_kw = output.grid_export_limit_kw
-
             # Apply load commands.
             for cmd in output.load_commands:
                 if cmd.desired_relay_on is not None:
@@ -454,10 +474,15 @@ class Service:
                     await self._loads.start_cycle(cmd.load_id)
 
         elif self._state_machine.should_fallback:
+            # Same stale-price guard as the active path: don't trust a cached
+            # export price that's aged out — block export entirely instead.
+            price_age = self._amber.prices_5min_age
+            stale = price_age is None or price_age > EXPORT_PRICE_STALE_THRESHOLD
             await self._sigenergy.set_fallback(
                 export_price_ckwh=(
                     prices_5min[0].export_per_kwh if prices_5min else None
                 ),
+                block_export=stale,
             )
 
         # 10. Build and validate telemetry row
@@ -580,6 +605,7 @@ class Service:
                 lp_dispatch=lp_dispatch,
             )
             self._snapshots.write(snapshot)
+            self._last_snapshot = snapshot
         except Exception:
             logger.exception("Failed to write snapshot")
 
@@ -623,6 +649,32 @@ class Service:
         # watchdog. Best-effort: never crash the tick on heartbeat-write
         # failure — the watchdog itself will fire if we go silent.
         self._touch_heartbeat()
+
+    def _resolve_export_limit_kw(
+        self, lp_export_limit_kw: float | None, tick_id: str
+    ) -> float | None:
+        """Apply the stale-price guard to the LP's intended export limit.
+
+        Returns 0.0 instead of the LP's value when the cached 5-min Amber
+        price is older than EXPORT_PRICE_STALE_THRESHOLD. The LP may have
+        based its decision on a price that has since flipped sign, in which
+        case exporting would cost us real money. Pass-through otherwise.
+        """
+        if lp_export_limit_kw is None or lp_export_limit_kw <= 0:
+            return lp_export_limit_kw
+        age = self._amber.prices_5min_age
+        if age is not None and age <= EXPORT_PRICE_STALE_THRESHOLD:
+            return lp_export_limit_kw
+        emit(
+            EventType.EXPORT_BLOCKED_STALE_PRICE,
+            {
+                "lp_export_limit_kw": lp_export_limit_kw,
+                "price_age_seconds": age.total_seconds() if age else None,
+                "threshold_seconds": EXPORT_PRICE_STALE_THRESHOLD.total_seconds(),
+            },
+            tick_id=tick_id,
+        )
+        return 0.0
 
     def _check_curtailment(self, state, tick_id: str) -> None:
         kind, body = evaluate_curtailment(
@@ -678,6 +730,19 @@ class Service:
     @property
     def log_buffer(self) -> RingBufferHandler | None:
         return self._log_buffer
+
+    @property
+    def last_snapshot(self) -> TickSnapshot | None:
+        """Most recent TickSnapshot written this tick, or None until the
+        first post-startup tick completes. Exposed so /plan/current can
+        return the live plan without re-reading the NDJSON file."""
+        return self._last_snapshot
+
+    @property
+    def snapshot_dir(self) -> Path:
+        """Directory where TickSnapshots are persisted as daily .ndjson.gz
+        files. Used by /snapshots to build the DuckDB read_json glob."""
+        return Path(self._config.storage.snapshot_dir)
 
     def _attach_log_handlers(self) -> None:
         """Attach the ring buffer and (if configured) a rotating file

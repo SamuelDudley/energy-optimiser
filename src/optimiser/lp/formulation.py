@@ -26,6 +26,7 @@ from ..types import LoadProfile, ManagedLoadStatus, PriceInterval, PVForecast, S
 from .constants import (
     DEFAULT_SCENARIO_WEIGHTS,
     HORIZON_HOURS,
+    PV_CURTAIL_PENALTY_PER_KWH,
     SLOT_MINUTES,
     SOC_BOUND_PENALTY,
     TERMINAL_SOC_FLOOR_PCT,
@@ -484,6 +485,15 @@ def _add_scenario_to_problem(
             * (bat_charge_grid[t] + bat_charge_pv[t] + bat_discharge[t])
             * wear_cost_per_kwh
             * slot_hours
+        )
+        # PV curtail penalty. Without this, `pv_curtailed` is free in the
+        # objective while `bat_charge_pv` carries wear cost — on a flat-
+        # priced midday the LP would rather throw PV away than absorb it.
+        # Penalty is below wear so genuine forced-curtail cases (battery
+        # at hard ceiling, scenario PV exceeds all sinks) still resolve
+        # correctly. See constants.PV_CURTAIL_PENALTY_PER_KWH for sizing.
+        cost_terms.append(
+            weight * pv_curtailed[t] * PV_CURTAIL_PENALTY_PER_KWH * slot_hours
         )
         # SOC out-of-band penalty (see constants.SOC_BOUND_PENALTY for
         # sizing). Weighted like any other cost term so all scenarios
