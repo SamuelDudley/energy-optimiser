@@ -43,6 +43,7 @@ from .types import (
     LoadTelemetryRow,
     PriceInterval,
     PVForecast,
+    SystemState,
     TelemetryRow,
     TickSnapshot,
     WeatherForecastLogRow,
@@ -180,6 +181,21 @@ class Service:
         self._wake_loops = [
             WakeLoop("tick", self._config.planner.tick_interval_s, self._tick),
             WakeLoop("verify", WATCHER_PERIOD_S, self._watcher.poll),
+            # Amber 5-min poll: once per Amber slot, mid-slot. Aligned to
+            # `:02:30/:07:30/:12:30…` UTC (period 300s, offset 150s) so
+            # we land 2.5 min into each slot — late enough that Amber has
+            # the new slot's prices, early enough that the next 2.5 min
+            # of slot can still benefit. Replaces the old per-tick fetch
+            # (5 calls/slot → blew through Amber's 50/5min bucket and
+            # caused mid-slot LP plan flips when prices wobbled). On
+            # failure, `last_5min_prices` is preserved and consumers use
+            # `current_5min_price(now)` for time-correct lookup.
+            WakeLoop(
+                "prices_5min",
+                self._config.amber.poll_5min_interval_s,
+                self._fetch_5min_prices,
+                offset_s=self._config.amber.poll_5min_offset_s,
+            ),
             WakeLoop(
                 "prices_30min", self._config.amber.poll_30min_interval_s, self._fetch_30min_prices
             ),
@@ -324,11 +340,13 @@ class Service:
                     logger.exception("set_fallback failed after state read returned None")
             return
 
-        # 2. Refresh 5-min prices every tick (drives micro-arbitrage)
-        await self._fetch_5min_prices()
+        # 2. Price age check — the 5-min poll runs on its own slot-aligned
+        # wake loop now, not per-tick. We just sample the age here so the
+        # state machine can degrade if the cache goes stale (e.g. sustained
+        # 429 cool-down).
         self._state_machine.on_price_age_check(self._amber.prices_5min_age)
 
-        # 3. (Solcast/BOM/UniFi/30-min refresh handled by their own wake loops)
+        # 3. (5-min/30-min/Solcast/BOM/UniFi refresh handled by their own wake loops)
 
         # 4. Read managed load statuses
         load_statuses = await self._loads.all_statuses()
@@ -337,6 +355,12 @@ class Service:
         # 5. Build load profile and grab cached price arrays
         prices_5min = self._amber.last_5min_prices or []
         prices_30min = self._amber.last_prices or []
+        # Current 5-min slot by time, not by index. The cached list may be
+        # stale (poll failure or pre-mid-slot fetch) and `prices_5min[0]`
+        # is one of the `previous=2` entries, not "now". None means no
+        # 5-min interval covers the current wall-clock — callers fall
+        # through to 30-min coverage or skip price-conditional logic.
+        current_5min = self._amber.current_5min_price(now)
         pv_forecast = self._solcast.last_forecast if self._solcast else None
         load_profile = build_load_profile(
             self._store,
@@ -460,7 +484,7 @@ class Service:
                     self._loads.controllers,
                     FallbackReason.LP_ERROR,
                     export_price_ckwh=(
-                        prices_5min[0].export_per_kwh if prices_5min else None
+                        current_5min.export_per_kwh if current_5min else None
                     ),
                     extra_context={"phase": "apply_lp_dispatch"},
                 )
@@ -489,18 +513,37 @@ class Service:
             stale = price_age is None or price_age > EXPORT_PRICE_STALE_THRESHOLD
             await self._sigenergy.set_fallback(
                 export_price_ckwh=(
-                    prices_5min[0].export_per_kwh if prices_5min else None
+                    current_5min.export_per_kwh if current_5min else None
                 ),
                 block_export=stale,
             )
 
+        # 9b. Post-dispatch read. The state captured at step 1 is what
+        # the LP solved against; that's the right input for replay. But
+        # the snapshot also wants to record what the inverter is doing
+        # *in response* — without this second read, the snapshot at a
+        # slot transition would show the previous slot's mode (the read
+        # at step 1 happened before the dispatch). Best-effort: a failure
+        # here just leaves `state_post_dispatch=None` and the snapshot
+        # falls back to the pre-dispatch view.
+        state_post_dispatch: SystemState | None = None
+        try:
+            state_post_dispatch = await self._sigenergy.read_state(
+                outdoor_temp_c=outdoor_temp,
+                occupied=occupied,
+            )
+        except Exception:
+            logger.exception("Post-dispatch state read failed")
+
         # 10. Build and validate telemetry row
-        # Current price comes from 5-min for accuracy; snapshot keeps both
-        current_import = prices_5min[0].import_per_kwh if prices_5min else None
-        current_export = prices_5min[0].export_per_kwh if prices_5min else None
-        current_spot = prices_5min[0].spot_per_kwh if prices_5min else None
-        current_renewables = prices_5min[0].renewables_pct if prices_5min else None
-        current_spike = prices_5min[0].spike_status if prices_5min else None
+        # Current price comes from 5-min for accuracy; snapshot keeps both.
+        # Time-based slot lookup (not [0]) so stale `last_5min_prices` after
+        # a poll failure doesn't smuggle in an obsolete previous-window entry.
+        current_import = current_5min.import_per_kwh if current_5min else None
+        current_export = current_5min.export_per_kwh if current_5min else None
+        current_spot = current_5min.spot_per_kwh if current_5min else None
+        current_renewables = current_5min.renewables_pct if current_5min else None
+        current_spike = current_5min.spike_status if current_5min else None
 
         # Find current PV forecast
         pv_fcst_kw: float | None = None
@@ -614,6 +657,7 @@ class Service:
                 output=output,
                 lp_solution=lp_solution,
                 lp_dispatch=lp_dispatch,
+                system_state_post_dispatch=state_post_dispatch,
             )
             self._snapshots.write(snapshot)
             self._last_snapshot = snapshot
@@ -621,12 +665,19 @@ class Service:
             logger.exception("Failed to write snapshot")
 
         # 13. Emit tick complete event
+        # `price_ckwh` is the current 5-min IMPORT price (kept under that
+        # name for back-compat with existing log readers); `export_ckwh`
+        # is the same slot's export price. Both come from the merged
+        # 5-min/30-min view the LP solved with — an export change without
+        # an import change is exactly the signal that drove the
+        # discharge-for-export decisions seen on 2026-04-25 deploy.
         emit(
             EventType.TICK_COMPLETE,
             {
                 "soc": state.soc_pct,
                 "action": output.battery_action.value,
                 "price_ckwh": current_import,
+                "export_ckwh": current_export,
                 "reason": output.reason,
                 "state": self._state_machine.state.value,
                 "maturity": load_profile.maturity_level,
