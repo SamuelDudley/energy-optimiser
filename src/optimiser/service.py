@@ -355,7 +355,15 @@ class Service:
         #     clear the latch after N clean verifications. Until then we keep
         #     applying LP outputs but the breaker stays armed.
         #   - Otherwise → normal LP path.
-        prices_planning = prices_30min if prices_30min else prices_5min
+        # Overlay 5-min prices on top of 30-min for the LP's planning
+        # horizon. 5-min entries (current + ~30 min ahead at 5-min
+        # granularity from Amber) come FIRST so `_price_at`'s linear
+        # scan finds them preferentially; the 30-min entries fill the
+        # rest of the horizon. This lets the LP see and exploit 5-min
+        # spikes inside otherwise-flat 30-min intervals — e.g. a brief
+        # negative-export sub-window within a generally-expensive
+        # evening interval.
+        prices_planning = list(prices_5min) + list(prices_30min)
         breaker = self._lp_runtime.breaker
         is_probe = breaker.can_probe(now)
 

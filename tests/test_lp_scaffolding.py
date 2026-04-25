@@ -338,6 +338,62 @@ class TestEconomicBehaviour:
             f"during flat-priced PV surplus; got {pv_to_bat:.2f} kWh"
         )
 
+    def test_5min_overlay_lets_lp_see_intra_30min_negative_spike(
+        self,
+    ) -> None:
+        """Service merges 5-min over 30-min so `_price_at` finds 5-min
+        first within the overlapping window. A 5-min negative-import
+        spike inside a flat-priced 30-min interval should drive the LP
+        to grid-charge during just those 5-min slots.
+
+        Slot timing: NOW is on a 30-min boundary; the spike window is
+        slots 1–3 (covering NOW+5..NOW+20).
+        """
+        # Baseline 30-min prices: flat 20c import, 5c export
+        prices_30min = _flat_prices(import_c=20.0, export_c=5.0)
+        # 5-min "current and next-30min" cover, with a negative spike
+        # (e.g. -10c import) over slots 1..3
+        prices_5min: list[PriceInterval] = []
+        for i in range(12):  # 12 × 5 min = 60 min ahead
+            spike = 1 <= i <= 3
+            prices_5min.append(
+                PriceInterval(
+                    start=NOW + timedelta(minutes=5 * i),
+                    end=NOW + timedelta(minutes=5 * (i + 1)),
+                    import_per_kwh=(-10.0 if spike else 20.0),
+                    export_per_kwh=5.0,
+                    spot_per_kwh=5.0,
+                    renewables_pct=40.0,
+                    spike_status="none",
+                    descriptor="neutral" if not spike else "extremelyLow",
+                )
+            )
+        # Merge in the same order service.py does: 5-min first
+        merged = prices_5min + prices_30min
+
+        sol = solve(
+            state=_state(soc=50.0),
+            prices_planning=merged,
+            pv_forecast=None,  # no PV — isolate the price effect
+            load_profile=_flat_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+
+        # Spike slots (1..3) should show grid-charging; non-spike slots
+        # in the same first-hour window should not.
+        spike_bat = [d.battery_kw for d in sol.forward_trajectory[1:4]]
+        flat_bat = [d.battery_kw for d in sol.forward_trajectory[5:8]]
+        assert all(b > 0.5 for b in spike_bat), (
+            f"expected grid-charge during -10c spike slots; got {spike_bat}"
+        )
+        assert all(b < 0.5 for b in flat_bat), (
+            f"expected no charging in flat 20c slots after spike; got {flat_bat}"
+        )
+
     def test_negative_export_drives_pv_to_battery(self) -> None:
         """Negative export price + PV available → LP should soak PV into
         battery rather than export it.
