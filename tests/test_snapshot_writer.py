@@ -98,3 +98,44 @@ def test_close_is_safe_without_writes(tmp_path: Path) -> None:
     w = SnapshotWriter(tmp_path)
     w.close()
     w.close()
+
+
+def test_post_dispatch_state_round_trips(tmp_path: Path) -> None:
+    """The new system_state_post_dispatch field — populated by service.py
+    after dispatch is applied, observability use only — must serialise
+    when present and stay None when not."""
+    from optimiser.types import SystemState
+
+    w = SnapshotWriter(tmp_path)
+    ts = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    snap = _snap(ts)
+
+    # Replace with a snapshot carrying a distinct post-dispatch reading.
+    post = SystemState(
+        timestamp=ts,
+        soc_pct=49.7,
+        battery_power_kw=-5.2,
+        pv_power_kw=0.0,
+        grid_power_kw=-4.7,
+        house_load_kw=0.5,
+        ems_mode=6,
+        outdoor_temp_c=None,
+        occupied=None,
+    )
+    snap_with_post = snap.__class__(
+        **{**{k: getattr(snap, k) for k in snap.__slots__},
+           "system_state_post_dispatch": post},
+    )
+    w.write(snap_with_post)
+    w.write(snap)  # default: post-dispatch is None
+
+    path = tmp_path / "2026-04-24.ndjson.gz"
+    with gzip.open(path, "rt") as f:
+        lines = [json.loads(line) for line in f if line.strip()]
+
+    assert lines[0]["system_state_post_dispatch"]["battery_power_kw"] == -5.2
+    assert lines[0]["system_state_post_dispatch"]["ems_mode"] == 6
+    # Pre-dispatch state is unchanged
+    assert lines[0]["system_state"]["battery_power_kw"] == 0.0
+    # Second snapshot has no post-dispatch reading
+    assert lines[1]["system_state_post_dispatch"] is None

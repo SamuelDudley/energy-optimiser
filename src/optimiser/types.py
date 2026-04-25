@@ -351,6 +351,15 @@ class TickSnapshot:
     counterfactual_cost_cents: float | None = None
     lp_solution: LPSolution | None = None  # v0.2.0+: native LP output
     lp_dispatch: LPDispatch | None = None  # v0.2.0+: mode + cap sent to inverter
+    # Inverter state captured AFTER the tick's dispatch + load commands
+    # were applied (and after the mode-2 adaptive trim's Phase-A/B
+    # sequence). Lets observability / replay distinguish "what the LP
+    # planned with" (`system_state`, sampled at tick start) from "what
+    # the inverter is doing in response" (this field). Closes the
+    # ~30–60s observability lag at slot transitions where the snapshot
+    # would otherwise show pre-dispatch state. None if the post-dispatch
+    # read failed or the tick took the no-apply branch.
+    system_state_post_dispatch: SystemState | None = None
 
 
 @dataclass(frozen=True, slots=True)
