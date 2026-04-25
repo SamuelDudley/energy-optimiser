@@ -18,7 +18,9 @@ class AmberConfig:
     poll_30min_interval_s: int = 300
     forecast_intervals_5min: int = 12
     previous_intervals_5min: int = 2
-    forecast_intervals_30min: int = 72  # Amber returns up to ~72 (36h); more = longer LP horizon
+    # Amber publishes up to ~79 30-min intervals (~40h); 96 is a small
+    # over-ask that captures all of it. Anything higher is wasted bytes.
+    forecast_intervals_30min: int = 96
 
 
 @dataclass(frozen=True, slots=True)

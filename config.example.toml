@@ -6,8 +6,8 @@ api_key = "AMBER_API_KEY"
 site_id = "AMBER_SITE_ID"                # From GET /sites
 poll_5min_interval_s = 60                 # 5-min price refresh (drives tick)
 poll_30min_interval_s = 300               # 30-min planning forecast refresh
-forecast_intervals_30min = 72             # Amber returns up to ~72 (36h coverage)
-forecast_intervals_5min = 12              # ~1h of 5-min lookahead
+forecast_intervals_30min = 96             # Amber publishes ~79 intervals (~40h); 96 captures all of it with a small over-ask
+forecast_intervals_5min = 12              # ~1h of 5-min lookahead (reliable 5-min coverage is current + next 30-min period)
 previous_intervals_5min = 2
 
 [solcast]
