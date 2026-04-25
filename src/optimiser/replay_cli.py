@@ -7,11 +7,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
+from collections.abc import Iterator
 
 from .config import load_config
 from .replay import load_snapshots, replay, summarise_replay
+from .types import TickSnapshot
 
 
 def main() -> None:
@@ -42,12 +45,45 @@ def main() -> None:
         action="store_true",
         help="Print each tick where the decision changed",
     )
+    parser.add_argument(
+        "--filter-timestamp",
+        default=None,
+        help=(
+            "Restrict replay to snapshots whose timestamp ISO string starts "
+            "with this prefix (e.g. '2026-04-25T08:35'). Useful for "
+            "single-tick debugging."
+        ),
+    )
+    parser.add_argument(
+        "--override-soc",
+        type=float,
+        default=None,
+        help=(
+            "Override system_state.soc_pct on every replayed snapshot before "
+            "solving. Useful for testing whether a decision is sensitive to "
+            "the initial SOC."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
 
     print(f"Loading snapshots from: {args.snapshots}", file=sys.stderr)
-    snapshots = load_snapshots(args.snapshots)
+    snapshots: Iterator[TickSnapshot] = load_snapshots(args.snapshots)
+
+    if args.filter_timestamp:
+        prefix = args.filter_timestamp
+        snapshots = (s for s in snapshots if s.timestamp.isoformat().startswith(prefix))
+
+    if args.override_soc is not None:
+        soc = args.override_soc
+        snapshots = (
+            dataclasses.replace(
+                s,
+                system_state=dataclasses.replace(s.system_state, soc_pct=soc),
+            )
+            for s in snapshots
+        )
 
     results = []
     output_file = open(args.output, "w") if args.output else None
