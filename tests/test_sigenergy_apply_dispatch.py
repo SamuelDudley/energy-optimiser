@@ -143,31 +143,100 @@ class TestWriteOrdering:
             RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST.value,
         )
 
-    async def test_mode2_idle_writes_cap_zero_then_mode(
+    async def test_mode2_idle_runs_adaptive_trim(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Idle dispatch under the post-2026-04-25 design: write
-        40032 = 0 (block PV-to-battery charge), then mode = 2. The
-        cascade routes surplus to export at the DNSP cap (already
-        written by service.py before this call) and discharges battery
-        if PV < load. No cutoff (40047) write — that's pinned at the
-        startup ceiling."""
+        """SELF_CONSUME (idle) now routes through the adaptive Phase-A /
+        Phase-B trim, same as CHARGE — just with `lp_rate = 0` so the
+        trim collapses to "soak any PV beyond the export cap into the
+        battery, leave the rest for export". The earlier idle path
+        wrote `40032 = 0` directly, which left unforecast PV surplus
+        for the cascade to curtail rather than store. No cutoff (40047)
+        write — that's pinned at the startup ceiling."""
+        from datetime import UTC, datetime
+
+        from optimiser.types import SystemState
+
         ctrl = _controller()
         rec = _WriteRecorder()
         _install_recorder(ctrl, monkeypatch, rec)
 
-        assert await ctrl.apply_lp_dispatch(_self_consume_dispatch(target_soc_pct=58.5))
+        async def _no_sleep(_seconds: float) -> None:
+            return None
 
-        assert len(rec.calls) == 2
-        assert rec.calls[0] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 0)
+        async def _read_state():
+            # PV 7 kW, house 0.5 kW, export cap 5 kW → trim should be
+            # max(0, 7 - 5) - 0.5 = 1.5 kW (house deliberately ignored)
+            return SystemState(
+                timestamp=datetime.now(UTC),
+                soc_pct=87.0,
+                battery_power_kw=0.0,
+                pv_power_kw=7.0,
+                grid_power_kw=-6.5,
+                house_load_kw=0.5,
+                ems_mode=2,
+                outdoor_temp_c=None,
+                occupied=True,
+            )
+
+        monkeypatch.setattr("asyncio.sleep", _no_sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+
+        assert await ctrl.apply_lp_dispatch(
+            _self_consume_dispatch(target_soc_pct=87.1),
+            export_cap_kw=5.0,
+        )
+
+        # Phase-A: 40032=max, mode=2; Phase-B: 40032=trim
+        assert len(rec.calls) == 3
+        assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
+        assert rec.calls[0][2] == int(round(ctrl._battery.max_dc_charge_kw * 1000))
         assert rec.calls[1] == (
             "u16",
             REG_REMOTE_EMS_CONTROL_MODE,
             RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
         )
+        # max(0, 7 - 5) - 0.5 headroom = 1.5 kW → 1500
+        assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 1500)
         # No cutoff write
         assert all(addr != REG_CHARGE_CUTOFF_SOC for _, addr, _ in rec.calls)
+
+    async def test_mode2_idle_with_pv_below_export_cap_trims_to_zero(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If PV ≤ export cap, no surplus to soak — trim collapses to 0.
+        Battery stays idle as before; cascade discharges if PV < load."""
+        from datetime import UTC, datetime
+
+        from optimiser.types import SystemState
+
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _no_sleep(_seconds: float) -> None:
+            return None
+
+        async def _read_state():
+            return SystemState(
+                timestamp=datetime.now(UTC),
+                soc_pct=50.0, battery_power_kw=0.0,
+                pv_power_kw=3.0,        # below export cap
+                grid_power_kw=-2.5, house_load_kw=0.5,
+                ems_mode=2, outdoor_temp_c=None, occupied=True,
+            )
+
+        monkeypatch.setattr("asyncio.sleep", _no_sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+
+        assert await ctrl.apply_lp_dispatch(
+            _self_consume_dispatch(), export_cap_kw=5.0,
+        )
+
+        # Phase-B writes 0 — no surplus over export cap
+        assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 0)
 
 
 class TestWriteFailureSafety:
@@ -260,11 +329,15 @@ class TestMode2Adaptive:
             occupied=True,
         )
 
-    async def test_phase_b_trims_surplus_minus_export_cap(
+    async def test_phase_b_trims_pv_minus_export_cap(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """surplus=8, export_cap=5, headroom=0.5 → trim ≈ 2.5 kW.
-        Phase-A writes 40032=max + mode=2; Phase-B writes 40032=trim."""
+        """pv=9, export_cap=5, headroom=0.5 → trim = 3.5 kW. Trim
+        formula uses PV alone (not pv-house) — the cascade serves house
+        at priority 1 from PV automatically; including house in the
+        trim makes the 5-second Phase-A sample fragile to load
+        transients (kettle/microwave cycling). Phase-A writes 40032=max
+        + mode=2; Phase-B writes 40032=trim."""
         ctrl = _controller()
         rec = _WriteRecorder()
         _install_recorder(ctrl, monkeypatch, rec)
@@ -273,7 +346,10 @@ class TestMode2Adaptive:
             return None
 
         async def _read_state():
-            return self._state(pv_kw=9.0, load_kw=1.0)  # surplus 8
+            # House=1 deliberately ignored by the trim — the 5s sample
+            # could land in a kettle transient and we don't want that
+            # to compress the trim toward zero for the rest of the slot.
+            return self._state(pv_kw=9.0, load_kw=1.0)
 
         monkeypatch.setattr("asyncio.sleep", _no_sleep)
         monkeypatch.setattr(ctrl, "read_state", _read_state)
@@ -293,8 +369,8 @@ class TestMode2Adaptive:
             REG_REMOTE_EMS_CONTROL_MODE,
             RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
         )
-        # surplus 8 - export 5 - headroom 0.5 = 2.5 kW → 2500
-        assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 2500)
+        # pv 9 - export 5 - headroom 0.5 = 3.5 kW → 3500
+        assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 3500)
 
     async def test_phase_b_lp_rate_is_trim_floor(
         self, monkeypatch: pytest.MonkeyPatch

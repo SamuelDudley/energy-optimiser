@@ -104,6 +104,8 @@ class EventType(StrEnum):
     BREAKER_CLEARED = auto()  # Returned to normal LP control
     PV_CURTAILMENT_SUSPECTED = auto()  # MPPT appears throttled at sink ceiling
     PV_CURTAILMENT_CLEARED = auto()  # Throttle signal cleared (back below ceiling)
+    MODE2_TRIM = auto()  # Phase-A PV reading + Phase-B trim value (per dispatch)
+    MODE2_TRIM_BLIND = auto()  # Phase-A telemetry unavailable — uncapped fallthrough
 
 
 # ── Value Objects ────────────────────────────────────────────────

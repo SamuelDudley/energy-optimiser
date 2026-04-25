@@ -14,7 +14,6 @@ from pymodbus.client import AsyncModbusTcpClient
 
 from ..config import BatteryConfig, SigenergyConfig
 from ..logging_utils import emit
-from ..lp.dispatch import DispatchKind
 from ..time_utils import now_utc
 from ..types import (
     EventType,
@@ -909,22 +908,21 @@ class SigenergyController:
         mode = dispatch.mode
         kind_name = dispatch.kind.name if dispatch.kind is not None else "?"
 
-        # Adaptive mode-2 charge has its own multi-phase path because it
-        # requires a mid-apply telemetry read between writes.
-        if (
-            mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
-            and dispatch.kind == DispatchKind.CHARGE
-        ):
+        # Every mode-2 dispatch — CHARGE or SELF_CONSUME — runs the
+        # adaptive trim. For CHARGE, the LP's intended rate becomes the
+        # trim floor; for SELF_CONSUME the floor is 0 and the trim
+        # collapses to "soak whatever PV is left after the export cap".
+        # The earlier "idle = 40032=0" path was fragile: it relied on
+        # the cascade fully respecting cap=0, and any unforecast PV
+        # surplus was left for the inverter to curtail rather than store.
+        # Adaptive trim measures actual PV and sets 40032 to the surplus
+        # over the export cap — soaking the rest into the battery.
+        if mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION:
             return await self._apply_mode2_adaptive_charge(
                 dispatch, export_cap_kw=export_cap_kw
             )
 
-        # Mode 2 idle: write 40032 = 0 to block PV charge; surplus exports
-        # via the cascade up to the DNSP cap (already written by caller).
-        if mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION:
-            if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, 0):
-                return False
-        elif mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST:
+        if mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST:
             cap_raw = max(0, int(round(dispatch.cap_kw * 1000)))
             if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, cap_raw):
                 return False
@@ -954,25 +952,47 @@ class SigenergyController:
     async def _apply_mode2_adaptive_charge(
         self, dispatch: LPDispatch, *, export_cap_kw: float
     ) -> bool:
-        """Two-phase mode-2 dispatch for PV-dominant charge.
+        """Two-phase mode-2 dispatch — covers both CHARGE and SELF_CONSUME.
 
         Phase A: write 40032 = max_dc_charge_kw, mode = 2. Cascade soaks
         all surplus PV into the battery so we can read true MPP from
         telemetry. Sleep `MODE2_PROBE_SECONDS` for the cascade to settle.
 
-        Phase B: read state, compute trim:
+        Phase B: read PV, compute trim:
 
-            surplus_a = max(0, pv_kw - house_load_kw)
-            trim_kw   = max(LP_rate, surplus_a - export_cap_kw - headroom)
-            trim_kw   = min(trim_kw, max_dc_charge_kw)
+            trim_kw = max(LP_rate, pv_kw - export_cap_kw - headroom)
+            trim_kw = min(trim_kw, max_dc_charge_kw)
 
-        Write 40032 = trim_kw. The mode-2 cascade now splits surplus
-        between battery (up to trim) and export (up to DNSP cap),
-        avoiding the "battery first, then export" flip-flop. LP_rate
-        is the trim floor so a transient PV droop during Phase A
-        doesn't collapse the trim toward zero.
+        Write 40032 = trim_kw. The mode-2 cascade then splits available
+        PV: house at priority 1 (sub-second), battery up to `trim_kw`,
+        export up to the DNSP cap, curtail anything left.
 
-        See SPEC-ENERGY-01.md §5.4 and probe_two_phase.py.
+        Why **PV alone** in the trim, not `pv − house`: the cascade
+        already serves house at priority 1 from PV. Including house in
+        the trim makes the 5-second Phase-A sample fragile to load
+        transients (kettle/microwave cycling) — a single high-load
+        sample collapses trim toward zero and the rest of the slot ends
+        up curtailed. Trimming on PV alone gives up roughly `house` kW
+        of nominal export (mid-day baseline ~0.5 kW, a few cents/slot)
+        in exchange for being immune to load-side noise.
+
+        Revisit when the load model is mature enough to provide a
+        reliable rolling-average house value (see KNOWN-ISSUES #25).
+        Two paths once that's true: use `LP-planned pv_to_house_kw`
+        (already a load-profile-derived estimate) or a controller-side
+        rolling median of the last N measured loads. Until then PV
+        alone is the right trade-off.
+
+        For CHARGE: `lp_rate = |signed_intent_kw|` (LP's intended rate),
+        which acts as the trim floor — a transient PV droop during
+        Phase A can't collapse the trim below the LP's intent.
+
+        For SELF_CONSUME: `lp_rate ≈ 0`, trim collapses to "soak any PV
+        beyond the export cap". Replaces the older `40032 = 0` idle
+        behaviour, which left unforecast PV surplus to be curtailed by
+        the inverter rather than stored.
+
+        See SPEC-ENERGY-01.md §5.4, probe_two_phase.py, probe_no_cutoff.py.
         """
         max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
         if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw):
@@ -986,28 +1006,58 @@ class SigenergyController:
         await asyncio.sleep(MODE2_PROBE_SECONDS)
 
         state = await self.read_state()
-        if state is None or state.pv_power_kw is None or state.house_load_kw is None:
+        kind_name = dispatch.kind.name if dispatch.kind is not None else "?"
+        lp_rate = abs(dispatch.signed_intent_kw) if dispatch.signed_intent_kw else 0.0
+        if state is None or state.pv_power_kw is None:
             # Telemetry blind — leave Phase-A state in force (uncapped
-            # charge). Equivalent to fallback behaviour. Log so we know.
+            # charge). All PV soaks into battery for the rest of the slot,
+            # which matches the "soak first" intent. Log AND emit so this
+            # is queryable in the NDJSON event stream.
             logger.warning(
-                "mode-2 adaptive: phase-A telemetry unavailable; "
-                "staying uncapped (40032=max)"
+                "mode-2 adaptive (%s): phase-A telemetry unavailable; "
+                "staying uncapped (40032=max)",
+                kind_name,
+            )
+            emit(
+                EventType.MODE2_TRIM_BLIND,
+                {
+                    "kind": kind_name,
+                    "lp_rate_kw": lp_rate,
+                    "export_cap_kw": export_cap_kw,
+                },
             )
             return True
-        surplus_a = max(0.0, state.pv_power_kw - state.house_load_kw)
+        pv_a = max(0.0, state.pv_power_kw)
 
-        lp_rate = abs(dispatch.signed_intent_kw) if dispatch.signed_intent_kw else 0.0
         trim_kw = max(
             lp_rate,
-            max(0.0, surplus_a - export_cap_kw) - MODE2_TRIM_FLOOR_HEADROOM_KW,
+            max(0.0, pv_a - export_cap_kw) - MODE2_TRIM_FLOOR_HEADROOM_KW,
         )
         trim_kw = min(trim_kw, self._battery.max_dc_charge_kw)
         trim_raw = int(round(trim_kw * 1000))
         logger.info(
-            "Mode-2 adaptive: phaseA pv=%.2fkW load=%.2fkW surplus=%.2fkW "
+            "Mode-2 adaptive (%s): phaseA pv=%.2fkW "
             "→ phaseB trim=%.2fkW (lp_rate=%.2fkW, export_cap=%.2fkW)",
-            state.pv_power_kw, state.house_load_kw, surplus_a,
-            trim_kw, lp_rate, export_cap_kw,
+            kind_name, pv_a, trim_kw, lp_rate, export_cap_kw,
+        )
+        # Structured event so replay / analytics can answer "what did
+        # Phase A read at this tick, and how did the trim formula
+        # combine that with LP rate and export cap to land on the
+        # value written to 40032?" without parsing log text.
+        emit(
+            EventType.MODE2_TRIM,
+            {
+                "kind": kind_name,
+                "phase_a_pv_kw": pv_a,
+                "phase_a_house_kw": state.house_load_kw,
+                "phase_a_grid_kw": state.grid_power_kw,
+                "phase_a_battery_kw": state.battery_power_kw,
+                "phase_a_soc_pct": state.soc_pct,
+                "lp_rate_kw": lp_rate,
+                "export_cap_kw": export_cap_kw,
+                "headroom_kw": MODE2_TRIM_FLOOR_HEADROOM_KW,
+                "trim_kw": trim_kw,
+            },
         )
         return await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, trim_raw)
 

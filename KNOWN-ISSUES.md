@@ -594,3 +594,45 @@ off analysis script to answer (1) and (2), then add scenarios behind a
 config flag that defaults OFF. Compare via replay before flipping.
 **Priority:** post-deploy enhancement. The code as-shipped is correct
 — this is an improvement, not a fix.
+
+### 25. Mode-2 adaptive trim ignores house load — revisit when load model matures
+**File:** `clients/sigenergy.py::_apply_mode2_adaptive_charge`
+**Impact:** The Phase-B trim is `pv − export_cap − headroom` and
+deliberately omits any house-load term. The cascade still serves house
+at priority 1 from PV (sub-second) so absorption is correct, but during
+slots with sustained high house load (oven, heat-pump cycle, sustained
+HVAC) we under-export by `house − headroom` rather than hitting the
+DNSP cap exactly. Mid-day baseline (~0.5 kW house) costs nothing; a
+1–2 hour evening cooking window at the export cap is on the order of
+a few cents/day in lost export revenue.
+
+**Why deliberate (2026-04-25):** the earlier formula `pv − house_spot
+− export_cap` was fragile to the 5-second Phase-A sample landing in a
+load transient (kettle/microwave on for 30–60s). A bad sample collapsed
+the trim toward zero and the rest of the slot was curtailed — much
+worse than the steady-state under-export. Rather than depend on either
+the spot reading (transient-fragile) or the LP's planned `pv_to_house_kw`
+from `load_profile` (the profile isn't mature enough to trust as
+ground truth), we dropped house from the formula entirely. See the
+"Trim formula uses PV alone" entry in CLAUDE.md decision log.
+
+**Revisit when:**
+1. `load_profile` has been in production long enough that the
+   profiler's per-slot expected house values are accurate to within
+   ~0.3 kW for "typical" conditions (occupied/unoccupied × outdoor
+   temp bins). Realistically: 6–12 weeks of clean CT data spanning
+   a few seasons.
+2. *Or* when we add a short-window rolling average of measured house
+   load to `SigenergyController` (e.g. median of last 5 reads). That's
+   independent of profiler maturity and is the cheaper path if export
+   revenue starts to bite.
+
+**Fix path:** put the house source behind a config flag
+(`use_house_in_trim: bool` + `house_source: "lp_planned" | "rolling"`),
+ship default OFF, A/B via replay over a representative window, flip
+the default once the loss/win shows in the data.
+
+**Priority:** low. The current behaviour matches the user's "soak PV
+maximally, exports up to cap" principle. Revisit driven by either
+measured export-revenue regression in the snapshot data or load model
+maturity, not by hypothetical analysis.

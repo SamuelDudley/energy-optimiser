@@ -66,10 +66,13 @@ class LPDispatch:
 
     `cap_kw` semantics by branch:
       - mode 2 + CHARGE: the LP's intended charge rate. Used as the
-        trim floor in the adaptive Phase-B write to 40032.
-      - mode 2 + SELF_CONSUME (idle): 0 — written directly to 40032 to
-        idle the battery. Cascade still allows discharge if PV < load
-        (40032 caps charge, not discharge).
+        adaptive trim floor (Phase-B write to 40032).
+      - mode 2 + SELF_CONSUME (idle): 0 — also runs the adaptive trim,
+        with `lp_rate` floor of 0 so the trim collapses to "soak any
+        PV beyond the export cap". 40032 is *not* zeroed any more —
+        that left unforecast PV surplus for the inverter to curtail
+        rather than store. Discharge still flows if PV < load (40032
+        caps charge only).
       - mode 3 charge: the LP's intended grid-charge rate, written to
         40032 directly.
       - mode 5/6 discharge: physical max_discharge_kw (LP's signed
@@ -125,13 +128,14 @@ def dispatch_from_slot(
     (`COMMAND_CHARGING_PV_FIRST`) stays in the enum for replay
     compatibility but is never emitted.
 
-    Idle (`|battery_kw| < DEADBAND_KW`) writes `40032 = 0` under mode 2.
-    The cascade `PV → house → battery(cap=0) → export → curtail` then
-    routes surplus straight to export (up to DNSP), and a load shortfall
-    is covered by battery discharge (40032 only caps charge — discharge
-    is bounded by `discharge_cut_off_soc` set at startup). Validated in
-    `probe_no_cutoff.py` P1 (battery idled at -0.02 kW, surplus exported
-    at DNSP cap).
+    Idle (`|battery_kw| < DEADBAND_KW`) also runs the adaptive trim
+    (with `lp_rate=0`) so the cascade soaks any PV surplus over the
+    export cap into the battery — see
+    `clients/sigenergy.py::_apply_mode2_adaptive_charge`. Earlier
+    behaviour wrote `40032=0`, which left unforecast PV for the cascade
+    to curtail rather than store; the user-visible symptom was the
+    battery sitting at zero while ~1 kW of PV was discarded. Discharge
+    continues to flow when PV < load (40032 caps charge only).
 
     Charge cap (mode-3 path) uses the LP's intended rate: grid charge is
     directly controllable and exceeding the plan wastes money.
