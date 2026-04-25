@@ -603,7 +603,9 @@ class Service:
                 timestamp=now,
                 version=_VERSION,
                 system_state=state,
-                price_forecast=prices_30min if prices_30min else prices_5min,
+                # Same merged view the LP solved with — 5-min entries first
+                # so they take precedence within their coverage window.
+                price_forecast=prices_planning,
                 pv_forecast=pv_forecast,
                 load_profile=load_profile,
                 managed_loads=load_statuses,
