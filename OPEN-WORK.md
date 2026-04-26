@@ -45,6 +45,33 @@ Amber wholesale pricing. Previous session established:
    `dispatch_from_slot(slot_0, battery_config, measured_pv_kw)` threads
    live PV reading. Threshold `PV_PRODUCING_THRESHOLD_KW = 0.2`. See
    `lp/dispatch.py`.
+5. **Hard SOC floor + per-slot enforcement** (commit `8893964`,
+   2026-04-26). After the 2026-04-25 overnight (LP drained pack 70% →
+   0.1% chasing 7-8c export at flat-pricing evening, then panic-
+   recharged on Sunday morning), restored a hard `soc_pct[t] >=
+   effective_floor` constraint with feasibility clamp `min(state.soc_pct,
+   max(soc_floor_pct, backup_soc_pct, discharge_cutoff_pct))`. NO slack
+   penalty on the lower side — that was the panic-buy regression
+   retired in `9d23d14`. Now: LP can't sell into the safety reserve;
+   if it enters a tick already below floor, just can't discharge
+   further (no incentive to grid-charge "back up"). Tests in
+   `tests/test_lp_properties.py::TestLPSOCBoundsTrajectory` (full
+   forward-trajectory), `tests/test_lp_multitick_soc.py` (closed-loop
+   solve→apply→re-solve over realistic shapes incl. sub-floor entry +
+   morning-peak).
+6. **Wear cost lifted 2.5 → 5 c/kWh + closed-loop simulator** (commit
+   `0ab9e44`, 2026-04-26). Above the floor the LP was still cycling at
+   speculative low-export prices because round-trip wear at 2.5c × 2 =
+   5c was below typical low-tier ep. Per-tick diagnostic at the
+   2026-04-25 23:00 AEST failure moment: wear=2.5 → -6 kW with 5 kW
+   speculative export at 8c; wear=4.5+ → drops to -1 kW (house only).
+   New default 5 c/kWh halfway to "true" LFP wear (~10 c/kWh per
+   CLAUDE.md sizing); break-even spread now ~13 c rather than ~7.8 c.
+   Validated via new `simulate.py` closed-loop simulator on 2026-04-25:
+   pre-fix worst-case daily cost $2.90 → post-fix $0.85 (–$2.05/day
+   under PV-bust scenarios) at the cost of ~$0.78/day less arbitrage on
+   optimal sunny days. Also exposed `wear_cost_per_kwh` on
+   `solve_stochastic` for replay/sweep work.
 
 ## 3. Active items
 
@@ -220,11 +247,10 @@ path unchanged.
 
 ### 4.3 Drop default `soc_floor_pct` from 10% in `BatteryConfig`
 
-Current default is 15.0 (I raised it during §3 work), but the user's
-`config.toml` explicitly sets 10.0 and wins. Discussion about whether
-to raise to 15/20% for cycle life is unresolved. See §3 of
-`SIGENERGY-MODES.md` and discussion in the session log — we landed on
-"LFP is tolerant; 15% is sensible; 10% is fine too". No urgent action.
+**Status:** ✅ resolved 2026-04-26. Default is 15.0 in `BatteryConfig`,
+deployed `config.toml` sets 15.0 explicitly. The default is now also a
+HARD operational floor in the LP (commit `8893964`), not just a soft
+preference. See §2 entry 5.
 
 ### 4.4 Verify hardware SOC limits wrote correctly
 
