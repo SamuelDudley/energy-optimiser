@@ -61,14 +61,26 @@ class SigenergyConfig:
 @dataclass(frozen=True, slots=True)
 class BatteryConfig:
     capacity_kwh: float = 40.0
-    # LP planning band — soft constraints in the formulation. Only the
-    # CEILING is slack-penalised; the lower band is unenforced per-slot
-    # so the LP doesn't grid-charge to "satisfy a floor" at a loss.
-    # Sub-floor SOC is allowed mid-horizon; the terminal-floor
-    # constraint at end-of-horizon (separate slack) is the only
-    # long-horizon recovery pressure. These fields do NOT directly
-    # drive the hardware discharge backstop — see `discharge_cutoff_pct`
-    # below for that.
+    # LP planning band.
+    #
+    # `soc_floor_pct` is a HARD per-slot lower bound on the planned SOC
+    # trajectory: the LP cannot plan a discharge that drops SOC below
+    # this value. There is no slack penalty on the lower bound, so the
+    # LP has no incentive to grid-charge "back up to floor" — that
+    # avoids the panic-buy regression seen on 2026-04-25 where a 1e4
+    # penalty forced grid-charging regardless of price. If the inverter
+    # somehow starts a tick below this floor (post-fallback re-entry,
+    # BMS quirk, operator action), the constraint is clamped to the
+    # current SOC so the LP stays feasible — sub-floor the LP just
+    # can't discharge further; it's still free to be clever about
+    # charging based on price signals.
+    #
+    # `soc_ceiling_pct` is a SOFT per-slot upper bound (slack-penalised)
+    # so the LP stays feasible when local EMS has already charged above
+    # the ceiling.
+    #
+    # These fields do NOT directly drive the hardware discharge
+    # backstop — see `discharge_cutoff_pct` below for that.
     soc_floor_pct: float = 15.0
     soc_ceiling_pct: float = 100.0
     # Hardware discharge cut-off (reg 40048). This is the SOC at which

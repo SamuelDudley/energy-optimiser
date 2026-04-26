@@ -219,21 +219,39 @@ class TestLPDischargeDecisions:
         assert disp.kind == DispatchKind.DISCHARGE
         assert sol.slot_0.battery_kw < -0.5
 
-    def test_discharges_below_floor_when_economic(self) -> None:
-        """Sub-floor discharge is allowed under the post-2026-04-25
-        design: the per-slot SOC floor penalty was retired so the LP
-        plans economically against arbitrage + wear, not against an
-        artificial below-floor barrier. With an 80c import spike at
-        slot 0 and 10c rest, discharging the battery to cover load is
-        the right call even at the floor."""
+    def test_holds_at_floor_under_import_spike(self) -> None:
+        """Hard floor: starting AT the floor with a massive import spike,
+        the LP must not plan a discharge that drops SOC below the floor.
+        Replaces the panic-buy regression seen on 2026-04-25 (LP would
+        empty the pack overnight chasing peak prices) without bringing
+        back the 1e4 floor penalty that forced grid-charging recovery."""
         cfg = BatteryConfig(soc_floor_pct=10.0)
         sol, disp = _solve(
             soc=10.0,
             prices=_prices(slot_0_import=80.0, rest_import=10.0),
             battery_config=cfg,
         )
-        assert disp.kind == DispatchKind.DISCHARGE
-        assert sol.slot_0.battery_kw < -0.5
+        # Slot 0: cannot discharge below the floor.
+        assert sol.slot_0.battery_kw >= -0.01
+        # And no slack penalty drove panic-buy grid-charging either.
+        assert sol.slot_0.grid_to_battery_kw < 0.01
+
+    def test_does_not_grid_charge_to_recover_floor(self) -> None:
+        """Sub-floor entry (e.g. SOC=8% with floor=15%): LP should not
+        grid-charge purely to recover the floor — flat prices give it
+        no economic reason. The hard floor is clamped to state.soc_pct
+        for feasibility, and there's no slack penalty pushing recovery."""
+        cfg = BatteryConfig(soc_floor_pct=15.0)
+        sol, disp = _solve(
+            soc=8.0,
+            prices=_prices(slot_0_import=20.0, rest_import=20.0),
+            battery_config=cfg,
+        )
+        # Flat 20c prices → cycling loses on wear (~7.8c break-even).
+        # No grid-charging back to floor.
+        assert sol.slot_0.grid_to_battery_kw < 0.01
+        # And no discharge below the (clamped) sub-floor SOC.
+        assert sol.forward_trajectory[0].soc_pct_end >= 8.0 - 0.1
 
     def test_spike_price_triggers_discharge(self) -> None:
         """Very expensive current slot (100c) with cheap future (15c).
@@ -419,3 +437,105 @@ class TestLPLookahead:
         sol, disp = _solve(soc=30.0, prices=prices)
         assert disp.kind == DispatchKind.CHARGE
         assert sol.slot_0.battery_kw > 1.0
+
+
+# ── SOC-bound trajectory checks ──────────────────────────────────
+#
+# A single-tick LP test that only inspects slot 0 misses bugs where the
+# LP plans to drop below the floor (or above the ceiling) several slots
+# *into* the horizon — exactly the failure mode that masked the
+# 2026-04-25 floor-retirement regression. These tests assert on the
+# whole `forward_trajectory`, so a "discharge below floor in slot 12"
+# plan fails immediately even though slot 0 looks innocent.
+
+
+class TestLPSOCBoundsTrajectory:
+    def test_floor_holds_across_full_horizon_under_evening_peak(self) -> None:
+        """Starting just above floor (16% with floor=15%) and an evening
+        peak ladder in the horizon: the LP must not plan ANY slot below
+        the floor, even far out where slot-0 isn't the binding tick."""
+        cfg = BatteryConfig(soc_floor_pct=15.0)
+        # Cheap-then-peak ladder: encourages discharge several slots in.
+        prices = _varying_prices(
+            [10.0] * 4 + [70.0] * 12 + [10.0] * 32,
+        )
+        sol, disp = _solve(soc=16.0, prices=prices, battery_config=cfg)
+        for i, slot in enumerate(sol.forward_trajectory):
+            # Tiny float tolerance; the constraint is hard so this is
+            # really just guarding against solver-roundoff noise.
+            assert slot.soc_pct_end >= cfg.soc_floor_pct - 0.05, (
+                f"slot {i} planned soc={slot.soc_pct_end:.3f} "
+                f"violates floor {cfg.soc_floor_pct}"
+            )
+
+    def test_floor_holds_under_huge_export_revenue(self) -> None:
+        """High export price across the horizon would, under the old
+        post-2026-04-25 design, drain the pack to zero (the overnight
+        symptom that kicked off this fix). With the hard floor it must
+        not."""
+        cfg = BatteryConfig(soc_floor_pct=15.0)
+        # Export price > import price across the whole horizon — the LP
+        # has every reason to dump the battery to grid.
+        prices = [
+            PriceInterval(
+                start=NOW + timedelta(minutes=30 * i),
+                end=NOW + timedelta(minutes=30 * (i + 1)),
+                import_per_kwh=15.0,
+                export_per_kwh=40.0,
+                spot_per_kwh=5.0,
+                renewables_pct=40.0,
+                spike_status="none",
+                descriptor="neutral",
+            )
+            for i in range(N_INTERVALS)
+        ]
+        sol, disp = _solve(soc=80.0, prices=prices, battery_config=cfg)
+        for i, slot in enumerate(sol.forward_trajectory):
+            assert slot.soc_pct_end >= cfg.soc_floor_pct - 0.05, (
+                f"slot {i} planned soc={slot.soc_pct_end:.3f} "
+                f"violates floor {cfg.soc_floor_pct}"
+            )
+
+    def test_starting_below_floor_does_not_panic_buy_at_spike(self) -> None:
+        """Sub-floor entry (SOC=8% with floor=15%) with an import SPIKE
+        at slot 0: the LP must not grid-charge to recover the floor at
+        the spike price. Defer to the cheap slots that follow.
+
+        This is the operationally critical case — only slot 0 actually
+        gets executed. A flat-price variant of this test is degenerate
+        (HiGHS clusters terminal-floor recovery on an arbitrary slot at
+        max rate); with price variation the LP unambiguously picks the
+        cheap end."""
+        cfg = BatteryConfig(soc_floor_pct=15.0)
+        # 60c spike right now, 10c rest of horizon. Terminal-floor
+        # recovery (~5 kWh) should land on the 10c slots, not the 60c.
+        sol, disp = _solve(
+            soc=8.0,
+            prices=_prices(slot_0_import=60.0, rest_import=10.0),
+            battery_config=cfg,
+        )
+        # Trajectory respects the clamped sub-floor.
+        for i, slot in enumerate(sol.forward_trajectory):
+            assert slot.soc_pct_end >= 8.0 - 0.1, (
+                f"slot {i} planned soc={slot.soc_pct_end:.3f} below 8%"
+            )
+        # Slot 0 must not panic-buy at the spike — this is what the
+        # live system actually executes.
+        assert sol.slot_0.grid_to_battery_kw < 0.1, (
+            f"slot 0 grid-charged {sol.slot_0.grid_to_battery_kw:.2f} kW "
+            f"at 60c spike — panic-buy regression"
+        )
+
+    def test_ceiling_holds_across_horizon(self) -> None:
+        """Ceiling is soft (slack-penalised) but at SOC_BOUND_PENALTY=1e4
+        per %-slot, no realistic arbitrage can override it. Trajectory
+        should respect it just like the floor."""
+        cfg = BatteryConfig(soc_ceiling_pct=85.0)
+        # Cheap now, expensive later — encourages charging hard.
+        prices = _varying_prices([5.0] * 8 + [60.0] * 40)
+        sol, disp = _solve(soc=70.0, prices=prices, battery_config=cfg)
+        for i, slot in enumerate(sol.forward_trajectory):
+            assert slot.soc_pct_end <= cfg.soc_ceiling_pct + 0.5, (
+                f"slot {i} planned soc={slot.soc_pct_end:.3f} "
+                f"violates ceiling {cfg.soc_ceiling_pct}"
+            )

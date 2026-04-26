@@ -25,11 +25,19 @@ slave_id = 1
 
 [battery]
 capacity_kwh = 40.0
-# LP planning band. The ceiling is slack-penalised; the lower band is
-# unenforced per-slot — the LP doesn't grid-charge to "satisfy a floor"
-# at a loss. Sub-floor SOC is allowed mid-horizon; the terminal-floor
-# constraint at end-of-horizon (separate slack) is the only long-horizon
-# recovery pressure. These do NOT drive the hardware backstops directly.
+# LP planning band.
+#   soc_floor_pct: HARD per-slot lower bound on planned SOC. The LP
+#     cannot schedule a discharge that drops SOC below this. No slack
+#     penalty → no panic-buy: if SOC is already below the floor (post-
+#     fallback / BMS quirk / operator action), the LP just can't
+#     discharge further; it's still free to be clever about charging
+#     when prices justify it. Raise to keep more reserve, lower to
+#     extract more usable energy from the pack.
+#   soc_ceiling_pct: SOFT per-slot upper bound. Slack-penalised so the
+#     LP stays feasible if local EMS overcharged before we regained
+#     control. Lower this to protect calendar life on the top end.
+# Neither of these touches the hardware backstops — see
+# `discharge_cutoff_pct` and `backup_soc_pct` below for those.
 soc_floor_pct = 15.0
 soc_ceiling_pct = 100.0
 # Hardware discharge cut-off (reg 40048). Bottom of the battery the

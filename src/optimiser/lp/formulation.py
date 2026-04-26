@@ -315,13 +315,12 @@ def _add_scenario_to_problem(
 
     # ── SOC trajectory ───────────────────────────────────────────
     # Variable bounds are [0, 100] — the physical range. The operating
-    # band (`soc_floor_pct`..`soc_ceiling_pct`) is enforced as soft
-    # constraints with slack variables penalised in the objective.
-    # Reason: if the inverter's local EMS (e.g. mode 2) charges past our
-    # ceiling before we regain control, the initial SOC will be outside
-    # the band, and a hard bound makes the LP infeasible immediately.
-    # Slack variables let the LP plan the fastest legal return to band
-    # while staying solvable.
+    # ceiling is a soft constraint (slack-penalised) so the LP stays
+    # feasible if the inverter's local EMS charged past our ceiling
+    # before we regained control. The operating floor is a hard
+    # constraint, but clamped to the initial SOC so the LP stays
+    # feasible if we start below it (post-fallback / BMS quirk /
+    # operator action).
     soc_pct = [
         pulp.LpVariable(
             f"{prefix}soc_{t}",
@@ -333,18 +332,25 @@ def _add_scenario_to_problem(
     # Slack on the upper side of the operating band, per slot. Penalty
     # is large enough to dominate any arbitrage gain but finite (not
     # big-M) so the LP stays numerically well-conditioned.
-    #
-    # No lower-band slack: it was retired 2026-04-25 because the 1e4
-    # penalty forced grid-charging to recover `effective_floor`
-    # regardless of price — panic-buying with no offsetting revenue.
-    # Sub-floor SOC is now allowed mid-horizon; the terminal-floor
-    # constraint at the end of the horizon (also slack-penalised)
-    # provides the only long-horizon recovery pressure. Wear cost +
-    # curtail penalty + terminal floor together keep the SOC trajectory
-    # in a sensible band economically.
     soc_over_ceiling = [
         pulp.LpVariable(f"{prefix}soc_over_{t}", lowBound=0.0) for t in range(n)
     ]
+
+    # Effective per-slot floor. Same hierarchy as the terminal floor
+    # (max of the three configured floor-like bounds) but excluding
+    # `TERMINAL_SOC_FLOOR_PCT` — that constant only ever applies at
+    # end-of-horizon. Clamped to the initial SOC so the LP stays
+    # feasible when we start below the configured floor; in that
+    # regime the constraint collapses to "don't discharge further",
+    # which is the intended sub-floor behaviour.
+    effective_floor = min(
+        state.soc_pct,
+        max(
+            battery_config.soc_floor_pct,
+            battery_config.backup_soc_pct,
+            battery_config.discharge_cutoff_pct,
+        ),
+    )
 
     # ── Add load variables (each load contributes its own vars) ──
     load_vars: dict[str, LoadVars] = {}
@@ -429,15 +435,34 @@ def _add_scenario_to_problem(
             f"{prefix}pv_to_export_bounded_{t}",
         )
 
-        # Soft upper-band constraint only. `soc_pct[t]` is physically in
-        # [0, 100]; we still penalise excursions above `soc_ceiling_pct`
-        # so the LP never plans a charge that pushes SOC over its
-        # configured ceiling. There is no per-slot floor pressure —
-        # only the terminal-floor constraint applies, at the end of
-        # the horizon.
+        # Soft upper-band constraint. We penalise excursions above
+        # `soc_ceiling_pct` so the LP never plans a charge that pushes
+        # SOC over its configured ceiling, but with slack so the LP
+        # stays feasible if the initial SOC is already over.
         prob += (
             soc_pct[t] <= battery_config.soc_ceiling_pct + soc_over_ceiling[t],
             f"{prefix}soc_ceiling_soft_{t}",
+        )
+
+        # Hard per-slot floor. The LP cannot plan a discharge that
+        # drops SOC below `effective_floor`. Two-part design:
+        #
+        # 1. NO slack on this bound (unlike the previous 1e4 penalty)
+        #    so the LP has zero incentive to grid-charge "back up to
+        #    floor" — that was the panic-buy regression retired
+        #    2026-04-25.
+        # 2. The floor is clamped to the initial SOC: if we somehow
+        #    start below `soc_floor_pct` (post-fallback re-entry, BMS
+        #    quirk, manual operator action), the constraint becomes
+        #    `soc_pct[t] >= state.soc_pct` — feasible (the LP just
+        #    can't discharge further) and consistent with "fallback-
+        #    style" behaviour at sub-floor SOC: no discharge, no panic
+        #    buy, PV charge fully welcome (only bounded by PV
+        #    availability and `max_dc_charge_kw`), house load served
+        #    by grid via the system-balance constraint.
+        prob += (
+            soc_pct[t] >= effective_floor,
+            f"{prefix}soc_floor_hard_{t}",
         )
 
     # ── SOC dynamics ─────────────────────────────────────────────

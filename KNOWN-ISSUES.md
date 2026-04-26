@@ -232,6 +232,45 @@ The HA integration is widely deployed and known to work with Sigenergy hardware.
 
 ## High — Should fix before production use
 
+### LP grid-arbitrage loophole at export > import
+
+**File:** `lp/formulation.py` (system_balance constraint)
+
+**Found:** 2026-04-26 while writing closed-loop multi-tick floor tests.
+
+When the LP sees `export_per_kwh > import_per_kwh` in any slot, the
+system-balance constraint admits a phantom solution where the inverter
+simultaneously imports N kW from the grid and exports N kW to the grid,
+banking the spread as profit. There's no constraint forbidding
+simultaneous import + export.
+
+Why it doesn't bite production today: the inverter physically can't do
+that — mode 6 either discharges to grid or doesn't, and our DNSP cap
+(register 40038) bounds export below typical retail import. So the
+dispatch layer can't execute the plan even if the LP cooks one up.
+
+When it would bite: if Amber export ever exceeds import in real
+pricing (negative spot, peak FIT, atypical event windows), the LP
+plan would over-value the no-op of "pass grid through", suppress
+genuine battery discharge in favour of phantom revenue, and produce
+nonsense slot-0 plans. The dispatch would then fall back to whatever
+the LP actually planned for the battery in those slots, which under
+this artefact is "do nothing" — i.e. the LP misses the export
+opportunity entirely.
+
+**Fix:** add a complementarity constraint `grid_import[t] *
+grid_export[t] = 0` (binary indicator + big-M) so a slot can be
+import-only OR export-only, never both. Cheap MILP touch on a
+formulation that already has binaries; should not change solve time
+materially.
+
+**Test artefact:** `tests/test_lp_multitick_soc.py` deliberately
+keeps `export < import` in its synthetic price profiles to avoid
+triggering this loophole; the comment in `_evening_peak_prices`
+documents the workaround.
+
+
+
 ### ~~4. No retry/backoff on API calls~~ — Resolved
 **Files:** `clients/amber.py`, `clients/solcast.py`, `clients/bom.py`,
 new `clients/_retry.py`
