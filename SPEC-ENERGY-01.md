@@ -10,8 +10,8 @@
 ## 1. Overview
 
 A standalone Python service that optimises battery charge/discharge and hot water
-scheduling against Amber Electric's wholesale pricing. Runs as a systemd unit on
-Proxmox.
+scheduling against Amber Electric's wholesale pricing. Runs as Docker containers
+managed by docker-compose (main service + watchdog sidecar).
 
 ### 1.1 Goals
 

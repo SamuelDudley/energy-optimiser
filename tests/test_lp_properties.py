@@ -394,6 +394,66 @@ class TestLPExportBehaviour:
         assert sol.slot_0.grid_export_kw < 0.1
         assert sol.grid_export_limit_kw == 0.0
 
+    def test_exports_over_curtail_at_low_positive_export_price(self) -> None:
+        """When the plan saturates the battery (filling to ~ceiling) and PV
+        still spills past house+battery, the LP must allocate the spill to
+        grid_export rather than pv_curtailed at any positive ep — even a
+        token 1c. Curtail carries a 1c penalty; export at 1c earns 1c.
+        Net gap is 2c/kWh in favour of export, regardless of wear cost
+        (wear is on the charge path, not on direct PV→grid).
+
+        Failure mode this guards against: an objective change that
+        accidentally makes curtail cheaper than export at marginal ep.
+        """
+        # 8 kW PV for first 16 slots (8h × 8 kW = 64 kWh) — comfortably
+        # more than battery headroom (40 kWh × 0.7 = 28 kWh) plus 8h of
+        # 1 kW house. Battery WILL saturate; remainder must go somewhere.
+        pv = []
+        for i in range(N_INTERVALS):
+            kw = 8.0 if i < 16 else 0.0
+            pv.append(
+                PVForecast(
+                    start=NOW + timedelta(minutes=30 * i),
+                    end=NOW + timedelta(minutes=30 * (i + 1)),
+                    pv_estimate_kw=kw,
+                    pv_estimate10_kw=kw * 0.7,
+                    pv_estimate90_kw=kw * 1.3,
+                )
+            )
+        # ep=1c flat across the whole horizon. No future peak — there is
+        # no economic reason to store-for-later. The LP's choice for the
+        # forced overflow is purely export-vs-curtail.
+        prices = _varying_prices([20.0] * N_INTERVALS, export=1.0)
+        sol, _ = _solve(
+            soc=30.0,
+            pv_kw=8.0,
+            pv=pv,
+            load_kw=1.0,
+            prices=prices,
+        )
+        # 5-min slot width — forward_trajectory is 5-min granularity even
+        # though the inputs were 30-min. PV forecast covers slots [0, 96)
+        # at 30-min ⇒ trajectory slots [0, 576) at 5-min. PV is on for
+        # the first 16×6 = 96 slots.
+        dt_h = 5 / 60
+        pv_window = sol.forward_trajectory[: 16 * 6]
+        # Energy balance: curtailed = PV_total − (to_house + to_bat + to_export).
+        total_pv_in = 8.0 * 8.0  # 8 kW × 8 h
+        used_kwh = sum(
+            (s.pv_to_house_kw + s.pv_to_battery_kw + s.pv_to_export_kw) * dt_h
+            for s in pv_window
+        )
+        curtailed_kwh = max(0.0, total_pv_in - used_kwh)
+        exported_kwh = sum(s.pv_to_export_kw * dt_h for s in pv_window)
+        assert curtailed_kwh < 0.5, (
+            f"LP curtailed {curtailed_kwh:.2f} kWh at ep=1c — should have "
+            f"exported (curtail penalty 1c, export +1c, gap 2c/kWh)."
+        )
+        assert exported_kwh > 5.0, (
+            f"LP exported only {exported_kwh:.2f} kWh — fixture likely "
+            f"didn't actually saturate the battery."
+        )
+
     def test_negative_export_price_curtails(self) -> None:
         """When export price is negative, the LP should not export. With a
         short PV window and an expensive evening, it should store PV in the
@@ -455,6 +515,53 @@ class TestLPLookahead:
         sol, disp = _solve(soc=30.0, prices=prices)
         assert disp.kind == DispatchKind.CHARGE
         assert sol.slot_0.battery_kw > 1.0
+
+    def test_grid_charges_on_cloudy_day_for_evening_peak(self) -> None:
+        """Cloudy day (PV=0 throughout) with a cheap mid-day import window
+        followed by an expensive evening peak: the LP should grid-charge
+        during the cheap window so it can self-supply (or export) at peak.
+
+        Battery starts at floor (16% with floor=15%) so the only way to
+        have anything to discharge at peak is to grid-charge first.
+        Peak ip=50c — saving the 50c retail import via stored cheap kWh
+        is worth ~32c/kWh after wear (50 − 8 − 5 − 5 = 32c). Spread is
+        wide enough that it should fire even at conservative wear.
+
+        Guards against regressions where wear cost or some other lever
+        accidentally suppresses grid-arb on the cloudy-day case the LP
+        should be most useful for.
+        """
+        cfg = BatteryConfig(soc_floor_pct=15.0)
+        # 30-min planning intervals: 0–7 cheap (4h), 8–13 peak (3h),
+        # 14–47 medium. Total 48 intervals = 24h horizon.
+        prices = _varying_prices(
+            [8.0] * 8 + [50.0] * 6 + [15.0] * 34,
+            export=5.0,
+        )
+        pv = _pv_forecast(0.0)
+        sol, _ = _solve(
+            soc=16.0,  # at floor — battery has nothing to give
+            pv=pv,
+            pv_kw=0.0,
+            load_kw=1.0,
+            prices=prices,
+            battery_config=cfg,
+        )
+        # 5-min trajectory: cheap window = first 8 × 6 = 48 slots,
+        # peak window = next 6 × 6 = 36 slots.
+        cheap = sol.forward_trajectory[:48]
+        peak = sol.forward_trajectory[48:84]
+        grid_charge_during_cheap = sum(s.grid_to_battery_kw for s in cheap) * (5 / 60)
+        discharge_during_peak = -sum(s.battery_kw for s in peak) * (5 / 60)
+        assert grid_charge_during_cheap > 3.0, (
+            f"LP grid-charged only {grid_charge_during_cheap:.2f} kWh in the "
+            f"cheap (8c) window. Battery started at floor, peak is 50c retail, "
+            f"so grid-arb should clearly fire."
+        )
+        assert discharge_during_peak > 2.0, (
+            f"LP discharged only {discharge_during_peak:.2f} kWh during the "
+            f"50c peak — expected it to self-supply house from stored kWh."
+        )
 
 
 # ── SOC-bound trajectory checks ──────────────────────────────────

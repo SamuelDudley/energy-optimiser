@@ -59,34 +59,35 @@ ROLL_FORWARD_CAP_MULTIPLIER: float = 2.0
 # Per-kWh cost charged to the LP for each direction of battery flow.
 # Round-trip cost ≈ 2 × WEAR_COST_PER_KWH (charged once, discharged once).
 #
-# Sizing rationale (post-2026-04-26 simulator-driven retune):
+# Sizing rationale:
 #   LFP replacement cost (~$500/kWh installed) / usable throughput
 #   (~6000 cycles × 0.8 DoD) implies a "true" wear cost floor of roughly
 #   10 c/kWh one-way = 20 c/kWh round-trip. That's economically correct
 #   but suppresses arbitrage too aggressively on typical-spread days.
 #
-#   Earlier (2.5 c/kWh) was too low: closed-loop simulator confirmed it
-#   let the LP cycle the pack for ANY positive export above ~3c, even
-#   at the moment overnight on 2026-04-25 where ep was 7-8c and grid
-#   refill cost was 23c. Per-tick diagnostic at the actual failure
-#   moment (Sat 23:00 AEST, SOC=50%, ep=8c): at wear=2.5c the LP
-#   discharged at -6 kW exporting 5kW at 8c; at wear=4.5c it dropped
-#   to -1 kW (house only); at wear=5c+ it stayed there.
+#   2.5 c/kWh one-way (= 5 c/kWh round-trip) is the pragmatic value: it
+#   matches the marginal degradation at the operating point (LFP cycled
+#   gently within a 15–100% band), and the LP behaviour falls out
+#   correctly as a result — discharge through evening peaks ≥ 8c,
+#   grid-arb on cloudy days when day↔peak spread > ~5c, refill from
+#   morning PV.
 #
-#   5 c/kWh one-way (= 10 c/kWh round-trip) is now the chosen middle
-#   ground: halfway between earlier "pragmatic" and "true" values,
-#   above the threshold that suppresses speculative export-at-low-
-#   prices, but well below typical evening peak spreads (15-30c) so
-#   genuine arbitrage still fires.
+#   Brief excursion to 5 c/kWh (2026-04-26 → 2026-04-26) was a
+#   redundant safety hedge layered on top of the new hard SOC floor.
+#   Closed-loop simulator showed it suppressed legitimate cycling: max
+#   SOC capped at ~52% on normal days (battery half-used), $0.78/day of
+#   evening-peak revenue forfeited, "might as well leave it in manual
+#   mode 2". The hard floor at battery_config.soc_floor_pct is now the
+#   safety mechanism — wear cost can return to its true economic value.
 #
 #   Break-even on a single 1kWh arbitrage round-trip at 90% efficiency:
 #     required_spread_cents = (2 × wear + import × (1 − 0.9)) / 0.9
-#     → W=5.0, 20c import → break-even spread ≈ 13.3c
+#     → W=2.5, 20c import → break-even spread ≈ 7.8c
 #
 # Tunable via the `wear_cost_per_kwh` parameter on solve_stochastic /
 # build_stochastic_lp / simulate(...) for replay/sweep work; the
 # constant is the production default.
-WEAR_COST_PER_KWH: float = 5.0
+WEAR_COST_PER_KWH: float = 2.5
 
 
 # ── PV curtail penalty ───────────────────────────────────────────
