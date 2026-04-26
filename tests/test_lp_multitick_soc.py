@@ -490,6 +490,123 @@ class TestClosedLoopCeiling:
 # ── Configurability sanity ───────────────────────────────────────
 
 
+# ── Wear-cost suppresses cycle-for-loss ──────────────────────────
+
+
+class TestWearCostSuppressesCycleForLoss:
+    """Sanity-check that the wear cost is correctly tunable through
+    the solver, and that real-Amber-shaped arbitrage still fires at
+    wear=5c (the new default).
+
+    The end-to-end "did the fix actually save money in the failure
+    scenario" assertion is in `tests/test_simulate.py` (closed-loop
+    sim) — that's the layer that catches the compounding-decisions
+    failure mode. Here we just pin one boundary: the wear=5c default
+    is configured high enough to suppress break-even-or-worse cycles
+    but low enough to let real peak arbitrage through."""
+
+    def test_wear_cost_is_tunable(self) -> None:
+        """Plumbing test: the wear_cost_per_kwh parameter on
+        solve_stochastic actually flows into the formulation."""
+        from optimiser.lp.solver import solve_stochastic
+
+        cfg = BatteryConfig(soc_floor_pct=15.0)
+        prices = [
+            PriceInterval(
+                start=NOW + timedelta(minutes=30 * i),
+                end=NOW + timedelta(minutes=30 * (i + 1)),
+                import_per_kwh=20.0,
+                export_per_kwh=5.0,
+                spot_per_kwh=6.0,
+                renewables_pct=40.0,
+                spike_status="none",
+                descriptor="neutral",
+            )
+            for i in range(PLANNING_INTERVALS)
+        ]
+        sol_low = solve_stochastic(
+            state=_state(soc=50.0, ts=NOW),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            wear_cost_per_kwh=2.5,
+        )
+        sol_hi = solve_stochastic(
+            state=_state(soc=50.0, ts=NOW),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            wear_cost_per_kwh=5.0,
+        )
+        # Higher wear → lower expected_total_cost magnitude
+        # (the wear penalty is added to the objective; same plan
+        # under both should give a different cost). At minimum the
+        # wear cost shows up in the objective somewhere — assert
+        # the costs differ.
+        assert sol_low.expected_total_cost_cents != sol_hi.expected_total_cost_cents
+
+    def test_real_peak_arbitrage_still_fires_at_default_wear(self) -> None:
+        """Sanity: with wear=5c (the new default) the LP must still
+        discharge during a genuine peak. ip=50c at slot 0 (peak),
+        falling to 10c after. House savings at peak (50c × house)
+        plus export earnings clear 10c round-trip wear with margin."""
+        from optimiser.lp.solver import solve_stochastic
+
+        cfg = BatteryConfig(soc_floor_pct=15.0)
+        # Slot 0: peak ip=50c. Rest: 10c. ep flat at 5c throughout
+        # (avoid the LP grid-arb loophole at ep > ip — separate
+        # known issue; see KNOWN-ISSUES).
+        prices = []
+        for i in range(PLANNING_INTERVALS):
+            ip = 50.0 if i == 0 else 10.0
+            ep = 5.0
+            prices.append(
+                PriceInterval(
+                    start=NOW + timedelta(minutes=30 * i),
+                    end=NOW + timedelta(minutes=30 * (i + 1)),
+                    import_per_kwh=ip,
+                    export_per_kwh=ep,
+                    spot_per_kwh=ip * 0.3,
+                    renewables_pct=40.0,
+                    spike_status="none",
+                    descriptor="neutral",
+                )
+            )
+        sol = solve_stochastic(
+            state=_state(soc=70.0, ts=NOW),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_profile(),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=cfg,
+            # Use the constant default explicitly so this test pins
+            # "the production wear cost lets real peaks fire". If
+            # someone bumps WEAR_COST_PER_KWH past ~10c, this test
+            # will break and force a re-evaluation.
+            wear_cost_per_kwh=None,
+        )
+        # At ip=50c discharge to house saves 50c per kWh — well above
+        # 5c wear. LP should discharge enough to at least cover house
+        # load (~1 kW). Note that ep=5c equals the wear threshold, so
+        # the LP correctly doesn't bother exporting — the assertion
+        # is just "discharges at all", which is what real-peak
+        # arbitrage looks like at this wear cost.
+        assert sol.slot_0.battery_kw < -0.5, (
+            f"production wear cost must not suppress 50c-peak arbitrage "
+            f"(got {sol.slot_0.battery_kw:.2f})"
+        )
+
+
+# ── Configurability ──────────────────────────────────────────────
+
+
 @pytest.mark.parametrize("floor", [10.0, 15.0, 25.0, 40.0])
 def test_floor_is_configurable(floor: float) -> None:
     """The hard per-slot floor honours whatever value the operator

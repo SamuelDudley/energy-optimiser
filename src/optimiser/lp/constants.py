@@ -59,26 +59,34 @@ ROLL_FORWARD_CAP_MULTIPLIER: float = 2.0
 # Per-kWh cost charged to the LP for each direction of battery flow.
 # Round-trip cost ≈ 2 × WEAR_COST_PER_KWH (charged once, discharged once).
 #
-# Sizing rationale:
+# Sizing rationale (post-2026-04-26 simulator-driven retune):
 #   LFP replacement cost (~$500/kWh installed) / usable throughput
 #   (~6000 cycles × 0.8 DoD) implies a "true" wear cost floor of roughly
 #   10 c/kWh one-way = 20 c/kWh round-trip. That's economically correct
-#   but leaves a lot of achievable arbitrage on the table because it
-#   suppresses cycling for spreads under ~20c — which is most of the
-#   Amber-tariff day.
+#   but suppresses arbitrage too aggressively on typical-spread days.
 #
-#   2.5 c/kWh one-way (= 5 c/kWh round-trip) is a pragmatic middle
-#   ground: preserves the break-even threshold above typical flat-day
-#   spreads (which aren't worth the cycle) while still firing on
-#   genuine peak-trough events and spikes.
+#   Earlier (2.5 c/kWh) was too low: closed-loop simulator confirmed it
+#   let the LP cycle the pack for ANY positive export above ~3c, even
+#   at the moment overnight on 2026-04-25 where ep was 7-8c and grid
+#   refill cost was 23c. Per-tick diagnostic at the actual failure
+#   moment (Sat 23:00 AEST, SOC=50%, ep=8c): at wear=2.5c the LP
+#   discharged at -6 kW exporting 5kW at 8c; at wear=4.5c it dropped
+#   to -1 kW (house only); at wear=5c+ it stayed there.
+#
+#   5 c/kWh one-way (= 10 c/kWh round-trip) is now the chosen middle
+#   ground: halfway between earlier "pragmatic" and "true" values,
+#   above the threshold that suppresses speculative export-at-low-
+#   prices, but well below typical evening peak spreads (15-30c) so
+#   genuine arbitrage still fires.
 #
 #   Break-even on a single 1kWh arbitrage round-trip at 90% efficiency:
 #     required_spread_cents = (2 × wear + import × (1 − 0.9)) / 0.9
-#     → W=2.5, 20c import → break-even spread ≈ 7.8c
+#     → W=5.0, 20c import → break-even spread ≈ 13.3c
 #
-# Tune via replay once snapshots are flowing; suspect we'll land
-# somewhere in the 2–4 c/kWh range.
-WEAR_COST_PER_KWH: float = 2.5
+# Tunable via the `wear_cost_per_kwh` parameter on solve_stochastic /
+# build_stochastic_lp / simulate(...) for replay/sweep work; the
+# constant is the production default.
+WEAR_COST_PER_KWH: float = 5.0
 
 
 # ── PV curtail penalty ───────────────────────────────────────────

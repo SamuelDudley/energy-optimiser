@@ -80,6 +80,7 @@ def solve_stochastic(
     battery_config: BatteryConfig,
     scenario_weights: dict[str, float] | None = None,
     timeout_s: float = SOLVER_TIMEOUT_S,
+    wear_cost_per_kwh: float | None = None,
 ) -> LPSolution:
     """Build and solve the stochastic LP across PV percentile scenarios.
 
@@ -88,6 +89,8 @@ def solve_stochastic(
     optimal against the weighted expected cost. The forward trajectory
     is taken from the base scenario (one of the equally-valid plans).
     """
+    from .constants import WEAR_COST_PER_KWH as _DEFAULT_WEAR
+    wear = wear_cost_per_kwh if wear_cost_per_kwh is not None else _DEFAULT_WEAR
     t0 = time.monotonic()
     try:
         prob, svars = build_stochastic_lp(
@@ -99,6 +102,7 @@ def solve_stochastic(
             lp_loads=lp_loads,
             battery_config=battery_config,
             scenario_weights=scenario_weights,
+            wear_cost_per_kwh=wear,
         )
     except Exception as exc:
         logger.exception("Stochastic LP build failed")
