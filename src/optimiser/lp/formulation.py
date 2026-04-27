@@ -31,8 +31,8 @@ from .constants import (
     PV_CURTAIL_PENALTY_PER_KWH,
     SLOT_MINUTES,
     SOC_BOUND_PENALTY,
-    TERMINAL_SOC_FLOOR_PCT,
     WEAR_COST_PER_KWH,
+    terminal_soc_floor_pct,
 )
 from .loads import LoadVars, LPLoad
 
@@ -486,11 +486,18 @@ def _add_scenario_to_problem(
     # longer cover. Softened with slack to stay feasible when the initial
     # SOC is too low to physically recover to terminal_floor within the
     # horizon; the penalty pushes the LP to recover as much as it can.
+    #
+    # Hour-of-day–aware: the terminal floor depends on what NEM hour the
+    # last slot lands on (e.g. 30% before morning peak, 15% during PV
+    # peak). See `lp/constants.terminal_soc_floor_pct` for the full
+    # table + rationale, and `TERMINAL-VALUE-PLAN.md` for the path
+    # toward replacing this hand-calibrated curve with a fitted V.
+    terminal_time_nem = slots[n - 1] + timedelta(hours=10)
     terminal_floor = max(
         battery_config.soc_floor_pct,
         battery_config.backup_soc_pct,
         battery_config.discharge_cutoff_pct,
-        TERMINAL_SOC_FLOOR_PCT,
+        terminal_soc_floor_pct(terminal_time_nem),
     )
     soc_terminal_slack = pulp.LpVariable(
         f"{prefix}soc_terminal_slack", lowBound=0.0

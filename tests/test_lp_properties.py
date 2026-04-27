@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from optimiser.config import BatteryConfig
 from optimiser.lp.constants import HORIZON_HOURS
 from optimiser.lp.dispatch import DispatchKind, dispatch_from_slot
@@ -724,8 +726,120 @@ class TestTerminalFloorTable:
             assert 10.0 <= v <= 50.0, f"hour {h} → {v} outside sane range"
 
     def test_legacy_constant_unchanged(self) -> None:
-        """The scalar `TERMINAL_SOC_FLOOR_PCT` is still 20% — the LP
-        currently uses it, and staging the new function must not
-        silently change that."""
+        """The scalar `TERMINAL_SOC_FLOOR_PCT` is still 20% — kept
+        in source as documentation of the prior heuristic and as a
+        defensive fallback inside `terminal_soc_floor_pct()`. The LP
+        no longer reads it directly."""
         from optimiser.lp.constants import TERMINAL_SOC_FLOOR_PCT
         assert TERMINAL_SOC_FLOOR_PCT == 20.0
+
+
+# ── Hour-of-day terminal floor — LP integration ─────────────────
+
+
+class TestLPHourAwareTerminalFloor:
+    """End-to-end: the LP's terminal-slot SOC must respect the
+    hour-of-day terminal floor, which depends on what NEM hour the
+    last slot of the horizon lands on. Wired into formulation.py
+    via `terminal_soc_floor_pct(slots[n-1] + UTC+10)`.
+
+    Trick: control the terminal NEM hour via the `state.timestamp`,
+    since `slots[n-1] = state.timestamp + 48h - 30min`. With
+    `state.timestamp = T0` and HORIZON_HOURS = 48, terminal NEM hour
+    is `(T0 + 48h + 10h).hour` (UTC → NEM).
+    """
+
+    def _build_solve(self, anchor_utc: datetime, prices_for_discharge: bool):
+        """Build a deterministic LP whose horizon terminates at
+        `anchor_utc + HORIZON_HOURS - 30min`. Strong discharge prices
+        push the LP to drain the battery to the per-slot floor where
+        possible — the terminal slot then settles at the per-NEM-hour
+        terminal floor (whichever is higher)."""
+        state = SystemState(
+            timestamp=anchor_utc,
+            soc_pct=70.0,  # well above any floor; LP can drain
+            battery_power_kw=0.0,
+            pv_power_kw=0.0,
+            grid_power_kw=1.0,
+            house_load_kw=1.0,
+            ems_mode=2,
+            outdoor_temp_c=20.0,
+            occupied=True,
+        )
+        # Flat 50c export, 5c import — discharging is profitable, no
+        # need to refill. LP wants to dump SOC to as low as possible.
+        if prices_for_discharge:
+            ip, ep = 5.0, 50.0
+        else:
+            ip, ep = 20.0, 20.0
+        prices = [
+            PriceInterval(
+                start=anchor_utc + timedelta(minutes=30 * i),
+                end=anchor_utc + timedelta(minutes=30 * (i + 1)),
+                import_per_kwh=ip,
+                export_per_kwh=ep,
+                spot_per_kwh=ip * 0.3,
+                renewables_pct=40.0,
+                spike_status="none",
+                descriptor="neutral",
+            )
+            for i in range(N_INTERVALS)
+        ]
+        sol = solve(
+            state=state,
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_profile(kw=1.0),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(soc_floor_pct=15.0),
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        return sol
+
+    def test_morning_peak_terminal_higher_than_pv_peak_terminal(self) -> None:
+        """LP whose horizon ends at NEM 06:00 (morning-peak bucket,
+        floor 30%) must terminate at higher SOC than one whose horizon
+        ends at NEM 12:00 (PV-peak bucket, floor 15%). Both with
+        identical strong-discharge prices."""
+        # T + 48h at NEM 06:00 → T at UTC 20:00 the day before. Setting
+        # T = day-before-yesterday 20:00 UTC.
+        morning_anchor = datetime(2026, 4, 1, 20, 0, tzinfo=UTC)
+        pv_peak_anchor = datetime(2026, 4, 2, 2, 0, tzinfo=UTC)
+        # Sanity-check arithmetic on the anchors:
+        from optimiser.lp.constants import HORIZON_HOURS
+        assert (morning_anchor + timedelta(hours=HORIZON_HOURS) + timedelta(hours=10)).hour == 6
+        assert (pv_peak_anchor + timedelta(hours=HORIZON_HOURS) + timedelta(hours=10)).hour == 12
+
+        morning_sol = self._build_solve(morning_anchor, prices_for_discharge=True)
+        pv_sol = self._build_solve(pv_peak_anchor, prices_for_discharge=True)
+
+        morning_terminal = morning_sol.forward_trajectory[-1].soc_pct_end
+        pv_terminal = pv_sol.forward_trajectory[-1].soc_pct_end
+
+        # The PV-peak terminal SOC should be at the per-slot floor (15%).
+        # The morning-peak one should be at the higher hour-of-day floor (30%).
+        assert pv_terminal == pytest.approx(15.0, abs=1.0), (
+            f"PV-peak terminal expected ~15% per the table, got {pv_terminal:.2f}"
+        )
+        assert morning_terminal >= 28.0, (
+            f"Morning-peak terminal expected ≥28% (table says 30%), got {morning_terminal:.2f}"
+        )
+        # And the difference should track the table delta.
+        assert morning_terminal - pv_terminal >= 10.0, (
+            f"Expected morning-peak terminal ≥10% above PV-peak; got "
+            f"diff = {morning_terminal - pv_terminal:.2f}"
+        )
+
+    def test_evening_peak_terminal_holds_high(self) -> None:
+        """Evening-peak terminal NEM hour (17–20 bucket → 28%): LP
+        must terminate at ≥28% even when prices encourage discharge."""
+        from optimiser.lp.constants import HORIZON_HOURS
+        # T + 48h at NEM 18:00 → T at UTC 08:00 the day before.
+        evening_anchor = datetime(2026, 4, 1, 8, 0, tzinfo=UTC)
+        assert (evening_anchor + timedelta(hours=HORIZON_HOURS) + timedelta(hours=10)).hour == 18
+        sol = self._build_solve(evening_anchor, prices_for_discharge=True)
+        terminal = sol.forward_trajectory[-1].soc_pct_end
+        assert terminal >= 27.5, (
+            f"Evening-peak terminal expected ≥28% per table, got {terminal:.2f}"
+        )
