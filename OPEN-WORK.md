@@ -259,6 +259,34 @@ inverter's behaviour. Easy verification: at next tick with sun, read
 reg 40047 back. If it's at 950 (95%), good. Can also inspect via
 probe script (see §3 of `SIGENERGY-MODES.md` for pattern).
 
+### 4.5 PV-aware terminal value function `V(SOC, state)`
+
+**Status:** parked, ~60 days from 2026-04-27. Plan documented in
+`TERMINAL-VALUE-PLAN.md`.
+
+The constant `TERMINAL_SOC_FLOOR_PCT = 20.0` ignores time-of-day and
+PV-forecast at the terminal slot. Replacement: a piecewise-linear
+function `V(SOC, features)` fitted from counterfactual realised-cost
+data, embedded in the LP objective as a soft term.
+
+What's already done (commits `787e345`, `09d3cff`, `ff81f59`):
+- Counterfactual training-data generator (`terminal_value_data.py`)
+  + CLI + tests, validated end-to-end on 3-day smoke.
+- Hand-calibrated hour-of-day fallback function
+  (`terminal_soc_floor_pct()` in `lp/constants.py`) — staged but
+  NOT wired into the LP. Discussion 2026-04-27 concluded the proper
+  V is the right answer; the heuristic curve risks over-correcting
+  in either direction.
+
+Outstanding before kicking off (see plan doc §8):
+1. Wait ~60 days for seasonal coverage in the snapshot archive.
+2. Parallelise the data-gen driver (sims are independent across
+   anchors; should be a small `multiprocessing.Pool` wrapper).
+3. Run full-archive data generation (~15 h on 8 cores).
+4. Fit the PWL V (~few hours interactive).
+5. Validate via `simulate_sweep` (~1 day).
+6. Ship + monitor 48 h post-deploy.
+
 ## 5. References
 
 - `SPEC-ENERGY-01.md` — canonical spec, §5.2 covers LP, §7.3 covers
