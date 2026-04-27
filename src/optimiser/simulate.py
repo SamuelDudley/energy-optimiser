@@ -333,7 +333,8 @@ def _physics_step(
 
 def simulate(
     *,
-    snapshots: str | list[Path],
+    snapshots: str | list[Path] | None = None,
+    snapshot_index: dict[datetime, TickSnapshot] | None = None,
     battery_config: BatteryConfig,
     scenario_weights: dict[str, float] | None = None,
     wear_cost_per_kwh: float | None = None,
@@ -347,6 +348,12 @@ def simulate(
 
     Args:
         snapshots: glob string or explicit list of NDJSON(.gz) paths.
+            Mutually exclusive with `snapshot_index`.
+        snapshot_index: pre-loaded `{timestamp → TickSnapshot}` index.
+            Pass this when running many sims over the same archive
+            (e.g. terminal-value data generation) to skip the
+            ~5–10s re-parse cost per call. Mutually exclusive with
+            `snapshots`.
         battery_config: candidate LP `BatteryConfig`.
         scenario_weights: candidate stochastic weights (None → defaults).
         modifier: optional `ScenarioModifier` for adverse-scenario
@@ -359,16 +366,22 @@ def simulate(
         progress: optional callback `(steps_done, total_steps)` for
             CLI progress bars.
     """
-    if isinstance(snapshots, str):
-        base = Path(snapshots).parent
-        pattern = Path(snapshots).name
-        paths = sorted(base.glob(pattern))
+    if snapshot_index is not None:
+        if snapshots is not None:
+            raise ValueError("pass exactly one of snapshots or snapshot_index")
+        index = snapshot_index
     else:
-        paths = list(snapshots)
-
-    index = _load_indexed_snapshots(paths)
+        if snapshots is None:
+            raise ValueError("must pass snapshots or snapshot_index")
+        if isinstance(snapshots, str):
+            base = Path(snapshots).parent
+            pattern = Path(snapshots).name
+            paths = sorted(base.glob(pattern))
+        else:
+            paths = list(snapshots)
+        index = _load_indexed_snapshots(paths)
     if not index:
-        raise ValueError(f"No snapshots loaded from {snapshots}")
+        raise ValueError(f"No snapshots loaded from {snapshots!r}")
 
     sorted_ts = sorted(index.keys())
     sim_start = start_ts or sorted_ts[0]

@@ -301,3 +301,51 @@ class TestEndToEnd:
             initial_soc_pct=20.0,
         )
         assert result.steps[0].soc_pct_start == pytest.approx(20.0, abs=0.5)
+
+    def test_snapshot_index_reuse_matches_glob_path(self, tmp_path: Path) -> None:
+        """Loading the index once and passing it to many simulate() calls
+        yields identical results to loading via the snapshots arg each
+        time. Locks in backward-compat for the optimisation that lets
+        the data-gen tool skip re-parsing the archive per anchor."""
+        from optimiser.simulate import _load_indexed_snapshots
+        path = tmp_path / "snap.ndjson.gz"
+        start = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+        _write_snapshot_file(path, n_steps=12, start=start, soc_at_start=50.0)
+
+        via_paths = simulate(
+            snapshots=[path],
+            battery_config=BatteryConfig(),
+            initial_soc_pct=40.0,
+        )
+        index = _load_indexed_snapshots([path])
+        via_index = simulate(
+            snapshot_index=index,
+            battery_config=BatteryConfig(),
+            initial_soc_pct=40.0,
+        )
+        assert len(via_paths.steps) == len(via_index.steps)
+        assert via_paths.total_cost_cents == pytest.approx(
+            via_index.total_cost_cents, abs=1e-6
+        )
+
+    def test_simulate_rejects_both_snapshots_and_index(self, tmp_path: Path) -> None:
+        """Passing both `snapshots` and `snapshot_index` is ambiguous —
+        must raise rather than silently picking one."""
+        path = tmp_path / "snap.ndjson.gz"
+        _write_snapshot_file(
+            path, n_steps=4,
+            start=datetime(2026, 4, 1, 12, 0, tzinfo=UTC), soc_at_start=50.0,
+        )
+        from optimiser.simulate import _load_indexed_snapshots
+        index = _load_indexed_snapshots([path])
+        with pytest.raises(ValueError, match="exactly one"):
+            simulate(
+                snapshots=[path],
+                snapshot_index=index,
+                battery_config=BatteryConfig(),
+            )
+
+    def test_simulate_rejects_neither_snapshots_nor_index(self) -> None:
+        """Caller must pass one of the two."""
+        with pytest.raises(ValueError, match="must pass"):
+            simulate(battery_config=BatteryConfig())

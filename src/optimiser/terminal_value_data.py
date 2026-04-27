@@ -279,6 +279,9 @@ def generate_rows(
     if not paths:
         raise ValueError(f"No snapshot files matched {snapshots!r}")
 
+    # Load the index ONCE and reuse across every simulate() call. The
+    # archive can be ~30 MB across many days; re-parsing per anchor ×
+    # SOC blew dominant runtime in the smoke test.
     index = _load_indexed_snapshots(paths)
     if not index:
         raise ValueError(f"No snapshots loaded from {paths}")
@@ -307,7 +310,7 @@ def generate_rows(
         n_anchors += 1
         for soc in starting_socs:
             result = simulate(
-                snapshots=paths,
+                snapshot_index=index,
                 battery_config=battery_config,
                 initial_soc_pct=soc,
                 start_ts=t,
