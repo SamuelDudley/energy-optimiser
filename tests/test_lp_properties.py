@@ -664,3 +664,68 @@ class TestLPSOCBoundsTrajectory:
                 f"slot {i} planned soc={slot.soc_pct_end:.3f} "
                 f"violates ceiling {cfg.soc_ceiling_pct}"
             )
+
+
+# ── Hour-of-day terminal-floor lookup ────────────────────────────
+
+
+class TestTerminalFloorTable:
+    """Unit tests for the staged hour-of-day terminal-floor function in
+    `lp/constants.py`. The function is not yet wired into the LP — these
+    tests just lock in the table's shape and lookup logic so when it
+    ships, behaviour is the same as designed."""
+
+    def test_morning_peak_window_higher_than_pv_peak(self) -> None:
+        from optimiser.lp.constants import terminal_soc_floor_pct
+        from datetime import datetime, timezone
+        # 06:00 NEM (morning peak) vs 12:00 NEM (PV peak)
+        morning = datetime(2026, 4, 27, 6, 0, tzinfo=timezone.utc)
+        midday = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+        assert terminal_soc_floor_pct(morning) > terminal_soc_floor_pct(midday)
+
+    def test_evening_peak_higher_than_post_peak(self) -> None:
+        from optimiser.lp.constants import terminal_soc_floor_pct
+        from datetime import datetime, timezone
+        # 18:00 NEM (peak) vs 21:00 NEM (post-peak)
+        peak = datetime(2026, 4, 27, 18, 0, tzinfo=timezone.utc)
+        post = datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
+        assert terminal_soc_floor_pct(peak) > terminal_soc_floor_pct(post)
+
+    def test_pv_peak_minimum(self) -> None:
+        """Midday PV-peak hour is the global minimum of the table."""
+        from optimiser.lp.constants import terminal_soc_floor_pct
+        from datetime import datetime, timezone
+        midday = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+        v_min = terminal_soc_floor_pct(midday)
+        for h in range(24):
+            t = datetime(2026, 4, 27, h, 0, tzinfo=timezone.utc)
+            assert terminal_soc_floor_pct(t) >= v_min
+
+    def test_table_covers_all_24_hours(self) -> None:
+        """No hour falls through to the legacy fallback."""
+        from optimiser.lp.constants import (
+            TERMINAL_SOC_FLOOR_PCT,
+            terminal_soc_floor_pct,
+            _TERMINAL_FLOOR_BY_NEM_HOUR,
+        )
+        from datetime import datetime, timezone
+        # If any hour falls through, terminal_soc_floor_pct() returns the
+        # legacy 20% scalar — but the table itself shouldn't miss any.
+        covered = set()
+        for hr_range, _ in _TERMINAL_FLOOR_BY_NEM_HOUR:
+            covered.update(hr_range)
+        assert covered == set(range(24)), (
+            f"hours not covered: {set(range(24)) - covered}"
+        )
+        # Smoke: every hour returns a finite, sane number in [10, 50].
+        for h in range(24):
+            t = datetime(2026, 4, 27, h, 0, tzinfo=timezone.utc)
+            v = terminal_soc_floor_pct(t)
+            assert 10.0 <= v <= 50.0, f"hour {h} → {v} outside sane range"
+
+    def test_legacy_constant_unchanged(self) -> None:
+        """The scalar `TERMINAL_SOC_FLOOR_PCT` is still 20% — the LP
+        currently uses it, and staging the new function must not
+        silently change that."""
+        from optimiser.lp.constants import TERMINAL_SOC_FLOOR_PCT
+        assert TERMINAL_SOC_FLOOR_PCT == 20.0

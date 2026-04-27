@@ -37,9 +37,54 @@ DEFAULT_SCENARIO_WEIGHTS: dict[str, float] = {
 # Floor on SOC at the last slot of the (possibly truncated) LP horizon.
 # Guards against "arrive empty at end of planning horizon and then grid-
 # import through an unpriced tail". Applied as max(soc_floor_pct, this).
-# Crude but safe v1 — replace with a PV-aware terminal value function once
-# we have replay data to calibrate.
+#
+# Currently the legacy scalar — used as the constant arm in
+# `terminal_soc_floor_pct()` if hour-aware lookup is unavailable. Kept
+# separate from the table so the constant baseline (20%) is still
+# inspectable. Will be retired once the PV-aware V function trained
+# from `terminal_value_data.py` lands.
 TERMINAL_SOC_FLOOR_PCT: float = 20.0
+
+
+# Hand-calibrated piecewise table: NEM hour at the terminal slot →
+# terminal-floor SOC %. Captures the time-of-day-dependent value of
+# end-of-horizon energy ahead of the proper V function being fitted.
+#
+# Shape rationale (NEM time, UTC+10, DST-stable):
+#   00–05  high — overnight, 5–7h of pure house draw before PV
+#   05–07  highest — morning peak window active or imminent, no PV
+#   07–10  moderate — peak winding down, PV starting to ramp
+#   10–14  lowest — PV peak; battery refills within ~1h regardless
+#   14–17  moderate — PV declining, build for evening peak
+#   17–20  high — evening peak active
+#   20–24  moderate — post-peak overnight buffer
+#
+# Intentionally piecewise-constant rather than smooth: easy to inspect,
+# trivially LP-embeddable (single max() against a per-tick scalar),
+# and clearly sub-optimal-on-purpose so the V fit has obvious upside.
+_TERMINAL_FLOOR_BY_NEM_HOUR: tuple[tuple[range, float], ...] = (
+    (range(0, 5), 28.0),
+    (range(5, 7), 30.0),
+    (range(7, 10), 22.0),
+    (range(10, 14), 15.0),
+    (range(14, 17), 20.0),
+    (range(17, 20), 28.0),
+    (range(20, 24), 22.0),
+)
+
+
+def terminal_soc_floor_pct(terminal_time_nem) -> float:  # type: ignore[no-untyped-def]
+    """Return the terminal-floor SOC % for an LP horizon ending at
+    `terminal_time_nem` (datetime; expected in NEM time, UTC+10).
+    Lookup is piecewise-constant by NEM hour. Falls back to
+    `TERMINAL_SOC_FLOOR_PCT` if the hour somehow doesn't match a
+    bucket — defensive only, the table covers 0–23 with no gaps.
+    """
+    h = terminal_time_nem.hour
+    for hr_range, floor in _TERMINAL_FLOOR_BY_NEM_HOUR:
+        if h in hr_range:
+            return floor
+    return TERMINAL_SOC_FLOOR_PCT
 
 
 # ── Signal-driven load (HW heat pump, future EV) ─────────────────
