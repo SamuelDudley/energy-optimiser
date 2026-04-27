@@ -167,13 +167,15 @@ class SigenergyController:
         """Connect to the inverter via Modbus TCP."""
         try:
             connected = await self._client.connect()
-            self._connected = connected
             if connected:
+                self._mark_connected()
                 logger.info(
                     "Connected to Sigenergy at %s:%d",
                     self._config.host,
                     self._config.port,
                 )
+            else:
+                self._connected = False
             return connected
         except Exception:
             logger.exception("Modbus connection failed")
@@ -183,6 +185,48 @@ class SigenergyController:
     async def disconnect(self) -> None:
         self._client.close()
         self._connected = False
+
+    def _mark_connected(self) -> None:
+        """Flip `_connected` True; emit MODBUS_RECONNECTED on rising edge.
+
+        Called after any successful Modbus operation (read_state's reconnect,
+        successful writes that recover from a prior drop). The rising-edge
+        guard means steady-state ticks don't spam the event stream.
+        """
+        if not self._connected:
+            logger.info("Modbus connection restored")
+            emit(
+                EventType.MODBUS_RECONNECTED,
+                {"host": self._config.host, "port": self._config.port},
+            )
+        self._connected = True
+
+    async def _attempt_reconnect(self) -> bool:
+        """Quiet reconnect attempt — used by `read_state` after a drop.
+
+        Distinct from `connect()`:
+          * Logs WARNING (no traceback) on failure to avoid flooding the log
+            during sustained outages — every tick (60s) re-attempts, and a
+            multi-hour Wi-Fi/inverter outage would otherwise produce dozens
+            of stack traces.
+          * Emits MODBUS_RECONNECTED via `_mark_connected` on success so the
+            recovery is queryable in the NDJSON event stream.
+
+        pymodbus's `AsyncModbusTcpClient.connect()` is idempotent — fast when
+        already connected at the TCP layer, fails fast on host-unreachable.
+        """
+        try:
+            connected = await self._client.connect()
+        except Exception as exc:
+            logger.warning("Modbus reconnect failed: %s", exc)
+            self._connected = False
+            return False
+        if connected:
+            self._mark_connected()
+            return True
+        # connect() returned False (host unreachable) — quiet, will retry next tick.
+        self._connected = False
+        return False
 
     # ── Read Methods ─────────────────────────────────────────────
 
@@ -404,7 +448,15 @@ class SigenergyController:
     ) -> SystemState | None:
         """Read current inverter/battery/grid state."""
         if not self._connected:
-            return None
+            # Sticky-disconnect recovery. A prior read raised
+            # ConnectionException (Wi-Fi outage, inverter reboot, router
+            # cycle) and flipped `_connected = False`. Without an explicit
+            # reconnect path the flag stays False forever — pymodbus's
+            # internal auto-reconnect heals the socket transparently, but
+            # nothing here knew to re-arm. Attempt a reconnect; on failure
+            # return None and let the next tick retry.
+            if not await self._attempt_reconnect():
+                return None
 
         try:
             ems_mode = await self._read_input_u16(REG_EMS_WORK_MODE)
@@ -680,6 +732,11 @@ class SigenergyController:
                     },
                 )
                 return False
+            # Successful write: TCP socket carried a Modbus exchange end-to-end.
+            # If `_connected` was False (sticky drop with read path stuck), this
+            # re-arms it so the next tick's read_state proceeds without a
+            # separate reconnect round-trip.
+            self._mark_connected()
             emit(EventType.MODBUS_WRITE, {"register": address, "value": value})
             return True
         except Exception:
@@ -702,6 +759,7 @@ class SigenergyController:
                 logger.warning("Modbus write error at %d: %s", address, result)
                 emit(EventType.MODBUS_ERROR, {"register": address, "value": value})
                 return False
+            self._mark_connected()
             emit(EventType.MODBUS_WRITE, {"register": address, "value": value})
             return True
         except Exception:

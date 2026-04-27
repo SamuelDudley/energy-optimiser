@@ -311,3 +311,196 @@ class TestReadStateEventDedup:
 
         warnings = [e for e in events if "derived" in str(e[1].get("message", "")).lower()]
         assert len(warnings) == 1
+
+
+# ── Sticky-disconnect recovery ────────────────────────────────────
+
+
+class TestReadStateReconnectAfterDrop:
+    """Wi-Fi outage / inverter reboot scenarios. A prior `_read_input_*`
+    raised ConnectionException and flipped `_connected = False`. Without
+    an explicit re-arm path the flag stays False forever and `read_state`
+    short-circuits on every subsequent tick — the heartbeat goes stale,
+    the watchdog keeps firing, and the inverter sits idle even after the
+    network has recovered. The fix attempts a reconnect inside `read_state`
+    and re-arms via `_mark_connected` on any successful read or write."""
+
+    async def test_reconnects_and_returns_state_when_link_recovers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = SigenergyController(
+            SigenergyConfig(host="127.0.0.1"),
+            BatteryConfig(),
+        )
+        ctrl._connected = False  # simulate prior drop
+
+        # pymodbus client.connect() succeeds on the next tick
+        async def _fake_connect() -> bool:
+            return True
+
+        monkeypatch.setattr(ctrl._client, "connect", _fake_connect)
+        _patch_reads(
+            ctrl,
+            monkeypatch,
+            u16={
+                REG_EMS_WORK_MODE: 2,
+                REG_GRID_SENSOR_STATUS: 1,
+                REG_PLANT_ESS_SOC: 500,
+            },
+            s32={
+                REG_GRID_ACTIVE_POWER: 1.0,
+                REG_PLANT_ESS_POWER: 0.0,
+                REG_PLANT_PV_POWER: 2.0,
+            },
+        )
+        events: list[tuple] = []
+        monkeypatch.setattr(
+            "optimiser.clients.sigenergy.emit",
+            lambda evt_type, payload: events.append((evt_type, payload)),
+        )
+
+        state = await ctrl.read_state()
+        assert state is not None
+        assert ctrl.connected is True
+        # MODBUS_RECONNECTED emitted on the rising edge.
+        from optimiser.types import EventType as ET
+        recon = [e for e in events if e[0] == ET.MODBUS_RECONNECTED]
+        assert len(recon) == 1
+
+    async def test_returns_none_when_reconnect_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = SigenergyController(
+            SigenergyConfig(host="127.0.0.1"),
+            BatteryConfig(),
+        )
+        ctrl._connected = False
+
+        async def _fake_connect() -> bool:
+            return False  # inverter still unreachable
+
+        monkeypatch.setattr(ctrl._client, "connect", _fake_connect)
+
+        state = await ctrl.read_state()
+        assert state is None
+        assert ctrl.connected is False
+
+    async def test_reconnect_failure_quiet_and_state_stays_false(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sustained outages must not flood the log with stack traces.
+        `_attempt_reconnect` logs a one-line WARNING; the existing read
+        path's exception traceback already captured the original drop."""
+        ctrl = SigenergyController(
+            SigenergyConfig(host="127.0.0.1"),
+            BatteryConfig(),
+        )
+        ctrl._connected = False
+
+        async def _raises(*_a, **_k):
+            raise OSError("host unreachable")
+
+        monkeypatch.setattr(ctrl._client, "connect", _raises)
+
+        state = await ctrl.read_state()
+        assert state is None
+        assert ctrl.connected is False
+
+
+class TestWriteRecoversConnectedFlag:
+    """While `read_state` is short-circuiting, the fallback path keeps
+    issuing writes (`set_fallback`). When those writes start succeeding
+    again — pymodbus's underlying socket has recovered — `_connected`
+    must flip back to True so the next tick's `read_state` proceeds
+    without waiting for the explicit reconnect attempt."""
+
+    async def test_successful_u16_write_marks_connected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = SigenergyController(
+            SigenergyConfig(host="127.0.0.1"),
+            BatteryConfig(),
+        )
+        ctrl._connected = False
+
+        class _OkResult:
+            def isError(self) -> bool:
+                return False
+
+        async def _fake_write(**_kwargs):
+            return _OkResult()
+
+        monkeypatch.setattr(ctrl._client, "write_register", _fake_write)
+        events: list[tuple] = []
+        monkeypatch.setattr(
+            "optimiser.clients.sigenergy.emit",
+            lambda evt_type, payload: events.append((evt_type, payload)),
+        )
+
+        ok = await ctrl._write_u16(40031, 2)
+        assert ok is True
+        assert ctrl.connected is True
+
+        from optimiser.types import EventType as ET
+        recon = [e for e in events if e[0] == ET.MODBUS_RECONNECTED]
+        assert len(recon) == 1, "Rising-edge recovery should emit one event"
+
+    async def test_successful_u32_write_marks_connected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = SigenergyController(
+            SigenergyConfig(host="127.0.0.1"),
+            BatteryConfig(),
+        )
+        ctrl._connected = False
+
+        class _OkResult:
+            def isError(self) -> bool:
+                return False
+
+        async def _fake_writes(**_kwargs):
+            return _OkResult()
+
+        monkeypatch.setattr(ctrl._client, "write_registers", _fake_writes)
+
+        ok = await ctrl._write_u32(40032, 5000)
+        assert ok is True
+        assert ctrl.connected is True
+
+    async def test_steady_state_writes_dont_re_emit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When already connected, repeated successful writes must NOT
+        re-emit MODBUS_RECONNECTED — only the rising edge counts."""
+        ctrl = SigenergyController(
+            SigenergyConfig(host="127.0.0.1"),
+            BatteryConfig(),
+        )
+        ctrl._connected = True  # already healthy
+
+        class _OkResult:
+            def isError(self) -> bool:
+                return False
+
+        async def _fake_write(**_kwargs):
+            return _OkResult()
+
+        monkeypatch.setattr(ctrl._client, "write_register", _fake_write)
+        events: list[tuple] = []
+        monkeypatch.setattr(
+            "optimiser.clients.sigenergy.emit",
+            lambda evt_type, payload: events.append((evt_type, payload)),
+        )
+
+        for _ in range(5):
+            await ctrl._write_u16(40031, 2)
+
+        from optimiser.types import EventType as ET
+        recon = [e for e in events if e[0] == ET.MODBUS_RECONNECTED]
+        assert len(recon) == 0
