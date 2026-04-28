@@ -67,9 +67,16 @@ def _gen(
     return obj
 
 
-def _fi(start: str, *, per_kwh: float = 6.0) -> dict:
-    return {
-        "type": "ForecastInterval",
+def _fi(
+    start: str,
+    *,
+    interval_type: str = "ForecastInterval",
+    per_kwh: float = 6.0,
+    advanced: dict | None = None,
+    estimate: bool | None = None,
+) -> dict:
+    obj: dict = {
+        "type": interval_type,
         "duration": 30,
         "channelType": "feedIn",
         "startTime": start,
@@ -80,6 +87,11 @@ def _fi(start: str, *, per_kwh: float = 6.0) -> dict:
         "spikeStatus": "none",
         "descriptor": "neutral",
     }
+    if advanced is not None:
+        obj["advancedPrice"] = advanced
+    if estimate is not None:
+        obj["estimate"] = estimate
+    return obj
 
 
 class TestAmberDrainLogRows:
@@ -116,6 +128,39 @@ class TestAmberDrainLogRows:
         # convention (customer charged). Our internal convention negates at
         # the boundary so positive = revenue — stored here as -6.0.
         assert r.export_per_kwh == pytest.approx(-6.0)
+
+    async def test_feedin_advancedprice_lands_in_log_row(
+        self, amber_config: AmberConfig,
+    ) -> None:
+        """advancedPrice on the feedIn channel populates the export-side
+        forecast columns on PriceForecastLogRow with the customer-
+        perspective sign convention (positive = revenue from export).
+        """
+        start = "2026-04-15T00:00:00Z"
+        payload = [
+            _gen(start, advanced={"low": 10, "predicted": 20, "high": 35}),
+            _fi(
+                start,
+                per_kwh=-3.0,
+                advanced={"low": -2.0, "predicted": -3.5, "high": -5.0},
+            ),
+        ]
+        client = AmberClient(amber_config)
+        client._client = MagicMock()
+        client._client.get = AsyncMock(return_value=_mock_response(payload))
+
+        await client.get_current_prices()
+        rows = client.drain_log_rows()
+
+        assert len(rows) == 1
+        r = rows[0]
+        # Import side unchanged.
+        assert r.forecast_predicted == pytest.approx(20.0)
+        # Export side: signs flipped relative to Amber's ledger view.
+        assert r.export_per_kwh == pytest.approx(3.0)
+        assert r.export_forecast_predicted == pytest.approx(3.5)
+        assert r.export_forecast_low == pytest.approx(2.0)
+        assert r.export_forecast_high == pytest.approx(5.0)
 
     async def test_drain_is_destructive(
         self, amber_config: AmberConfig,
@@ -174,17 +219,59 @@ class TestStorePriceForecastLog:
                 descriptor="neutral",
                 is_locked=None,
                 renewables_pct=45.0,
+                export_forecast_predicted=4.5,
+                export_forecast_low=3.0,
+                export_forecast_high=6.5,
             ),
         ]
         store.write_price_forecast_log(rows)
 
         result = store._db.execute(
-            "SELECT COUNT(*), AVG(forecast_predicted), MAX(per_kwh) "
+            "SELECT COUNT(*), AVG(forecast_predicted), MAX(per_kwh), "
+            "AVG(export_forecast_predicted), AVG(export_forecast_low), "
+            "AVG(export_forecast_high) "
             "FROM price_forecast_log",
         ).fetchone()
         assert result[0] == 1
         assert result[1] == pytest.approx(22.0)
         assert result[2] == pytest.approx(25.0)
+        assert result[3] == pytest.approx(4.5)
+        assert result[4] == pytest.approx(3.0)
+        assert result[5] == pytest.approx(6.5)
+
+    def test_write_with_default_none_export_forecast(
+        self, store: TelemetryStore,
+    ) -> None:
+        """Old call sites that don't pass the new export_forecast_*
+        kwargs must still work — fields default to None and DuckDB
+        stores NULL. This protects forward-compat with any caller that
+        constructs PriceForecastLogRow positionally or with an older
+        argument set.
+        """
+        ts = datetime(2026, 4, 15, 0, 0, tzinfo=UTC)
+        row = PriceForecastLogRow(
+            fetched_at=ts,
+            resolution=30,
+            interval_start=ts,
+            interval_end=datetime(2026, 4, 15, 0, 30, tzinfo=UTC),
+            interval_type="ActualInterval",
+            per_kwh=25.0,
+            export_per_kwh=6.0,
+            spot_per_kwh=9.0,
+            forecast_predicted=None,
+            forecast_low=None,
+            forecast_high=None,
+            spike_status="none",
+            descriptor="neutral",
+            is_locked=None,
+            renewables_pct=45.0,
+        )
+        store.write_price_forecast_log([row])
+        result = store._db.execute(
+            "SELECT export_forecast_predicted, export_forecast_low, "
+            "export_forecast_high FROM price_forecast_log"
+        ).fetchone()
+        assert result == (None, None, None)
 
     def test_empty_list_noop(self, store: TelemetryStore) -> None:
         store.write_price_forecast_log([])

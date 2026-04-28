@@ -641,3 +641,109 @@ class TestHorizonTruncationAndTerminalSOC:
         assert sol.slot_0.battery_kw > 2.0, (
             f"expected strong charge at slot 0 (predicted=2c), got {sol.slot_0.battery_kw:.2f}"
         )
+
+    def test_lp_uses_export_forecast_predicted_over_export_per_kwh(self) -> None:
+        """Symmetric with the import-side test: when Amber's feedIn
+        channel supplies advancedPrice.predicted, the LP must prefer
+        export_forecast_predicted over export_per_kwh in the cost
+        objective.
+
+        Scenario: SOC starts high so the LP has battery to discharge,
+        all slots have export_per_kwh=0 (boring) EXCEPT slot 0 has
+        export_forecast_predicted=30 (highly profitable). Expectation:
+        LP discharges/exports at slot 0 to capture the predicted-only
+        revenue. This proves the resolver is reading the new field.
+        """
+        prices = _flat_prices(import_c=30.0, export_c=0.0)
+        prices[0] = PriceInterval(
+            start=prices[0].start, end=prices[0].end,
+            import_per_kwh=30.0, export_per_kwh=0.0,
+            spot_per_kwh=9.0, renewables_pct=40.0,
+            spike_status="none", descriptor="neutral",
+            export_forecast_predicted=30.0,
+        )
+        sol = solve(
+            state=_state(soc=90.0),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[], lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        # Negative battery_kw = discharging. Predicted-30c export should
+        # be far above wear (2.5c) so the LP exports.
+        assert sol.slot_0.battery_kw < -1.0, (
+            "expected discharge into the predicted-30c export at slot 0, "
+            f"got battery_kw={sol.slot_0.battery_kw:.2f}"
+        )
+        assert sol.slot_0.grid_export_kw > 0.5, (
+            f"expected export at slot 0, got {sol.slot_0.grid_export_kw:.2f}"
+        )
+
+    def test_lp_falls_back_to_export_per_kwh_when_predicted_none(self) -> None:
+        """When export_forecast_predicted is None (settled intervals or
+        feedIn channel without advancedPrice), the LP must fall back to
+        export_per_kwh. Mirror of the import-side fallback path.
+
+        Scenario: same shape as the previous test, but predicted is None
+        and export_per_kwh is 0. With nothing to gain, the LP should
+        idle the battery (or at least not aggressively discharge).
+        """
+        prices = _flat_prices(import_c=30.0, export_c=0.0)
+        # Default — no export_forecast_predicted set, so it's None.
+        sol = solve(
+            state=_state(soc=90.0),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[], lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        # No incentive to discharge to grid — and wear cost > 0 export
+        # revenue. Slot 0 should not push battery into export.
+        assert sol.slot_0.grid_export_kw < 0.5, (
+            "expected near-zero export when both export_per_kwh and "
+            f"predicted are 0/None, got {sol.slot_0.grid_export_kw:.2f}"
+        )
+
+    def test_export_tie_break_keys_off_resolved_ep(self) -> None:
+        """The EXPORT_TIE_BREAK_PENALTY (in `lp/constants.py`) fires at
+        `ep ≤ 0`. The boundary must key off the *resolved* `ep`
+        (predicted-or-export_per_kwh), not raw export_per_kwh.
+
+        Scenario: export_per_kwh = +1c (above the boundary, no penalty
+        if it were the resolved value) but export_forecast_predicted =
+        -1c (below the boundary, tie-break should fire). With SOC high
+        and PV present we'd otherwise expect the LP to export to the
+        positive raw price; the tie-break penalty plus the negative
+        predicted should bias toward storing instead.
+        """
+        prices = _flat_prices(import_c=30.0, export_c=1.0)
+        prices[0] = PriceInterval(
+            start=prices[0].start, end=prices[0].end,
+            import_per_kwh=30.0, export_per_kwh=1.0,
+            spot_per_kwh=9.0, renewables_pct=40.0,
+            spike_status="none", descriptor="neutral",
+            export_forecast_predicted=-1.0,
+        )
+        sol = solve(
+            state=_state(soc=50.0),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[], lp_loads=[],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+        # Negative predicted means exporting costs the customer; the LP
+        # must not discharge the battery into a loss-making export at
+        # slot 0. Allow tiny rounding (< 0.05 kW).
+        assert sol.slot_0.grid_export_kw < 0.05, (
+            "battery should not discharge into negative-predicted export "
+            f"at slot 0, got grid_export={sol.slot_0.grid_export_kw:.3f}"
+        )

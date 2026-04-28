@@ -85,6 +85,11 @@ class ReplayResult:
 
 
 def _reconstruct_price_interval(d: dict) -> PriceInterval:
+    # `.get()` for every advancedPrice field — old NDJSON snapshots
+    # written before the export-side fields existed will be missing
+    # them; the LP falls back to `export_per_kwh` in that case, which
+    # exactly reproduces the deployed-at-the-time decision. New
+    # snapshots carry both channels.
     return PriceInterval(
         start=parse_iso(d["start"]),
         end=parse_iso(d["end"]),
@@ -97,6 +102,9 @@ def _reconstruct_price_interval(d: dict) -> PriceInterval:
         forecast_low=d.get("forecast_low"),
         forecast_high=d.get("forecast_high"),
         forecast_predicted=d.get("forecast_predicted"),
+        export_forecast_low=d.get("export_forecast_low"),
+        export_forecast_high=d.get("export_forecast_high"),
+        export_forecast_predicted=d.get("export_forecast_predicted"),
     )
 
 

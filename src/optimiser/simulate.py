@@ -113,6 +113,26 @@ class ScenarioModifier:
                     if p.forecast_predicted is not None
                     else None
                 ),
+                # Mirror the import-side scaling on the export advancedPrice.
+                # low/high are not yet read by the LP (KNOWN-ISSUES #24) but
+                # scale them anyway so any future scenario work that consumes
+                # them sees a consistent perturbation across all four export
+                # price fields.
+                export_forecast_predicted=(
+                    p.export_forecast_predicted * self.export_price_multiplier
+                    if p.export_forecast_predicted is not None
+                    else None
+                ),
+                export_forecast_low=(
+                    p.export_forecast_low * self.export_price_multiplier
+                    if p.export_forecast_low is not None
+                    else None
+                ),
+                export_forecast_high=(
+                    p.export_forecast_high * self.export_price_multiplier
+                    if p.export_forecast_high is not None
+                    else None
+                ),
             )
             for p in snap.price_forecast
         ]

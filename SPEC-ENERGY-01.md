@@ -403,6 +403,22 @@ min Σ_s weight_s × Σ_t [
 ]
 ```
 
+Where each price resolves with a predicted-fallback rule:
+
+```
+import_price[t] = price[t].forecast_predicted
+                  ?? price[t].import_per_kwh
+export_price[t] = price[t].export_forecast_predicted
+                  ?? price[t].export_per_kwh
+```
+
+`forecast_predicted` is `general.advancedPrice.predicted`;
+`export_forecast_predicted` is `feedIn.advancedPrice.predicted`,
+sign-flipped at the parser to the customer convention. Both are
+populated only on `ForecastInterval` rows — past/locked intervals
+fall through to the AEMO-derived `perKwh` (which by then is the
+locked actual). See `lp/formulation.py` for the resolver.
+
 Default scenario weights: P10=0.20, P50=0.60, P90=0.20.
 Wear cost: 1 c/kWh (discourages unnecessary cycling).
 
@@ -862,27 +878,40 @@ returns `(forecasts, fetched_at)` if the most recent fetch is fresh
 
 Symmetric with the PV forecast log but with a different shape and
 different analysis goal. The LP uses `advancedPrice.predicted` as the
-point estimate (see §5.2) and the swagger tells us `advancedPrice.low/
-high` exist as a confidence band. The question we care about post-
-deploy is: **is that band calibrated?**
+point estimate on **both** the import and export sides (see §5.2):
+import from `general.advancedPrice.predicted`, export from
+`feedIn.advancedPrice.predicted`. Live API verification on 2026-04-28
+confirmed feedIn carries the same block; the parser populates and
+sign-flips the export-side fields at the boundary. The swagger also
+exposes `advancedPrice.low/high` as a confidence band on both
+channels. The question we care about post-deploy is: **is that band
+calibrated, on each channel?**
 
 ```sql
 CREATE TABLE price_forecast_log (
-    fetched_at          TIMESTAMPTZ NOT NULL,
-    resolution          INTEGER NOT NULL,        -- 5 or 30
-    interval_start      TIMESTAMPTZ NOT NULL,
-    interval_end        TIMESTAMPTZ NOT NULL,
-    interval_type       VARCHAR,                 -- Actual/Current/Forecast
-    per_kwh             REAL,                    -- AEMO point estimate
-    export_per_kwh      REAL,
-    spot_per_kwh        REAL,
-    forecast_predicted  REAL,                    -- Amber advancedPrice.predicted
-    forecast_low        REAL,                    -- advancedPrice.low
-    forecast_high       REAL,                    -- advancedPrice.high
-    spike_status        VARCHAR,
-    descriptor          VARCHAR,
-    is_locked           BOOLEAN,                 -- CurrentInterval.estimate inverted
-    renewables_pct      REAL
+    fetched_at                 TIMESTAMPTZ NOT NULL,
+    resolution                 INTEGER NOT NULL,        -- 5 or 30
+    interval_start             TIMESTAMPTZ NOT NULL,
+    interval_end               TIMESTAMPTZ NOT NULL,
+    interval_type              VARCHAR,                 -- Actual/Current/Forecast
+    per_kwh                    REAL,                    -- AEMO point estimate, general channel
+    export_per_kwh             REAL,                    -- feedIn revenue, sign-flipped
+    spot_per_kwh               REAL,
+    forecast_predicted         REAL,                    -- general.advancedPrice.predicted
+    forecast_low               REAL,                    -- general.advancedPrice.low
+    forecast_high              REAL,                    -- general.advancedPrice.high
+    spike_status               VARCHAR,
+    descriptor                 VARCHAR,
+    is_locked                  BOOLEAN,                 -- CurrentInterval.estimate inverted
+    renewables_pct             REAL,
+    -- feedIn channel advancedPrice (added 2026-04-28). Sign-flipped at
+    -- the parser to the customer convention so positive = revenue from
+    -- export, mirroring export_per_kwh. NULL on Actual/Current
+    -- intervals (Amber doesn't carry advancedPrice on settled rows)
+    -- and on rows written before 2026-04-28.
+    export_forecast_predicted  REAL,
+    export_forecast_low        REAL,
+    export_forecast_high       REAL
 );
 ```
 
@@ -893,7 +922,7 @@ successive fetches traces how the forecast evolved, and the last entry
 analysis joins the earlier forecast rows to the later actual row:
 
 ```sql
--- How often was realised within the advertised band?
+-- Import-side band calibration: how often was realised within the band?
 WITH forecasts AS (
   SELECT interval_start, forecast_low, forecast_predicted, forecast_high
   FROM price_forecast_log
@@ -913,13 +942,21 @@ SELECT
 FROM forecasts f JOIN actuals a USING (interval_start);
 ```
 
+The export-side calibration mirrors the above with `export_forecast_*`
+in place of `forecast_*` and `export_per_kwh` as `realised`. Run both
+— Amber may calibrate its predictions differently per channel, and
+the LP's slot-0 cost is asymmetric (import is dominant for evening
+peak shaving, export for midday surplus). Filter `WHERE
+interval_start >= '2026-04-28'` for export-side analysis (rows written
+before then have NULL export_forecast_*).
+
 This is the data needed to decide, post-deploy, whether to add price
-scenarios to the LP (see §5.2.1 deferred). If the band is well-
-calibrated (e.g. ~66% of realised values fall within [low, high]) and
-the mean absolute error of `predicted` is non-trivial compared to wear
-cost (~2.5 c/kWh), scenarios are worth building. If the band is noise
-or `predicted` is already tight, scenarios would add complexity without
-benefit.
+scenarios to the LP (see §5.2.1 deferred / KNOWN-ISSUES #24). If
+either band is well-calibrated (e.g. ~66% of realised values fall
+within [low, high]) and the mean absolute error of `predicted` is
+non-trivial compared to wear cost (~2.5 c/kWh), scenarios are worth
+building. If a band is noise or `predicted` is already tight,
+scenarios on that channel would add complexity without benefit.
 
 ### 6.4 Data Point Rationalisation
 

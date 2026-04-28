@@ -243,10 +243,23 @@ class AmberClient:
         fetched_at = now_utc()
         prices: list[PriceInterval] = []
         log_rows: list[PriceForecastLogRow] = []
+        # Amber's feedIn channel is signed from their ledger perspective —
+        # negative = revenue to customer, positive = customer pays (solar
+        # glut). The LP's internal convention is the customer's:
+        # positive = revenue from export. We negate every feedIn-derived
+        # value at this boundary so downstream code reads natural
+        # "what you get paid per kWh exported" semantics. This applies
+        # to feedIn.perKwh AND every field of feedIn.advancedPrice
+        # (low/predicted/high). Easy to forget on the advancedPrice
+        # branch — covered by `test_feedin_predicted_captured_and_sign_flipped`.
+        def _neg(x: float | None) -> float | None:
+            return -x if x is not None else None
+
         for key in sorted(general.keys()):
             gen = general[key]
             fi = feed_in.get(key, {})
             advanced = gen.get("advancedPrice") or {}
+            fi_advanced = fi.get("advancedPrice") or {}
             interval_type = gen.get("type")
             # CurrentInterval carries an `estimate` flag. False means the
             # final 30-min price has been locked in for that interval
@@ -265,14 +278,10 @@ class AmberClient:
             start = parse_iso(gen["startTime"]).replace(second=0, microsecond=0)
             end = parse_iso(gen["endTime"]).replace(second=0, microsecond=0)
             per_kwh = gen.get("perKwh", 0)
-            # Amber's feedIn.perKwh is signed from their ledger perspective:
-            # negative = revenue to customer (feed-in tariff paid), positive =
-            # cost to customer (solar-glut penalty). The LP's internal
-            # convention is the customer's: positive = revenue from export.
-            # Negate at the boundary so downstream code reads a natural
-            # "what you get paid per kWh exported" (positive in normal hours,
-            # negative only during curtailment events).
             export_per_kwh = -fi.get("perKwh", 0)
+            export_forecast_predicted = _neg(fi_advanced.get("predicted"))
+            export_forecast_low = _neg(fi_advanced.get("low"))
+            export_forecast_high = _neg(fi_advanced.get("high"))
             spot = gen.get("spotPerKwh", 0)
             renewables = gen.get("renewables", 0)
             spike = gen.get("spikeStatus", "none")
@@ -290,6 +299,9 @@ class AmberClient:
                     forecast_low=advanced.get("low"),
                     forecast_high=advanced.get("high"),
                     forecast_predicted=advanced.get("predicted"),
+                    export_forecast_low=export_forecast_low,
+                    export_forecast_high=export_forecast_high,
+                    export_forecast_predicted=export_forecast_predicted,
                     is_locked=is_locked,
                 )
             )
@@ -310,6 +322,9 @@ class AmberClient:
                     descriptor=descriptor,
                     is_locked=is_locked,
                     renewables_pct=renewables,
+                    export_forecast_predicted=export_forecast_predicted,
+                    export_forecast_low=export_forecast_low,
+                    export_forecast_high=export_forecast_high,
                 )
             )
         return prices, log_rows

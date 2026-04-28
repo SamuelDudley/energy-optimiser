@@ -330,7 +330,7 @@ misinterpreted as a counter reset (which would corrupt the baseline).
 **Impact:** At ~1MB/day compressed, this will consume ~365MB/year. Not critical but will grow indefinitely.
 **Fix:** Add a retention policy — delete snapshot files older than N days (configurable, default 180). Run as part of the daily 02:00 profile rebuild.
 
-### ~~9. Planner doesn't use `advancedPrice` confidence bands~~ — Resolved (v0.2.1)
+### ~~9. Planner doesn't use `advancedPrice` confidence bands~~ — Resolved (v0.2.1, extended 2026-04-28)
 **Original file:** `planner.py` (deleted); resolved in `clients/amber.py`,
 `lp/formulation.py`, `types.py`, `store.py`.
 
@@ -357,6 +357,22 @@ misinterpreted as a counter reset (which would corrupt the baseline).
 5. A dedicated `price_forecast_log` DuckDB table captures every
    forecast at every fetch with both resolutions, enabling later
    forecast-vs-realised calibration analysis (see spec §6.3.1).
+
+**Extension (2026-04-28):** the original v0.2.1 fix only parsed
+`advancedPrice` off the `general` (import) channel — feedIn rows were
+discarded. Live API verification on 2026-04-28 confirmed Amber
+publishes the same block on `feedIn.ForecastInterval` rows. The parser
+(`clients/amber.py::_fetch`) now reads both channels and populates
+three new fields on `PriceInterval` and `PriceForecastLogRow`:
+`export_forecast_predicted`, `export_forecast_low`,
+`export_forecast_high` (sign-flipped at the parser boundary to the
+customer convention, mirroring `export_per_kwh`). The LP's `ep` term
+in `lp/formulation.py` is now symmetric with `ip`: prefer
+`export_forecast_predicted`, fall back to `export_per_kwh`. The
+`price_forecast_log` table grew three matching columns (idempotent
+`ALTER TABLE ADD COLUMN IF NOT EXISTS` migration). Old NDJSON
+snapshots replay safely — `replay._reconstruct_price_interval` defaults
+the new keys to `None`, falling back to the old behaviour exactly.
 
 ### ~~10. No PV register means house_load model trains on wrong data~~ — Resolved
 **File:** `store.py`, `profiler.py`
@@ -607,32 +623,80 @@ at 200ms each — way over the 10s tick budget). Build as a CLI under
 ### 24. Price scenarios not yet added to the LP (deferred pending calibration data)
 **File:** `lp/formulation.py`, `lp/solver.py`
 **Impact:** The LP currently treats prices deterministically (using
-`advancedPrice.predicted` when available, `perKwh` otherwise). Only PV
-uncertainty is modelled stochastically. If Amber's `advancedPrice.low`/
-`high` band is meaningfully wide during volatile periods, the LP is
-leaving robustness value on the table.
+`advancedPrice.predicted` when available, `perKwh` otherwise) on BOTH
+the import and export sides (the export side gained predicted-fallback
+on 2026-04-28 — see issue 9). Only PV uncertainty is modelled
+stochastically. If Amber's `advancedPrice.low`/`high` band is
+meaningfully wide during volatile periods, the LP is leaving robustness
+value on the table.
+
+**Data status (2026-04-28):** `price_forecast_log` now captures
+`forecast_low/predicted/high` on **both** channels. The columns
+`export_forecast_low/predicted/high` are populated on every fetch and
+ready for calibration analysis. Pre-2026-04-28 rows have NULL on the
+export-side columns; calibration must filter them out (or wait until
+~3 weeks of fresh data accumulates from late April 2026).
+
 **Why deferred:** Building price scenarios requires three design
 choices, each of which needs data we don't yet have:
 
 1. **Band calibration.** Amber hasn't documented what percentile the
    `low`/`high` band represents. We need to measure — across a few
-   weeks of realised prices — how often `realised ∈ [low, high]`.
-   If ~66% it's a ~1σ band; if ~95% it's ~2σ; if 30% the band is
-   garbage and scenarios built from it would be worse than the point
-   estimate.
+   weeks of realised prices — how often `realised ∈ [low, high]`,
+   independently for import and export (Amber may calibrate each
+   channel differently). If ~66% it's a ~1σ band; if ~95% it's ~2σ;
+   if 30% the band is garbage and scenarios built from it would be
+   worse than the point estimate.
 2. **Composition with PV scenarios.** Three viable options: cross-
    product (3 PV × 3 price = 9 scenarios, ~3× solve time), shared-
    percentile (3 scenarios, assumes correlation we haven't measured),
-   or proper Monte Carlo (requires joint distributions).
+   or proper Monte Carlo (requires joint distributions). Note that
+   import and export bands are likely correlated within a slot
+   (NEM-driven) but may diverge across slots — the analysis must
+   characterise this before scenario composition is decided.
 3. **Scenario weights.** Depends on (1) and the cost of being wrong
    — which depends on (2) plus realised loss from miscalibrated
    decisions, which we can only measure via replay.
 
-**Fix:** once `price_forecast_log` has 2-4 weeks of data, write a one-
-off analysis script to answer (1) and (2), then add scenarios behind a
-config flag that defaults OFF. Compare via replay before flipping.
-**Priority:** post-deploy enhancement. The code as-shipped is correct
-— this is an improvement, not a fix.
+**Concrete next actions** (in dependency order):
+
+- a) **Calibration script.** Write `src/optimiser/analysis/price_band_calibration.py`.
+     Joins `price_forecast_log` (where `interval_type='ForecastInterval'`)
+     to itself (or to `interval_type='ActualInterval'`) on
+     `interval_start`, computes `realised ∈ [low, high]` hit rate for
+     both `forecast_*` and `export_forecast_*` columns. Output:
+     hit-rate per channel, MAE of `predicted` vs `realised`, hit-rate
+     by lookahead-bucket (0–6 h, 6–12 h, 12–24 h). Spec query in
+     SPEC-ENERGY-01 §6.3.1 covers the import side; mirror it for
+     export.
+- b) **Scenario constructor.** `lp/scenarios.py` (new): a function
+     that takes a `PriceInterval` and returns a list of
+     `(weight, price_with_predicted_overridden)` tuples. Three
+     canonical compositions — point-only (status quo), shared-
+     percentile (P10/P50/P90 from `low/predicted/high` jointly across
+     import+export), and cross-product (9 scenarios). Pure function,
+     unit-tested in isolation.
+- c) **Wire scenarios into the solver.** Today `solve_stochastic`
+     iterates PV scenarios. Extend its scenario loop to also iterate
+     price scenarios from (b), via a new `lp/constants.py` flag
+     `ENABLE_PRICE_SCENARIOS: bool = False`. When False, behaviour is
+     identical to today. When True, the resolved `ip`/`ep` per slot
+     come from the scenario being built, not the raw `PriceInterval`.
+- d) **Sweep validation.** `/sim-sweep` A/B between flag-off and
+     flag-on across a representative week of post-2026-04-28 snapshots.
+     Decision rule: keep flag-off unless flag-on shows ≥ $0.10/day
+     improvement on average AND no day worse than $0.50.
+- e) **Default-on + remove flag.** Once (d) is convincing, flip the
+     default and remove the flag in a follow-up. Add a CLAUDE.md
+     decision-log entry recording the calibration outcome.
+
+Each step is independently revertable; (a) and (b) ship without any
+LP behaviour change.
+
+**Priority:** post-deploy enhancement, gated on (a) — first
+calibration pass should run after ~3 weeks of fresh data (from late
+April 2026, so feasible from late May 2026 onward). The code as-
+shipped is correct — this is an improvement, not a fix.
 
 ### 25. Mode-2 adaptive trim ignores house load — revisit when load model matures
 **File:** `clients/sigenergy.py::_apply_mode2_adaptive_charge`

@@ -122,9 +122,21 @@ class PriceInterval:
     renewables_pct: float
     spike_status: str
     descriptor: str                    # Amber enum; see _FORECAST_DESCRIPTORS in amber.py
+    # advancedPrice on the `general` (import) channel. Populated only on
+    # ForecastIntervals; None on Current/Actual.
     forecast_low: float | None = None
     forecast_high: float | None = None
     forecast_predicted: float | None = None  # Amber's own model ("Advanced Price Forecast")
+    # advancedPrice on the `feedIn` (export) channel. Same population
+    # pattern as the import side. Sign-flipped to the customer
+    # convention at the parser boundary so positive = revenue from
+    # export — matches `export_per_kwh`. Used by the LP cost objective
+    # via `lp/formulation.py` (predicted preferred, fallback to
+    # `export_per_kwh`). low/high are captured for future scenario
+    # calibration (see KNOWN-ISSUES #24) and currently unread.
+    export_forecast_low: float | None = None
+    export_forecast_high: float | None = None
+    export_forecast_predicted: float | None = None
     is_locked: bool | None = None            # CurrentInterval.estimate inverted: False=estimate, True=locked, None=Actual/Forecast
 
 
@@ -140,15 +152,22 @@ class PriceForecastLogRow:
     interval_end: datetime
     interval_type: str | None                # ActualInterval / CurrentInterval / ForecastInterval
     per_kwh: float                           # AEMO point on the general channel
-    export_per_kwh: float                    # feedIn channel perKwh
+    export_per_kwh: float                    # feedIn channel perKwh, sign-flipped to customer
     spot_per_kwh: float
-    forecast_predicted: float | None
-    forecast_low: float | None
-    forecast_high: float | None
+    forecast_predicted: float | None         # general.advancedPrice.predicted
+    forecast_low: float | None               # general.advancedPrice.low
+    forecast_high: float | None              # general.advancedPrice.high
     spike_status: str
     descriptor: str
     is_locked: bool | None
     renewables_pct: float
+    # feedIn.advancedPrice.{predicted,low,high}, sign-flipped at parser
+    # boundary so positive = revenue from export. Defaults to None so
+    # existing call sites and forward-compat row reconstruction stay
+    # safe; populated by `clients/amber.py::_fetch` when present.
+    export_forecast_predicted: float | None = None
+    export_forecast_low: float | None = None
+    export_forecast_high: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

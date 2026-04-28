@@ -180,23 +180,42 @@ CREATE TABLE IF NOT EXISTS pv_forecast_log (
 # cadence once per polling cycle.
 PRICE_FORECAST_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS price_forecast_log (
-    fetched_at          TIMESTAMPTZ NOT NULL,
-    resolution          INTEGER NOT NULL,        -- 5 or 30
-    interval_start      TIMESTAMPTZ NOT NULL,
-    interval_end        TIMESTAMPTZ NOT NULL,
-    interval_type       VARCHAR,                 -- ActualInterval / CurrentInterval / ForecastInterval
-    per_kwh             REAL,                    -- AEMO point estimate (general channel)
-    export_per_kwh      REAL,                    -- feedIn revenue to customer (sign-flipped from Amber's raw)
-    spot_per_kwh        REAL,
-    forecast_predicted  REAL,                    -- Amber advancedPrice.predicted
-    forecast_low        REAL,                    -- Amber advancedPrice.low
-    forecast_high       REAL,                    -- Amber advancedPrice.high
-    spike_status        VARCHAR,
-    descriptor          VARCHAR,
-    is_locked           BOOLEAN,                 -- CurrentInterval.estimate inverted
-    renewables_pct      REAL
+    fetched_at                 TIMESTAMPTZ NOT NULL,
+    resolution                 INTEGER NOT NULL,        -- 5 or 30
+    interval_start             TIMESTAMPTZ NOT NULL,
+    interval_end               TIMESTAMPTZ NOT NULL,
+    interval_type              VARCHAR,                 -- Actual/Current/Forecast Interval
+    per_kwh                    REAL,                    -- AEMO point estimate (general channel)
+    export_per_kwh             REAL,                    -- feedIn revenue, sign-flipped
+    spot_per_kwh               REAL,
+    forecast_predicted         REAL,                    -- general.advancedPrice.predicted
+    forecast_low               REAL,                    -- general.advancedPrice.low
+    forecast_high              REAL,                    -- general.advancedPrice.high
+    spike_status               VARCHAR,
+    descriptor                 VARCHAR,
+    is_locked                  BOOLEAN,                 -- CurrentInterval.estimate inverted
+    renewables_pct             REAL,
+    -- feedIn channel advancedPrice, sign-flipped at the parser boundary
+    -- to the customer convention (positive = revenue from export). Same
+    -- population pattern as the import-side fields: populated on
+    -- ForecastInterval, NULL on Current/Actual. predicted is consumed
+    -- by the LP cost objective; low/high are captured for future
+    -- stochastic price scenarios (see KNOWN-ISSUES #24, currently
+    -- unread).
+    export_forecast_predicted  REAL,
+    export_forecast_low        REAL,
+    export_forecast_high       REAL
 );
 """
+
+# Migration for installs that pre-date the export advancedPrice columns
+# (added 2026-04-28). DuckDB's `ADD COLUMN IF NOT EXISTS` makes these
+# idempotent — safe to re-run on every startup.
+PRICE_FORECAST_LOG_MIGRATIONS = [
+    "ALTER TABLE price_forecast_log ADD COLUMN IF NOT EXISTS export_forecast_predicted REAL",
+    "ALTER TABLE price_forecast_log ADD COLUMN IF NOT EXISTS export_forecast_low       REAL",
+    "ALTER TABLE price_forecast_log ADD COLUMN IF NOT EXISTS export_forecast_high      REAL",
+]
 
 # Mirrors pv_forecast_log: every fetched interval logged with its
 # fetched_at, so forecast evolution and calibration can be analysed
@@ -246,7 +265,7 @@ class TelemetryStore:
         self._db.execute(PRICE_FORECAST_LOG_DDL)
         self._db.execute(WEATHER_FORECAST_LOG_DDL)
         # Apply migrations for installs that predate any added columns.
-        for stmt in TELEMETRY_MIGRATIONS:
+        for stmt in (*TELEMETRY_MIGRATIONS, *PRICE_FORECAST_LOG_MIGRATIONS):
             try:
                 self._db.execute(stmt)
             except Exception:
@@ -581,7 +600,7 @@ class TelemetryStore:
         try:
             self._db.executemany(
                 """INSERT INTO price_forecast_log VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )""",
                 [
                     [
@@ -600,6 +619,9 @@ class TelemetryStore:
                         r.descriptor,
                         r.is_locked,
                         r.renewables_pct,
+                        r.export_forecast_predicted,
+                        r.export_forecast_low,
+                        r.export_forecast_high,
                     ]
                     for r in rows
                 ],

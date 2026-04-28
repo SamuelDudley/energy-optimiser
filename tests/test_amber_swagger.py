@@ -63,9 +63,16 @@ def _general_interval(
     return obj
 
 
-def _feed_in_interval(start: str, *, per_kwh: float = 5.0) -> dict:
-    return {
-        "type": "ForecastInterval",
+def _feed_in_interval(
+    start: str,
+    *,
+    interval_type: str = "ForecastInterval",
+    per_kwh: float = 5.0,
+    advanced: dict | None = None,
+    estimate: bool | None = None,
+) -> dict:
+    obj: dict = {
+        "type": interval_type,
         "duration": 30,
         "channelType": "feedIn",
         "startTime": start,
@@ -76,6 +83,11 @@ def _feed_in_interval(start: str, *, per_kwh: float = 5.0) -> dict:
         "spikeStatus": "none",
         "descriptor": "neutral",
     }
+    if advanced is not None:
+        obj["advancedPrice"] = advanced
+    if estimate is not None:
+        obj["estimate"] = estimate
+    return obj
 
 
 class TestAdvancedPricePredicted:
@@ -111,7 +123,7 @@ class TestAdvancedPricePredicted:
         start = "2026-04-15T00:00:00Z"
         payload = [
             _general_interval(start, interval_type="ActualInterval"),
-            _feed_in_interval(start),
+            _feed_in_interval(start, interval_type="ActualInterval"),
         ]
         client = AmberClient(amber_config)
         client._client = MagicMock()
@@ -120,6 +132,81 @@ class TestAdvancedPricePredicted:
         prices = await client.get_current_prices()
 
         assert prices[0].forecast_predicted is None
+        # Same on the export side: feedIn ActualInterval has no
+        # advancedPrice, so the LP falls back to export_per_kwh.
+        assert prices[0].export_forecast_predicted is None
+        assert prices[0].export_forecast_low is None
+        assert prices[0].export_forecast_high is None
+
+    async def test_feedin_predicted_captured_and_sign_flipped(
+        self, amber_config: AmberConfig,
+    ) -> None:
+        """advancedPrice on the feedIn channel — verified live 2026-04-28
+        — must land in PriceInterval.export_forecast_*. Sign convention
+        mirrors export_per_kwh: Amber's ledger sign is flipped to the
+        customer perspective (positive = revenue from export).
+        """
+        start = "2026-04-15T00:00:00Z"
+        payload = [
+            _general_interval(start),
+            # Amber ledger view: negative perKwh means revenue to customer.
+            # The advancedPrice block on feedIn follows the same sign.
+            _feed_in_interval(
+                start,
+                per_kwh=-3.85,
+                advanced={"low": -2.71, "predicted": -3.95, "high": -5.24},
+            ),
+        ]
+        client = AmberClient(amber_config)
+        client._client = MagicMock()
+        client._client.get = AsyncMock(return_value=_mock_response(payload=payload))
+
+        prices = await client.get_current_prices()
+
+        assert len(prices) == 1
+        # Customer-perspective: revenue from export is positive.
+        assert prices[0].export_per_kwh == pytest.approx(3.85)
+        assert prices[0].export_forecast_predicted == pytest.approx(3.95)
+        assert prices[0].export_forecast_low == pytest.approx(2.71)
+        assert prices[0].export_forecast_high == pytest.approx(5.24)
+
+    async def test_feedin_advancedprice_independent_of_general(
+        self, amber_config: AmberConfig,
+    ) -> None:
+        """The two channels' advancedPrice blocks are populated
+        independently. Both can carry the field, only one can, or neither.
+        """
+        start = "2026-04-15T00:00:00Z"
+        payload = [
+            _general_interval(
+                start,
+                advanced={"low": 8.0, "predicted": 15.5, "high": 25.0},
+            ),
+            # No advancedPrice on feedIn — should leave export side None.
+            _feed_in_interval(start, per_kwh=-2.0),
+        ]
+        client = AmberClient(amber_config)
+        client._client = MagicMock()
+        client._client.get = AsyncMock(return_value=_mock_response(payload=payload))
+
+        prices = await client.get_current_prices()
+
+        assert prices[0].forecast_predicted == pytest.approx(15.5)
+        assert prices[0].export_forecast_predicted is None
+        # And the converse — only feedIn carries advancedPrice.
+        client2 = AmberClient(amber_config)
+        client2._client = MagicMock()
+        client2._client.get = AsyncMock(return_value=_mock_response(payload=[
+            _general_interval(start),
+            _feed_in_interval(
+                start,
+                per_kwh=-2.0,
+                advanced={"low": -1.0, "predicted": -2.5, "high": -4.0},
+            ),
+        ]))
+        prices2 = await client2.get_current_prices()
+        assert prices2[0].forecast_predicted is None
+        assert prices2[0].export_forecast_predicted == pytest.approx(2.5)
 
 
 class TestIsLocked:

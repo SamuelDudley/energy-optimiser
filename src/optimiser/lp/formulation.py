@@ -508,17 +508,31 @@ def _add_scenario_to_problem(
     )
 
     # ── Cost terms (already weighted) ────────────────────────────
-    # Import price: prefer Amber's `advancedPrice.predicted` when present
+    # Both prices: prefer Amber's `advancedPrice.predicted` when present
     # (their own ML forecast; explicitly recommended by Amber for
-    # forecasting) and fall back to `perKwh` (AEMO point estimate) when
-    # not. `predicted` is populated for ~24h of forward intervals;
-    # `perKwh` is always populated. Export price stays as `perKwh` —
-    # advancedPrice is on the general channel only.
+    # forecasting) and fall back to `perKwh` (AEMO-derived point
+    # estimate) when not. `predicted` is populated on ForecastInterval
+    # only — settled intervals (CurrentInterval / ActualInterval) carry
+    # only `perKwh`, which by then is the locked actual.
+    #
+    # advancedPrice is published on BOTH channels: the import side from
+    # `general.advancedPrice`, the export side from `feedIn.advancedPrice`
+    # (verified 2026-04-28 against live API). The export-side fields are
+    # sign-flipped at the parser boundary (see clients/amber.py) so
+    # positive = revenue from export, mirroring `export_per_kwh`.
+    #
+    # `forecast_low` / `forecast_high` are captured on both sides but
+    # not yet consumed — see KNOWN-ISSUES #24 for the price-scenario
+    # work that's gated on band calibration data.
     cost_terms: list[pulp.LpAffineExpression] = []
     for t in range(n):
         price = _price_at(prices_planning, slots[t])
         ip = price.forecast_predicted if price.forecast_predicted is not None else price.import_per_kwh
-        ep = price.export_per_kwh
+        ep = (
+            price.export_forecast_predicted
+            if price.export_forecast_predicted is not None
+            else price.export_per_kwh
+        )
         cost_terms.append(weight * grid_import[t] * ip * slot_hours)
         cost_terms.append(-weight * grid_export[t] * ep * slot_hours)
         # Export tie-break: at non-positive export prices, add a tiny

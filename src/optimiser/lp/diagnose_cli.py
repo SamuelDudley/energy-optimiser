@@ -164,7 +164,11 @@ def main() -> None:
     slot_hours = vars.slot_hours
     price0 = _price_at(snap.price_forecast, base.slots[0])
     ip0 = price0.forecast_predicted if price0.forecast_predicted is not None else price0.import_per_kwh
-    ep0 = price0.export_per_kwh
+    ep0 = (
+        price0.export_forecast_predicted
+        if price0.export_forecast_predicted is not None
+        else price0.export_per_kwh
+    )
 
     # Slot 0 across scenarios
     print("\n--- Slot 0 across scenarios (non-anti ties bat net only) ---")
@@ -191,7 +195,10 @@ def main() -> None:
     pvc0 = pulp.value(base.pv_curtailed[0])
     soc_over0 = pulp.value(base.soc_over_ceiling[0])
     w = base.weight
-    print(f"  ip(predicted-or-import) = {ip0:.4f}c/kWh, ep = {ep0:.4f}c/kWh, slot_hours = {slot_hours}")
+    print(
+        f"  ip(predicted-or-import) = {ip0:.4f}c/kWh, "
+        f"ep(predicted-or-export) = {ep0:.4f}c/kWh, slot_hours = {slot_hours}"
+    )
     print(f"    import_cost     = {w*gi0*ip0*slot_hours:+.4f}c")
     print(f"    export_revenue  = {-w*ge0*ep0*slot_hours:+.4f}c")
     print(f"    wear_charge     = {w*(bcg0+bcp0)*WEAR_COST_PER_KWH*slot_hours:+.4f}c")
@@ -213,6 +220,11 @@ def main() -> None:
         s = base.slots[t]
         pr = _price_at(snap.price_forecast, s)
         ip_t = pr.forecast_predicted if pr.forecast_predicted is not None else pr.import_per_kwh
+        ep_t = (
+            pr.export_forecast_predicted
+            if pr.export_forecast_predicted is not None
+            else pr.export_per_kwh
+        )
         print(
             f"  {s.isoformat()[:16]:>16}  "
             f"{pulp.value(base.bat_charge_grid[t]):7.3f} "
@@ -221,7 +233,7 @@ def main() -> None:
             f"{pulp.value(base.grid_export[t]):7.3f} "
             f"{pulp.value(base.grid_import[t]):7.3f} "
             f"{pulp.value(base.soc_pct[t]):7.3f}  "
-            f"{pr.export_per_kwh:7.3f}  {ip_t:7.3f}"
+            f"{ep_t:7.3f}  {ip_t:7.3f}"
         )
 
     # Horizon totals + terminal SOC
@@ -288,10 +300,15 @@ def main() -> None:
                     s = base.slots[t]
                     pr = _price_at(snap.price_forecast, s)
                     ip_t = pr.forecast_predicted if pr.forecast_predicted is not None else pr.import_per_kwh
+                    ep_t = (
+                        pr.export_forecast_predicted
+                        if pr.export_forecast_predicted is not None
+                        else pr.export_per_kwh
+                    )
                     print(
                         f"    {s.isoformat()[:16]}  "
                         f"Δbd={d_bd:+6.3f}  Δge={d_ge:+6.3f}  Δbcp={d_bcp:+6.3f}  Δbcg={d_bcg:+6.3f}  "
-                        f"ep={pr.export_per_kwh:7.3f}c  ip={ip_t:7.3f}c"
+                        f"ep={ep_t:7.3f}c  ip={ip_t:7.3f}c"
                     )
             slack1 = pulp.value(sv1.soc_terminal_slack) if sv1.soc_terminal_slack is not None else 0.0
             slack2 = pulp.value(sv2.soc_terminal_slack) if sv2.soc_terminal_slack is not None else 0.0
