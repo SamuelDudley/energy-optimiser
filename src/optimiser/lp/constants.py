@@ -32,6 +32,36 @@ DEFAULT_SCENARIO_WEIGHTS: dict[str, float] = {
 }
 
 
+# ── Price-axis stochasticity ─────────────────────────────────────
+
+# How the LP composes Amber's `advancedPrice.{low,predicted,high}`
+# bands into stochastic scenarios. See lp/scenarios.py for the
+# semantics of each mode.
+#
+# - POINT  (default): one scenario, weight 1.0, predicted-or-spot.
+#   Reproduces the deterministic LP that shipped before scenarios
+#   were introduced. Identical objective and dispatch.
+# - SHARED: 3 scenarios pairing import_low/export_low,
+#   import_predicted/export_predicted, import_high/export_high.
+#   Encodes the NEM-coupled assumption that wholesale surprises
+#   move both prices the same direction.
+# - CROSS:  9 scenarios on a 3×3 grid. Treats the import and export
+#   bands as independent. Composed with the 3 PV scenarios in
+#   build_stochastic_lp this becomes 27 compound scenarios.
+#
+# Default is POINT pending sweep evidence (see KNOWN-ISSUES #24,
+# steps d–e). Operators can override per-deployment via the
+# `[planner].lp_price_scenario_mode` config knob; the constant
+# below is the fallback when the config field is unset.
+#
+# Imported lazily to avoid a circular import (scenarios.py imports
+# from types.py only — but constants.py is imported by formulation.py
+# which is in the same package, so an enum import here is fine).
+from .scenarios import PriceScenarioMode  # noqa: E402
+
+PRICE_SCENARIO_MODE: PriceScenarioMode = PriceScenarioMode.POINT
+
+
 # ── Terminal SOC ─────────────────────────────────────────────────
 
 # Floor on SOC at the last slot of the (possibly truncated) LP horizon.
@@ -206,10 +236,18 @@ SOC_BOUND_PENALTY: float = 1e4
 
 # ── Solver ───────────────────────────────────────────────────────
 
-# Hard wall-clock limit for the LP solve. Past this, the optimiser falls
-# back to SELF_CONSUME mode + all relays off. The 10s budget is generous
-# for our problem size (~few thousand variables); production solves
-# typically finish in <500ms with HiGHS.
+# Hard wall-clock limit for the LP solve. Past this, the optimiser
+# falls back to SELF_CONSUME mode + all relays off. The 10s budget is
+# generous for our problem size and covers all three PRICE_SCENARIO_MODE
+# settings:
+#   - POINT  (default):  3 compound scenarios. Typical solve <250 ms.
+#   - SHARED:            9 compound scenarios. Typical solve <750 ms.
+#   - CROSS:            27 compound scenarios. Typical solve <2.5 s,
+#                       outlier P99 estimated <5 s.
+# The wall-clock timeout (lp_wall_clock_timeout_s in PlannerConfig)
+# defaults to 12s — slightly larger than this so HiGHS' own timeLimit
+# fires first and produces a graceful "best feasible" return rather
+# than the hard fallback path.
 SOLVER_TIMEOUT_S: int = 10
 
 # Mixed-integer treatment: only slot 0 binaries are integer-constrained

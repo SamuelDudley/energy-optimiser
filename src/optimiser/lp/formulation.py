@@ -28,6 +28,7 @@ from .constants import (
     EXPORT_TIE_BREAK_PENALTY_PER_KWH,
     HORIZON_HOURS,
     IMPORT_TIE_BREAK_REWARD_PER_KWH,
+    PRICE_SCENARIO_MODE,
     PV_CURTAIL_PENALTY_PER_KWH,
     SLOT_MINUTES,
     SOC_BOUND_PENALTY,
@@ -35,6 +36,11 @@ from .constants import (
     terminal_soc_floor_pct,
 )
 from .loads import LoadVars, LPLoad
+from .scenarios import (
+    PriceScenario,
+    PriceScenarioMode,
+    build_price_scenarios,
+)
 
 
 @dataclass
@@ -83,6 +89,13 @@ class StochasticLPVars:
     in any solved scenario, so reading from any one is equivalent.
 
     `base` is the canonical scenario for slot-0 extraction.
+
+    Compound scenario keys are `f"{pv_name}__{price_name}"` (see
+    `build_stochastic_lp`). In POINT mode that's `p10__point`,
+    `p50__point`, `p90__point`. Use `pv_scenario(name)` to find a
+    scenario by PV percentile alone — it returns the heaviest-weighted
+    compound for that PV bucket, so callers can keep their old
+    `scenarios["p10"]` semantics across all modes.
     """
 
     slots: list[datetime]
@@ -93,6 +106,26 @@ class StochasticLPVars:
     @property
     def base(self) -> LPVars:
         return self.scenarios[self.base_scenario]
+
+    def pv_scenario(self, pv_name: str) -> LPVars:
+        """Return the heaviest-weighted compound scenario for a PV
+        percentile. Stable across POINT/SHARED/CROSS price modes.
+
+        Used by code that historically indexed `scenarios["p10"]` and
+        wants to preserve that semantic without caring about the price
+        axis (e.g. dispatch_from_slot looking at the central forecast,
+        or diagnostic tooling that compares P10 vs P90 trajectories).
+        """
+        prefix = f"{pv_name}__"
+        candidates = [
+            (name, vars) for name, vars in self.scenarios.items() if name.startswith(prefix)
+        ]
+        if not candidates:
+            raise KeyError(
+                f"no compound scenario for pv_name={pv_name!r}; "
+                f"available={list(self.scenarios)}"
+            )
+        return max(candidates, key=lambda nv: nv[1].weight)[1]
 
 
 # ── Public: deterministic single-scenario ─────────────────────────
@@ -111,7 +144,13 @@ def build_lp(
     slot_minutes: int = SLOT_MINUTES,
     pv_percentile: str = "p50",
 ) -> tuple[pulp.LpProblem, LPVars]:
-    """Build a single-scenario deterministic LP."""
+    """Build a single-scenario deterministic LP.
+
+    Always uses POINT-mode price resolution (predicted-or-spot). The
+    price-scenario stochastic axis only exists in `build_stochastic_lp`
+    — this function is the deterministic baseline used in tests and
+    diagnostics.
+    """
     if not prices_planning:
         raise ValueError("build_lp requires non-empty prices_planning")
 
@@ -123,6 +162,7 @@ def build_lp(
 
     prob = pulp.LpProblem("energy_optimiser", pulp.LpMinimize)
 
+    point_scenario = build_price_scenarios(PriceScenarioMode.POINT)[0]
     vars, cost_terms = _add_scenario_to_problem(
         prob=prob,
         prefix="",
@@ -138,6 +178,7 @@ def build_lp(
         lp_loads=lp_loads,
         battery_config=battery_config,
         wear_cost_per_kwh=wear_cost_per_kwh,
+        price_scenario=point_scenario,
     )
     prob += pulp.lpSum(cost_terms), "total_cost_cents"
     return prob, vars
@@ -158,18 +199,40 @@ def build_stochastic_lp(
     wear_cost_per_kwh: float = WEAR_COST_PER_KWH,
     horizon_hours: int = HORIZON_HOURS,
     slot_minutes: int = SLOT_MINUTES,
+    price_scenario_mode: PriceScenarioMode | None = None,
 ) -> tuple[pulp.LpProblem, StochasticLPVars]:
-    """Build a two-stage stochastic LP across P10/P50/P90 PV scenarios.
+    """Build a two-stage stochastic LP across compound (PV × price) scenarios.
 
-    Each scenario gets its own copy of slots-1..N variables (so it can
-    plan a scenario-appropriate trajectory), but slot-0 variables are
-    tied across scenarios via non-anticipativity constraints. The result
-    is the optimal here-and-now decision against the weighted expected
-    cost across all scenarios.
+    Each compound scenario gets its own copy of slots-1..N variables (so
+    it can plan a scenario-appropriate trajectory), but slot-0 variables
+    are tied across scenarios via non-anticipativity constraints. The
+    result is the optimal here-and-now decision against the weighted
+    expected cost across the compound distribution.
 
-    `scenario_weights`: maps scenario name to probability mass. Defaults
-    to `DEFAULT_SCENARIO_WEIGHTS` (P10 0.2, P50 0.6, P90 0.2). Names must
-    be one of "p10"/"p50"/"p90" (matched to PVForecast percentile fields).
+    Compound scenarios: each PV percentile (default P10/P50/P90) is
+    paired with each price scenario from `price_scenario_mode`. The
+    compound weight is the product `pv_weight × price_weight`. Modes:
+      - POINT: 1 price scenario × 3 PV =  3 compound scenarios
+      - SHARED: 3 × 3 =  9 compound scenarios
+      - CROSS:  9 × 3 = 27 compound scenarios
+    See `lp/scenarios.py` for the price-axis taxonomy.
+
+    `scenario_weights`: maps PV scenario name to probability mass.
+    Defaults to `DEFAULT_SCENARIO_WEIGHTS` (P10 0.2, P50 0.6, P90 0.2).
+    Names must be one of "p10"/"p50"/"p90" (matched to PVForecast
+    percentile fields).
+
+    `price_scenario_mode`: defaults to the value of `constants.
+    PRICE_SCENARIO_MODE` (which is itself POINT by default — see
+    KNOWN-ISSUES #24). Pass an explicit mode to A/B in tests or the
+    `/sim-sweep` skill.
+
+    Compound scenario keys are `f"{pv_name}__{price_name}"` (double-
+    underscore separator chosen so each component is unambiguously
+    parseable). The base scenario is the unique heaviest-weighted
+    compound: under default weights that's `p50__point` in POINT mode,
+    `p50__shared_predicted` in SHARED, `p50__i_predicted_e_predicted`
+    in CROSS.
     """
     weights = scenario_weights or dict(DEFAULT_SCENARIO_WEIGHTS)
     if not weights:
@@ -178,6 +241,9 @@ def build_stochastic_lp(
         raise ValueError(f"scenario_weights must sum to 1.0, got {sum(weights.values()):.3f}")
     if not prices_planning:
         raise ValueError("build_stochastic_lp requires non-empty prices_planning")
+
+    mode = price_scenario_mode if price_scenario_mode is not None else PRICE_SCENARIO_MODE
+    price_scenarios = build_price_scenarios(mode)
 
     slots = _slot_grid(state.timestamp, horizon_hours, slot_minutes)
     slots = _truncate_to_priced(slots, prices_planning)
@@ -190,39 +256,45 @@ def build_stochastic_lp(
     scenarios: dict[str, LPVars] = {}
     all_cost_terms: list[pulp.LpAffineExpression] = []
 
-    for scenario_name, weight in weights.items():
-        vars, cost_terms = _add_scenario_to_problem(
-            prob=prob,
-            prefix=f"{scenario_name}_",
-            weight=weight,
-            slots=slots,
-            slot_hours=slot_hours,
-            state=state,
-            prices_planning=prices_planning,
-            pv_forecast=pv_forecast,
-            pv_percentile=scenario_name,
-            load_profile=load_profile,
-            managed_loads=managed_loads,
-            lp_loads=lp_loads,
-            battery_config=battery_config,
-            wear_cost_per_kwh=wear_cost_per_kwh,
-        )
-        scenarios[scenario_name] = vars
-        all_cost_terms.extend(cost_terms)
+    for pv_name, pv_weight in weights.items():
+        for price_scenario in price_scenarios:
+            compound_weight = pv_weight * price_scenario.weight
+            compound_name = f"{pv_name}__{price_scenario.name}"
+            vars, cost_terms = _add_scenario_to_problem(
+                prob=prob,
+                prefix=f"{compound_name}_",
+                weight=compound_weight,
+                slots=slots,
+                slot_hours=slot_hours,
+                state=state,
+                prices_planning=prices_planning,
+                pv_forecast=pv_forecast,
+                pv_percentile=pv_name,
+                load_profile=load_profile,
+                managed_loads=managed_loads,
+                lp_loads=lp_loads,
+                battery_config=battery_config,
+                wear_cost_per_kwh=wear_cost_per_kwh,
+                price_scenario=price_scenario,
+            )
+            scenarios[compound_name] = vars
+            all_cost_terms.extend(cost_terms)
 
     # Non-anticipativity: slot-0 decisions must be identical across all
-    # scenarios (we don't yet know which scenario will materialise, so
-    # the action we commit to NOW must be scenario-independent).
+    # compound scenarios (we don't yet know which compound scenario will
+    # materialise, so the action we commit to NOW must be independent of
+    # both the PV outcome and the price outcome).
     #
-    # Base scenario = the heaviest-weighted one (p50 under defaults). The
-    # slot-0 *net* battery kW is tied across scenarios, but the per-source
-    # decomposition (grid-vs-PV charge) is NOT — it can legitimately
-    # differ depending on the PV scenario. `dispatch_from_slot` reads the
-    # base scenario's decomposition to choose between mode 3 (grid-first)
-    # and mode 4 (PV-first). Picking the heaviest-weighted scenario makes
-    # that decomposition reflect the most likely PV outcome rather than
-    # the pessimistic one.
-    base_name = max(weights, key=weights.get)
+    # Base scenario = the unique heaviest-weighted compound. Under
+    # default weights that's `(p50, predicted)` ⇒ weight 0.6 × leg
+    # marginal. The slot-0 *net* battery kW is tied across scenarios,
+    # but the per-source decomposition (grid-vs-PV charge) is NOT — it
+    # can legitimately differ across compound scenarios.
+    # `dispatch_from_slot` reads the base scenario's decomposition to
+    # choose between mode 3 (grid-first) and mode 4 (PV-first). Picking
+    # the heaviest-weighted compound makes that decomposition reflect
+    # the most likely outcome on both axes.
+    base_name = max(scenarios, key=lambda n: scenarios[n].weight)
     base = scenarios[base_name]
     for name, vars in scenarios.items():
         if name == base_name:
@@ -257,10 +329,19 @@ def _add_scenario_to_problem(
     lp_loads: list[LPLoad],
     battery_config: BatteryConfig,
     wear_cost_per_kwh: float,
+    price_scenario: PriceScenario,
 ) -> tuple[LPVars, list[pulp.LpAffineExpression]]:
     """Add one scenario's variables, constraints, and weighted cost terms
     to the problem. Returns the LPVars and the list of cost terms (already
     multiplied by `weight` for the caller to sum into the objective).
+
+    `price_scenario` resolves the per-slot import / export prices used in
+    the cost objective. The deterministic single-scenario case passes
+    `PriceScenario(name="point", weight=1.0, "predicted", "predicted")`,
+    which collapses to the predicted-or-spot rule. The stochastic case
+    passes one PriceScenario per compound scenario; together with the PV
+    percentile the scenario carries everything that varies in the cost
+    objective.
     """
     n = len(slots)
 
@@ -508,31 +589,27 @@ def _add_scenario_to_problem(
     )
 
     # ── Cost terms (already weighted) ────────────────────────────
-    # Both prices: prefer Amber's `advancedPrice.predicted` when present
-    # (their own ML forecast; explicitly recommended by Amber for
-    # forecasting) and fall back to `perKwh` (AEMO-derived point
-    # estimate) when not. `predicted` is populated on ForecastInterval
-    # only — settled intervals (CurrentInterval / ActualInterval) carry
-    # only `perKwh`, which by then is the locked actual.
+    # Per-slot price resolution is delegated to `price_scenario`. Its
+    # resolver applies the chain: requested band leg → predicted →
+    # spot. POINT mode (default; deterministic LP) uses the
+    # "predicted" leg, falling back to `import_per_kwh` /
+    # `export_per_kwh` on settled intervals. SHARED / CROSS modes
+    # provide non-trivial scenarios for the stochastic LP.
     #
-    # advancedPrice is published on BOTH channels: the import side from
-    # `general.advancedPrice`, the export side from `feedIn.advancedPrice`
-    # (verified 2026-04-28 against live API). The export-side fields are
-    # sign-flipped at the parser boundary (see clients/amber.py) so
-    # positive = revenue from export, mirroring `export_per_kwh`.
+    # advancedPrice is published on BOTH channels: the import side
+    # from `general.advancedPrice`, the export side from
+    # `feedIn.advancedPrice` (verified 2026-04-28 against live API).
+    # Export-side fields are sign-flipped at the parser boundary (see
+    # clients/amber.py) so positive = revenue from export.
     #
-    # `forecast_low` / `forecast_high` are captured on both sides but
-    # not yet consumed — see KNOWN-ISSUES #24 for the price-scenario
-    # work that's gated on band calibration data.
+    # See `lp/scenarios.py` for the scenario taxonomy and
+    # KNOWN-ISSUES #24 for the calibration/sweep gate before flipping
+    # the production default off POINT.
     cost_terms: list[pulp.LpAffineExpression] = []
     for t in range(n):
         price = _price_at(prices_planning, slots[t])
-        ip = price.forecast_predicted if price.forecast_predicted is not None else price.import_per_kwh
-        ep = (
-            price.export_forecast_predicted
-            if price.export_forecast_predicted is not None
-            else price.export_per_kwh
-        )
+        ip = price_scenario.resolve_ip(price)
+        ep = price_scenario.resolve_ep(price)
         cost_terms.append(weight * grid_import[t] * ip * slot_hours)
         cost_terms.append(-weight * grid_export[t] * ep * slot_hours)
         # Export tie-break: at non-positive export prices, add a tiny

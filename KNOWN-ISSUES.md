@@ -660,43 +660,59 @@ choices, each of which needs data we don't yet have:
 
 **Concrete next actions** (in dependency order):
 
-- a) **Calibration script.** Write `src/optimiser/analysis/price_band_calibration.py`.
-     Joins `price_forecast_log` (where `interval_type='ForecastInterval'`)
-     to itself (or to `interval_type='ActualInterval'`) on
-     `interval_start`, computes `realised ∈ [low, high]` hit rate for
-     both `forecast_*` and `export_forecast_*` columns. Output:
-     hit-rate per channel, MAE of `predicted` vs `realised`, hit-rate
-     by lookahead-bucket (0–6 h, 6–12 h, 12–24 h). Spec query in
-     SPEC-ENERGY-01 §6.3.1 covers the import side; mirror it for
-     export.
-- b) **Scenario constructor.** `lp/scenarios.py` (new): a function
-     that takes a `PriceInterval` and returns a list of
-     `(weight, price_with_predicted_overridden)` tuples. Three
-     canonical compositions — point-only (status quo), shared-
-     percentile (P10/P50/P90 from `low/predicted/high` jointly across
-     import+export), and cross-product (9 scenarios). Pure function,
-     unit-tested in isolation.
-- c) **Wire scenarios into the solver.** Today `solve_stochastic`
-     iterates PV scenarios. Extend its scenario loop to also iterate
-     price scenarios from (b), via a new `lp/constants.py` flag
-     `ENABLE_PRICE_SCENARIOS: bool = False`. When False, behaviour is
-     identical to today. When True, the resolved `ip`/`ep` per slot
-     come from the scenario being built, not the raw `PriceInterval`.
-- d) **Sweep validation.** `/sim-sweep` A/B between flag-off and
-     flag-on across a representative week of post-2026-04-28 snapshots.
-     Decision rule: keep flag-off unless flag-on shows ≥ $0.10/day
-     improvement on average AND no day worse than $0.50.
-- e) **Default-on + remove flag.** Once (d) is convincing, flip the
-     default and remove the flag in a follow-up. Add a CLAUDE.md
-     decision-log entry recording the calibration outcome.
+- a) ✅ **Calibration script** — `src/optimiser/analysis/price_band_calibration.py`
+     (shipped 2026-04-28). Joins ForecastInterval rows to ActualInterval
+     rows on `interval_start`, computes per-channel hit-rate, MAE,
+     asymmetric breach split (above-high vs below-low), all stratified
+     by lookahead bucket (0–6 h / 6–12 h / 12–24 h / 24–36 h). Also
+     reports cross-channel residual correlation between import and
+     export — directly informs the SHARED-vs-CROSS composition choice.
+     CLI: `python -m optimiser.analysis.price_band_calibration --db
+     /tmp/telemetry-snapshot.duckdb --since 2026-04-28T00:00:00Z`.
+     Tested in `tests/test_price_band_calibration.py`.
+- b) ✅ **Scenario constructor** — `src/optimiser/lp/scenarios.py`
+     (shipped 2026-04-28). `PriceScenarioMode` enum + frozen
+     `PriceScenario` dataclass + `build_price_scenarios(mode)`. Three
+     modes: POINT (1, status quo), SHARED (3 NEM-coupled), CROSS
+     (3×3 = 9 with independent bands). Resolvers fall through
+     band-leg → predicted → spot, so locked intervals collapse all
+     scenarios to the spot value (preserving NA at slot 0). Tested
+     in `tests/test_lp_scenarios.py`.
+- c) ✅ **Solver wiring** — `lp/formulation.py::build_stochastic_lp`
+     (shipped 2026-04-28) now iterates compound `(pv_scenario,
+     price_scenario)` scenarios with multiplicative weights. POINT
+     mode reproduces the pre-scenarios LP byte-for-byte (regression
+     gated by `tests/test_lp_compound_scenarios.py::TestPointModeRegression`).
+     `StochasticLPVars.pv_scenario(name)` helper preserves callers
+     that historically indexed `scenarios["p10"]`.
 
-Each step is independently revertable; (a) and (b) ship without any
-LP behaviour change.
+     Selectable per-deployment via `[planner].lp_price_scenario_mode`
+     in config.toml ("point" / "shared" / "cross") or via the in-code
+     `lp.constants.PRICE_SCENARIO_MODE` default. Default is `"point"`.
 
-**Priority:** post-deploy enhancement, gated on (a) — first
-calibration pass should run after ~3 weeks of fresh data (from late
-April 2026, so feasible from late May 2026 onward). The code as-
-shipped is correct — this is an improvement, not a fix.
+- d) ⏳ **Sweep validation.** `/sim-sweep` A/B between POINT (status
+     quo) and SHARED / CROSS across a representative week of
+     post-2026-04-28 snapshots. Decision rule: keep POINT unless a
+     non-POINT mode shows ≥ $0.10/day improvement on average AND no
+     day worse than $0.50. Wait for ~5 days of fresh data (so from
+     2026-05-03 onward) before running.
+
+     Cross-channel correlation from (a) informs which non-POINT mode
+     to test: ρ ≈ +1 ⇒ try SHARED first (CROSS over-hedges
+     implausible combinations); ρ ≈ 0 ⇒ try CROSS first.
+- e) ⏳ **Flip default.** Once (d) is convincing, change
+     `PRICE_SCENARIO_MODE` and/or the config default to the winning
+     mode. Add a CLAUDE.md decision-log entry recording the
+     calibration outcome and the chosen mode.
+
+Steps (a), (b), (c) ship without any LP behaviour change — they
+land the infrastructure and start data collection. Steps (d) and
+(e) are gated on data and a measurement decision.
+
+**Priority:** post-deploy enhancement, gated on (a)+data — first
+calibration pass should run after ~5 days of fresh data (so from
+~2026-05-03 onward). The code as-shipped is correct — this is an
+improvement, not a fix.
 
 ### 25. Mode-2 adaptive trim ignores house load — revisit when load model matures
 **File:** `clients/sigenergy.py::_apply_mode2_adaptive_charge`

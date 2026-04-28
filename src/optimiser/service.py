@@ -888,6 +888,17 @@ class Service:
         breaker, emits BREAKER_LATCHED, returns `(None, None)`.
         """
         t0 = time.monotonic()
+        # Parse the price-scenario mode once per tick — fails loud
+        # rather than silently degrading to POINT if the operator
+        # mistypes the config string.
+        try:
+            price_scenario_mode = self._config.planner.parsed_price_scenario_mode
+        except ValueError:
+            logger.exception(
+                "lp_price_scenario_mode=%r invalid; falling back to PRICE_SCENARIO_MODE",
+                self._config.planner.lp_price_scenario_mode,
+            )
+            price_scenario_mode = None
         try:
             solution = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -900,6 +911,7 @@ class Service:
                     lp_loads=self._lp_loads,
                     battery_config=self._config.battery,
                     scenario_weights=self._config.planner.lp_scenario_weights,
+                    price_scenario_mode=price_scenario_mode,
                 ),
                 timeout=self._config.planner.lp_wall_clock_timeout_s,
             )

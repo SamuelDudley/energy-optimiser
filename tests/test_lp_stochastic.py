@@ -241,8 +241,8 @@ class TestNonAnticipativity:
         # We're not asserting a specific decision — just that scenarios
         # are FREE to differ in stage 2 (which they should, given the
         # different inputs).
-        slot_1_p10 = svars.scenarios["p10"].bat_charge_pv[1].value() or 0.0
-        slot_1_p90 = svars.scenarios["p90"].bat_charge_pv[1].value() or 0.0
+        slot_1_p10 = svars.pv_scenario("p10").bat_charge_pv[1].value() or 0.0
+        slot_1_p90 = svars.pv_scenario("p90").bat_charge_pv[1].value() or 0.0
         # P90 has more PV, so should put more PV into the battery
         assert slot_1_p90 >= slot_1_p10 - 0.01
 
@@ -380,7 +380,9 @@ class TestBaseScenarioSelection:
             battery_config=BatteryConfig(),
         )
         # Default weights: p10=0.20, p50=0.60, p90=0.20 — p50 is heaviest
-        assert svars.base_scenario == "p50"
+        # PV bucket. Compound key includes the price-axis suffix; check
+        # the PV part only so the assertion stays mode-agnostic.
+        assert svars.base_scenario.split("__")[0] == "p50"
 
     def test_custom_weights_select_heaviest(self) -> None:
         prob, svars = build_stochastic_lp(
@@ -393,7 +395,7 @@ class TestBaseScenarioSelection:
             battery_config=BatteryConfig(),
             scenario_weights={"p10": 0.7, "p50": 0.2, "p90": 0.1},
         )
-        assert svars.base_scenario == "p10"
+        assert svars.base_scenario.split("__")[0] == "p10"
 
 
 # ── S5: export untied across scenarios ───────────────────────────
@@ -423,9 +425,11 @@ class TestExportUntied:
         prob.solve(_solver(30.0))
         assert pulp.LpStatus[prob.status] == "Optimal"
 
+        # Use the PV-percentile helper so this test is robust to the
+        # compound (PV × price) scenario naming and to non-POINT modes.
         exports = {
-            name: (vars.grid_export[0].value() or 0.0)
-            for name, vars in svars.scenarios.items()
+            pv: (svars.pv_scenario(pv).grid_export[0].value() or 0.0)
+            for pv in ("p10", "p50", "p90")
         }
         # P90 has more PV than P10; with SOC near ceiling, the surplus
         # has nowhere to go but export. Export is free to differ now.
@@ -442,7 +446,7 @@ class TestExportUntied:
                 + (v.bat_charge_pv[0].value() or 0.0)
                 - (v.bat_discharge[0].value() or 0.0)
             )
-        baseline = _net(svars.scenarios["p50"])
+        baseline = _net(svars.pv_scenario("p50"))
         for name, vars in svars.scenarios.items():
             assert _net(vars) == pytest.approx(baseline, abs=0.001), (
                 f"battery-net tie broken: {name} net={_net(vars):.3f}, "

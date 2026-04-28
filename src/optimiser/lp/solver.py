@@ -81,13 +81,21 @@ def solve_stochastic(
     scenario_weights: dict[str, float] | None = None,
     timeout_s: float = SOLVER_TIMEOUT_S,
     wear_cost_per_kwh: float | None = None,
+    price_scenario_mode=None,  # type: ignore[no-untyped-def]
 ) -> LPSolution:
-    """Build and solve the stochastic LP across PV percentile scenarios.
+    """Build and solve the stochastic LP across compound (PV × price)
+    scenarios.
 
-    Slot-0 decisions are tied across scenarios by non-anticipativity, so
-    the returned `LPSolution.slot_0` is the unique here-and-now action
-    optimal against the weighted expected cost. The forward trajectory
-    is taken from the base scenario (one of the equally-valid plans).
+    Slot-0 decisions are tied across scenarios by non-anticipativity,
+    so the returned `LPSolution.slot_0` is the unique here-and-now
+    action optimal against the weighted expected cost. The forward
+    trajectory is taken from the base scenario (one of the equally-
+    valid plans).
+
+    `price_scenario_mode` (`PriceScenarioMode | None`) controls the
+    price axis. None defers to `constants.PRICE_SCENARIO_MODE`. See
+    `lp/scenarios.py` for the taxonomy and KNOWN-ISSUES #24 for the
+    sweep gate.
     """
     from .constants import WEAR_COST_PER_KWH as _DEFAULT_WEAR
     wear = wear_cost_per_kwh if wear_cost_per_kwh is not None else _DEFAULT_WEAR
@@ -103,6 +111,7 @@ def solve_stochastic(
             battery_config=battery_config,
             scenario_weights=scenario_weights,
             wear_cost_per_kwh=wear,
+            price_scenario_mode=price_scenario_mode,
         )
     except Exception as exc:
         logger.exception("Stochastic LP build failed")

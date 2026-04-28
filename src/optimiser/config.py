@@ -188,6 +188,13 @@ class PlannerConfig:
     lp_scenario_weight_p10: float = 0.20  # Stochastic PV scenario weights
     lp_scenario_weight_p50: float = 0.60
     lp_scenario_weight_p90: float = 0.20
+    # Price-axis stochasticity. See lp/scenarios.py for semantics.
+    # "point" reproduces the deterministic predicted-or-spot LP
+    # (default, pending sweep evidence per KNOWN-ISSUES #24).
+    # "shared" or "cross" enable Amber's advancedPrice bands as
+    # weighted scenarios. String here so config.toml stays plain;
+    # parsed via the property below.
+    lp_price_scenario_mode: str = "point"
 
     @property
     def lp_scenario_weights(self) -> dict[str, float]:
@@ -196,6 +203,19 @@ class PlannerConfig:
             "p50": self.lp_scenario_weight_p50,
             "p90": self.lp_scenario_weight_p90,
         }
+
+    @property
+    def parsed_price_scenario_mode(self):  # type: ignore[no-untyped-def]
+        """Parse `lp_price_scenario_mode` to the PriceScenarioMode enum.
+
+        Imported here (not at module top) to avoid a circular import
+        between config.py (loaded early) and lp.scenarios (which lives
+        under lp/ and imports from optimiser.types). Raises ValueError
+        if the string is not one of point/shared/cross.
+        """
+        from .lp.scenarios import PriceScenarioMode
+
+        return PriceScenarioMode(self.lp_price_scenario_mode)
 
 
 @dataclass(frozen=True, slots=True)

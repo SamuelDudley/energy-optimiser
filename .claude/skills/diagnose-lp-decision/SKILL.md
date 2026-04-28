@@ -28,7 +28,7 @@ If the user gives a *local* time, convert to UTC before doing anything else (Can
 This skill uses three CLIs, each read-only:
 
 - **`replay_cli`** with `--filter-timestamp` / `--override-soc` flags — one-tick replay against a candidate config; reproduces the historical solve (or doesn't, which is itself a finding). Use for SOC sensitivity sweeps.
-- **`optimiser.lp.diagnose_cli`** — single-tick deep introspection: slot-0 vars across all 3 scenarios, objective decomposition, forward trajectory, and an optional `--force-bat-net` counterfactual that surfaces *which scenario's future slot is binding* the slot-0 choice.
+- **`optimiser.lp.diagnose_cli`** — single-tick deep introspection: slot-0 vars across all compound scenarios (3 under default POINT mode; 9 under SHARED, 27 under CROSS — see `lp/scenarios.py`), objective decomposition, forward trajectory, and an optional `--force-bat-net` counterfactual that surfaces *which scenario's future slot is binding* the slot-0 choice.
 - **`jq`** against the snapshot file directly — for the original LP's `forward_trajectory` (already in the snapshot, no re-solve needed) and price-forecast inspection.
 
 The DuckDB telemetry file is locked by the running service. Don't touch it. Snapshots are NDJSON.gz, append-only, safe to read concurrently.
