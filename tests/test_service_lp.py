@@ -356,3 +356,90 @@ class TestRunLPFallbackSideEffects:
             await svc._run_lp(**_solver_args())
 
         assert svc._lp_runtime.commanded is None
+
+
+# ── Pre-LP PV probe gating ───────────────────────────────────────
+
+
+class TestMaybeRunPVProbe:
+    """`_maybe_run_pv_probe` is the gate that decides whether to pay
+    the 5 s Phase-A measurement cost on a given tick. Skips at night,
+    skips when planner disabled (caller checks elsewhere), passes
+    measurement to LP via `slot_0_pv_override_kw` only if unsaturated."""
+
+    def _state(self, pv_kw: float | None) -> MagicMock:
+        s = MagicMock()
+        s.pv_power_kw = pv_kw
+        return s
+
+    def _service_with_sigenergy(
+        self, measure_return, last_export_kw: float | None = 5.0
+    ) -> Service:
+        svc = _make_service()
+        svc._sigenergy.measure_uncapped_pv = AsyncMock(return_value=measure_return)
+        svc._last_export_limit_kw = last_export_kw
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_skips_when_pv_below_threshold(self) -> None:
+        """At night / dusk, pv reads ~0; the probe is uninformative."""
+        svc = self._service_with_sigenergy(measure_return=None)
+        result = await svc._maybe_run_pv_probe(self._state(pv_kw=0.1), "tick-1")
+        assert result is None
+        svc._sigenergy.measure_uncapped_pv.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_pv_unknown(self) -> None:
+        """Telemetry blind at tick start → no probe (we'd be writing
+        without context)."""
+        svc = self._service_with_sigenergy(measure_return=None)
+        result = await svc._maybe_run_pv_probe(self._state(pv_kw=None), "tick-1")
+        assert result is None
+        svc._sigenergy.measure_uncapped_pv.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_runs_and_returns_probe_when_pv_above_threshold(self) -> None:
+        from optimiser.types import PVProbeResult
+
+        probe = PVProbeResult(
+            pv_kw=8.0, saturated=False,
+            bat_kw=7.5, bat_avail_kw=13.0,
+            grid_export_kw=0.4, export_cap_kw=5.0,
+            house_kw=0.1, soc_pct=50.0,
+        )
+        svc = self._service_with_sigenergy(measure_return=probe)
+        result = await svc._maybe_run_pv_probe(self._state(pv_kw=8.0), "tick-1")
+        assert result is probe
+        svc._sigenergy.measure_uncapped_pv.assert_awaited_once_with(
+            export_cap_kw=5.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_passes_none_export_cap_on_first_tick(self) -> None:
+        """No `_last_export_limit_kw` yet → probe still runs but
+        saturation check has no export term to compare against."""
+        from optimiser.types import PVProbeResult
+
+        probe = PVProbeResult(
+            pv_kw=6.0, saturated=False,
+            bat_kw=5.5, bat_avail_kw=13.0,
+            grid_export_kw=0.0, export_cap_kw=None,
+            house_kw=0.1, soc_pct=40.0,
+        )
+        svc = self._service_with_sigenergy(measure_return=probe, last_export_kw=None)
+        result = await svc._maybe_run_pv_probe(self._state(pv_kw=6.0), "tick-1")
+        assert result is probe
+        svc._sigenergy.measure_uncapped_pv.assert_awaited_once_with(
+            export_cap_kw=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_uncap_write_failure(self) -> None:
+        """Hard probe failure → None propagates (caller falls back to
+        Solcast for slot-0 PV; dispatch's own fallback handles the
+        register state)."""
+        svc = self._service_with_sigenergy(measure_return=None)
+        # PV high enough to gate IN, but measure returns None
+        result = await svc._maybe_run_pv_probe(self._state(pv_kw=5.0), "tick-1")
+        assert result is None
+        svc._sigenergy.measure_uncapped_pv.assert_awaited_once()

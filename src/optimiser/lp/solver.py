@@ -82,6 +82,7 @@ def solve_stochastic(
     timeout_s: float = SOLVER_TIMEOUT_S,
     wear_cost_per_kwh: float | None = None,
     price_scenario_mode=None,  # type: ignore[no-untyped-def]
+    slot_0_pv_override_kw: float | None = None,
 ) -> LPSolution:
     """Build and solve the stochastic LP across compound (PV × price)
     scenarios.
@@ -112,6 +113,7 @@ def solve_stochastic(
             scenario_weights=scenario_weights,
             wear_cost_per_kwh=wear,
             price_scenario_mode=price_scenario_mode,
+            slot_0_pv_override_kw=slot_0_pv_override_kw,
         )
     except Exception as exc:
         logger.exception("Stochastic LP build failed")

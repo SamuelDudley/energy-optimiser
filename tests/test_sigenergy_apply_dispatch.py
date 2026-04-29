@@ -453,6 +453,278 @@ class TestMode2Adaptive:
         assert rec.calls[1][:2] == ("u16", REG_REMOTE_EMS_CONTROL_MODE)
 
 
+class TestMeasureUncappedPV:
+    """Pre-LP "uncap and measure" probe extracted from
+    `_apply_mode2_adaptive_charge`. The probe is the building block for
+    feeding true-MPP slot-0 PV into the LP, displacing the conservative
+    P10 forecast hedge that gimps battery_kw[0] across PV scenarios."""
+
+    @staticmethod
+    def _state(pv_kw: float, bat_kw: float, grid_kw: float, load_kw: float):
+        from datetime import UTC, datetime
+
+        from optimiser.types import SystemState
+
+        return SystemState(
+            timestamp=datetime.now(UTC),
+            soc_pct=50.0,
+            battery_power_kw=bat_kw,
+            pv_power_kw=pv_kw,
+            grid_power_kw=grid_kw,
+            house_load_kw=load_kw,
+            ems_mode=2,
+            outdoor_temp_c=None,
+            occupied=True,
+        )
+
+    async def test_writes_uncap_then_settles_then_reads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Probe writes 40032=max + mode 2, sleeps, then reads."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        sleep_calls: list[float] = []
+
+        async def _sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        async def _read_state():
+            return self._state(pv_kw=8.0, bat_kw=7.5, grid_kw=-0.4, load_kw=0.1)
+
+        async def _read_u32(_addr: int, gain: float = 1.0) -> float:
+            return 13.0  # BMS-available, well above measured 7.5
+
+        monkeypatch.setattr("asyncio.sleep", _sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+        monkeypatch.setattr(ctrl, "_read_input_u32", _read_u32)
+
+        result = await ctrl.measure_uncapped_pv(export_cap_kw=5.0)
+
+        # Two writes: 40032=max, mode=2.
+        assert rec.calls[0][:2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT)
+        assert rec.calls[0][2] == int(round(ctrl._battery.max_dc_charge_kw * 1000))
+        assert rec.calls[1] == (
+            "u16",
+            REG_REMOTE_EMS_CONTROL_MODE,
+            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
+        )
+        # Settled before reading.
+        assert len(sleep_calls) == 1 and sleep_calls[0] > 0
+        # Result reflects the read.
+        assert result.pv_kw == 8.0
+        assert result.bat_kw == 7.5
+        assert result.grid_export_kw == 0.4
+        assert result.bat_avail_kw == 13.0
+        assert result.export_cap_kw == 5.0
+        # Cascade had ample slack: bat 7.5 << bat_avail 13, export 0.4 << cap 5.
+        assert result.saturated is False
+
+    async def test_reports_saturated_when_both_caps_bind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Saturation requires BOTH battery acceptance AND export at cap.
+        Measurement is then a lower bound on true PV — caller should fall
+        back to forecast for the LP override."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _sleep(_s: float) -> None:
+            return None
+
+        async def _read_state():
+            # Battery 5.0 == bat_avail (capped); grid −5.0 → export 5.0 == cap.
+            return self._state(pv_kw=10.5, bat_kw=5.0, grid_kw=-5.0, load_kw=0.5)
+
+        async def _read_u32(_addr: int, gain: float = 1.0) -> float:
+            return 5.0  # battery acceptance limited (e.g. high SOC taper)
+
+        monkeypatch.setattr("asyncio.sleep", _sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+        monkeypatch.setattr(ctrl, "_read_input_u32", _read_u32)
+
+        result = await ctrl.measure_uncapped_pv(export_cap_kw=5.0)
+
+        assert result.saturated is True
+        assert result.pv_kw == 10.5  # the *minimum* of true MPP
+
+    async def test_unsaturated_when_only_export_at_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Battery still has acceptance headroom → cascade has slack →
+        measurement is true MPP."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _sleep(_s: float) -> None:
+            return None
+
+        async def _read_state():
+            # Export at cap (5), battery 6 < bat_avail 13.
+            return self._state(pv_kw=11.0, bat_kw=6.0, grid_kw=-5.0, load_kw=0.0)
+
+        async def _read_u32(_addr: int, gain: float = 1.0) -> float:
+            return 13.0
+
+        monkeypatch.setattr("asyncio.sleep", _sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+        monkeypatch.setattr(ctrl, "_read_input_u32", _read_u32)
+
+        result = await ctrl.measure_uncapped_pv(export_cap_kw=5.0)
+
+        assert result.saturated is False
+        assert result.pv_kw == 11.0
+
+    async def test_telemetry_failure_returns_pv_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Modbus blip during settle → caller falls back to Solcast."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _sleep(_s: float) -> None:
+            return None
+
+        async def _read_state():
+            return None
+
+        async def _read_u32(_addr: int, gain: float = 1.0) -> float:
+            return None  # type: ignore[return-value]
+
+        monkeypatch.setattr("asyncio.sleep", _sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+        monkeypatch.setattr(ctrl, "_read_input_u32", _read_u32)
+
+        result = await ctrl.measure_uncapped_pv(export_cap_kw=5.0)
+
+        assert result.pv_kw is None
+        assert result.saturated is False  # never asserted
+
+    async def test_uncap_write_failure_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failed 40032 write → returns None (hard failure, distinct
+        from telemetry-blind which returns PVProbeResult(pv_kw=None)).
+        Caller MUST treat as abort and trigger fallback."""
+        ctrl = _controller()
+        rec = _WriteRecorder(u32_returns={REG_ESS_MAX_CHARGING_LIMIT: False})
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        sleep_calls: list[float] = []
+
+        async def _sleep(s: float) -> None:
+            sleep_calls.append(s)
+
+        monkeypatch.setattr("asyncio.sleep", _sleep)
+
+        result = await ctrl.measure_uncapped_pv(export_cap_kw=5.0)
+
+        assert result is None
+        assert sleep_calls == []  # bailed before settle
+
+
+class TestApplyDispatchPrefetched:
+    """Prefetched probe path: when the service has already done the
+    Phase-A sleep before the LP solve, `apply_lp_dispatch` reuses the
+    measurement and skips the redundant 5 s wait. Saves ~5 s/tick."""
+
+    @staticmethod
+    def _state_for(pv_kw: float, load_kw: float):
+        from datetime import UTC, datetime
+
+        from optimiser.types import SystemState
+
+        return SystemState(
+            timestamp=datetime.now(UTC),
+            soc_pct=50.0,
+            battery_power_kw=0.0,
+            pv_power_kw=pv_kw,
+            grid_power_kw=-(pv_kw - load_kw),
+            house_load_kw=load_kw,
+            ems_mode=2,
+            outdoor_temp_c=None,
+            occupied=True,
+        )
+
+    async def test_prefetched_skips_phase_a_sleep_and_reads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from optimiser.types import PVProbeResult
+
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        sleep_calls: list[float] = []
+        read_state_calls: list[None] = []
+
+        async def _sleep(s: float) -> None:
+            sleep_calls.append(s)
+
+        async def _read_state():
+            read_state_calls.append(None)
+            return self._state_for(pv_kw=9.0, load_kw=0.5)
+
+        monkeypatch.setattr("asyncio.sleep", _sleep)
+        monkeypatch.setattr(ctrl, "read_state", _read_state)
+
+        prefetched = PVProbeResult(
+            pv_kw=9.0, saturated=False,
+            bat_kw=8.5, bat_avail_kw=13.0,
+            grid_export_kw=0.0, export_cap_kw=5.0,
+            house_kw=0.5, soc_pct=50.0,
+        )
+        assert await ctrl.apply_lp_dispatch(
+            _mode2_charge_dispatch(signed_intent_kw=1.0),
+            export_cap_kw=5.0,
+            prefetched_probe=prefetched,
+        )
+
+        # Skipped Phase-A entirely: only 1 register write (the trim).
+        # No sleep, no extra read.
+        assert sleep_calls == []
+        assert read_state_calls == []
+        assert len(rec.calls) == 1
+        # pv 9 - export 5 - headroom 0.5 = 3.5 kW → 3500 raw
+        assert rec.calls[0] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 3500)
+
+    async def test_prefetched_blind_emits_blind_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the probe was telemetry-blind upstream, the dispatch
+        accepts the None and behaves like Phase-A blindfailed: leaves
+        40032=max in force without a trim write."""
+        from optimiser.types import PVProbeResult
+
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        async def _sleep(_s: float) -> None:
+            return None
+
+        monkeypatch.setattr("asyncio.sleep", _sleep)
+
+        blind = PVProbeResult(
+            pv_kw=None, saturated=False,
+            bat_kw=None, bat_avail_kw=None,
+            grid_export_kw=None, export_cap_kw=5.0,
+            house_kw=None, soc_pct=None,
+        )
+        assert await ctrl.apply_lp_dispatch(
+            _mode2_charge_dispatch(signed_intent_kw=1.0),
+            export_cap_kw=5.0,
+            prefetched_probe=blind,
+        )
+
+        # No trim write — leaves Phase-A state in force.
+        assert rec.calls == []
+
+
 class TestAssertSOCLimits:
     """§4.2: split between startup (all three limits) and periodic
     re-assertion (discharge-side only, skipping 40047 so it doesn't

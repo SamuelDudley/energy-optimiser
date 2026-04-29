@@ -275,6 +275,152 @@ class TestNonAnticipativity:
 # ── Behavioural properties ──────────────────────────────────────
 
 
+class TestSlot0PVOverride:
+    """When a Phase-A "uncap and measure" probe ran successfully and
+    produced a true-MPP slot-0 PV reading, the LP should consume that
+    value across every PV scenario at slot 0 — collapsing the
+    non-anticipativity hedge against P10 forecast that otherwise gimps
+    battery_kw[0] when actual PV >> P10."""
+
+    def test_override_replaces_pv_avail_at_slot_0_in_all_scenarios(self) -> None:
+        # Forecast: P10=2, P50=5, P90=8. Override to 9 — above P90.
+        prob, svars = build_stochastic_lp(
+            state=_state(soc=30.0),
+            prices_planning=_flat_prices(),
+            pv_forecast=_pv_forecast(p50_kw=5.0, p10_kw=2.0, p90_kw=8.0),
+            load_profile=_flat_profile(kw=0.5),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            slot_0_pv_override_kw=9.0,
+        )
+        prob.solve(_solver(30.0))
+        assert pulp.LpStatus[prob.status] == "Optimal"
+
+        # All scenarios must satisfy: pv_to_house[0] + pv_to_battery[0]
+        # + pv_to_export[0] + pv_curtailed[0] == 9.0 (the override).
+        for name, vars in svars.scenarios.items():
+            total_pv = (
+                (vars.pv_to_house[0].value() or 0.0)
+                + (vars.pv_to_battery[0].value() or 0.0)
+                + (vars.pv_to_export[0].value() or 0.0)
+                + (vars.pv_curtailed[0].value() or 0.0)
+            )
+            assert total_pv == pytest.approx(9.0, abs=0.01), (
+                f"scenario {name} slot-0 total PV {total_pv:.3f} != 9.0 override"
+            )
+
+    def test_override_does_not_affect_slot_1(self) -> None:
+        """Slots 1+ keep the per-scenario forecast — uncertainty about
+        the future remains, only the present is observed."""
+        prob, svars = build_stochastic_lp(
+            state=_state(soc=30.0),
+            prices_planning=_flat_prices(),
+            pv_forecast=_pv_forecast(p50_kw=5.0, p10_kw=2.0, p90_kw=8.0),
+            load_profile=_flat_profile(kw=0.5),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            slot_0_pv_override_kw=9.0,
+        )
+        prob.solve(_solver(30.0))
+
+        # P10 scenario at slot 1: total PV must equal P10 forecast (2.0).
+        p10 = svars.pv_scenario("p10")
+        slot1_p10 = (
+            (p10.pv_to_house[1].value() or 0.0)
+            + (p10.pv_to_battery[1].value() or 0.0)
+            + (p10.pv_to_export[1].value() or 0.0)
+            + (p10.pv_curtailed[1].value() or 0.0)
+        )
+        assert slot1_p10 == pytest.approx(2.0, abs=0.01)
+
+        # P90 scenario at slot 1: total PV must equal P90 forecast (8.0).
+        p90 = svars.pv_scenario("p90")
+        slot1_p90 = (
+            (p90.pv_to_house[1].value() or 0.0)
+            + (p90.pv_to_battery[1].value() or 0.0)
+            + (p90.pv_to_export[1].value() or 0.0)
+            + (p90.pv_curtailed[1].value() or 0.0)
+        )
+        assert slot1_p90 == pytest.approx(8.0, abs=0.01)
+
+    def test_override_unblocks_slot_0_battery_when_actual_above_p10(self) -> None:
+        """Without override, slot-0 battery_kw is gimped to P10 surplus
+        via non-anticipativity. With override at the actual measurement,
+        slot-0 battery can charge at the true surplus."""
+        # Without override: P10 forecast is the binding constraint.
+        prob_no, svars_no = build_stochastic_lp(
+            state=_state(soc=30.0),
+            prices_planning=_flat_prices(import_c=20.0, export_c=1.0),
+            pv_forecast=_pv_forecast(p50_kw=7.0, p10_kw=3.0, p90_kw=9.0),
+            load_profile=_flat_profile(kw=0.5),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+        )
+        prob_no.solve(_solver(30.0))
+        bat_no = (
+            (svars_no.base.bat_charge_pv[0].value() or 0.0)
+            + (svars_no.base.bat_charge_grid[0].value() or 0.0)
+            - (svars_no.base.bat_discharge[0].value() or 0.0)
+        )
+
+        # With override at 9.0 (we observed P90-equivalent PV).
+        prob_ov, svars_ov = build_stochastic_lp(
+            state=_state(soc=30.0),
+            prices_planning=_flat_prices(import_c=20.0, export_c=1.0),
+            pv_forecast=_pv_forecast(p50_kw=7.0, p10_kw=3.0, p90_kw=9.0),
+            load_profile=_flat_profile(kw=0.5),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            slot_0_pv_override_kw=9.0,
+        )
+        prob_ov.solve(_solver(30.0))
+        bat_ov = (
+            (svars_ov.base.bat_charge_pv[0].value() or 0.0)
+            + (svars_ov.base.bat_charge_grid[0].value() or 0.0)
+            - (svars_ov.base.bat_discharge[0].value() or 0.0)
+        )
+
+        # Override should let the LP charge harder at slot 0 (the
+        # whole point — observed PV > P10 means more headroom for
+        # battery charge under non-anticipativity).
+        assert bat_ov > bat_no + 0.5, (
+            f"override didn't unblock slot-0 battery: "
+            f"no_override={bat_no:.2f}, override={bat_ov:.2f}"
+        )
+
+    def test_negative_override_clamped_to_zero(self) -> None:
+        """Defensive: negative override (bad telemetry) clamps to 0
+        rather than producing a nonsense LP."""
+        prob, svars = build_stochastic_lp(
+            state=_state(soc=30.0),
+            prices_planning=_flat_prices(),
+            pv_forecast=_pv_forecast(p50_kw=5.0, p10_kw=2.0, p90_kw=8.0),
+            load_profile=_flat_profile(kw=0.5),
+            managed_loads=[],
+            lp_loads=[],
+            battery_config=BatteryConfig(),
+            slot_0_pv_override_kw=-1.0,
+        )
+        prob.solve(_solver(30.0))
+        assert pulp.LpStatus[prob.status] == "Optimal"
+
+        # All scenarios slot-0 PV totals to exactly 0.
+        for name, vars in svars.scenarios.items():
+            total = (
+                (vars.pv_to_house[0].value() or 0.0)
+                + (vars.pv_to_battery[0].value() or 0.0)
+                + (vars.pv_to_export[0].value() or 0.0)
+                + (vars.pv_curtailed[0].value() or 0.0)
+            )
+            assert total == pytest.approx(0.0, abs=0.01), (
+                f"scenario {name} slot-0 PV {total:.3f} != 0 (clamped)"
+            )
+
+
 class TestStochasticBehaviour:
     def test_pessimistic_weights_reduce_pv_reliance(self) -> None:
         """Heavily P10-weighted solve should plan less aggressive

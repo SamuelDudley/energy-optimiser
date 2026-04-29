@@ -200,6 +200,7 @@ def build_stochastic_lp(
     horizon_hours: int = HORIZON_HOURS,
     slot_minutes: int = SLOT_MINUTES,
     price_scenario_mode: PriceScenarioMode | None = None,
+    slot_0_pv_override_kw: float | None = None,
 ) -> tuple[pulp.LpProblem, StochasticLPVars]:
     """Build a two-stage stochastic LP across compound (PV × price) scenarios.
 
@@ -233,6 +234,16 @@ def build_stochastic_lp(
     compound: under default weights that's `p50__point` in POINT mode,
     `p50__shared_predicted` in SHARED, `p50__i_predicted_e_predicted`
     in CROSS.
+
+    ``slot_0_pv_override_kw``: when set, replaces ``pv_avail[0]`` in
+    every PV scenario with this value. Slots 1+ keep the per-percentile
+    Solcast estimate. Used by the service when a "Phase-A uncap and
+    measure" PV probe ran successfully and unsaturated before the
+    solve, displacing the conservative P10 forecast at slot-0 with the
+    measured ground truth. The non-anticipativity hedge that ties
+    ``battery_kw[0]`` across PV scenarios then doesn't gimp slot-0 to
+    the worst-case forecast — all scenarios see the same observed PV.
+    None preserves the legacy per-scenario forecast behaviour.
     """
     weights = scenario_weights or dict(DEFAULT_SCENARIO_WEIGHTS)
     if not weights:
@@ -276,6 +287,7 @@ def build_stochastic_lp(
                 battery_config=battery_config,
                 wear_cost_per_kwh=wear_cost_per_kwh,
                 price_scenario=price_scenario,
+                slot_0_pv_override_kw=slot_0_pv_override_kw,
             )
             scenarios[compound_name] = vars
             all_cost_terms.extend(cost_terms)
@@ -330,6 +342,7 @@ def _add_scenario_to_problem(
     battery_config: BatteryConfig,
     wear_cost_per_kwh: float,
     price_scenario: PriceScenario,
+    slot_0_pv_override_kw: float | None = None,
 ) -> tuple[LPVars, list[pulp.LpAffineExpression]]:
     """Add one scenario's variables, constraints, and weighted cost terms
     to the problem. Returns the LPVars and the list of cost terms (already
@@ -347,6 +360,14 @@ def _add_scenario_to_problem(
 
     # PV availability per slot for this scenario's percentile
     pv_avail = [_pv_estimate_at(pv_forecast, slots[t], pv_percentile) for t in range(n)]
+    # Slot-0 override: replace forecast PV with a measured value (e.g.
+    # from a pre-LP "uncap and measure" probe). Applied identically to
+    # every PV scenario — the whole point is that we *observed* slot-0
+    # PV, so non-anticipativity has no forecast uncertainty to hedge
+    # against. Slots 1+ keep the per-percentile Solcast estimate
+    # because the future remains uncertain.
+    if slot_0_pv_override_kw is not None and n > 0:
+        pv_avail[0] = max(0.0, slot_0_pv_override_kw)
 
     # ── Battery flow variables ───────────────────────────────────
     bat_charge_grid = [

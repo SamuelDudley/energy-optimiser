@@ -43,6 +43,7 @@ from .types import (
     LoadTelemetryRow,
     PriceInterval,
     PVForecast,
+    PVProbeResult,
     SystemState,
     TelemetryRow,
     TickSnapshot,
@@ -61,6 +62,15 @@ _VERSION = "0.2.0"
 # while blind". 15 min is ~3 missed Amber update cycles, well beyond any
 # transient 429 cool-down (≤300s observed in production).
 EXPORT_PRICE_STALE_THRESHOLD = timedelta(minutes=15)
+
+# Pre-LP "uncap and measure" PV probe gate. The probe writes
+# 40032=max + mode 2, sleeps 5 s for cascade settle, then reads true MPP.
+# Below this threshold the probe is uninformative (no surplus to discover)
+# and we save the 5 s plus the briefly-forced charge-then-overwrite if
+# the LP picks discharge. PV_power_kw at the pre-probe `read_state` call
+# is used for the gate check; it may be curtailed but it's a reliable
+# floor on actual PV.
+PV_PROBE_MIN_KW = 0.5
 
 
 class Service:
@@ -392,6 +402,11 @@ class Service:
         breaker = self._lp_runtime.breaker
         is_probe = breaker.can_probe(now)
 
+        # Will be populated by the PV probe and consumed by both the LP
+        # (as slot-0 override) and the dispatch (as prefetched Phase-A).
+        pv_probe: PVProbeResult | None = None
+        pv_probe_lp_override_kw: float | None = None
+
         if not self._state_machine.should_run_planner:
             output = fallback_planner_output("planner disabled in current state")
             lp_solution = None
@@ -416,12 +431,30 @@ class Service:
                     tick_id=tick_id,
                 )
 
+            # Pre-LP "uncap and measure" PV probe. Replaces the Solcast
+            # P10 forecast at slot 0 with measured truth so the LP's
+            # non-anticipativity hedge doesn't gimp slot-0 battery rate
+            # against a forecast scenario the present moment already
+            # contradicts. Runs only when PV is meaningfully present
+            # (gates out at night, deep cloud, dusk) and the measurement
+            # is reliable (cascade had slack — battery and export were
+            # below their respective caps). On any failure / saturation
+            # we fall back silently to the per-scenario forecast.
+            pv_probe = await self._maybe_run_pv_probe(state, tick_id)
+            if (
+                pv_probe is not None
+                and pv_probe.pv_kw is not None
+                and not pv_probe.saturated
+            ):
+                pv_probe_lp_override_kw = pv_probe.pv_kw
+
             lp_solution, lp_dispatch = await self._run_lp(
                 state=state,
                 prices_planning=prices_planning,
                 pv_forecast=pv_forecast,
                 load_profile=load_profile,
                 managed_loads=load_statuses,
+                slot_0_pv_override_kw=pv_probe_lp_override_kw,
             )
             if lp_solution is not None and lp_dispatch is not None:
                 output = lp_solution_to_planner_output(lp_solution, lp_dispatch)
@@ -455,6 +488,13 @@ class Service:
             apply_ok = await self._sigenergy.apply_lp_dispatch(
                 lp_dispatch,
                 export_cap_kw=export_limit_kw or 0.0,
+                # Reuse the pre-LP probe so the dispatch's mode-2 path
+                # doesn't pay the Phase-A 5 s sleep again. Skipped
+                # automatically on non-mode-2 dispatch paths (cap
+                # registers get overwritten anyway). None when the
+                # probe was gated out — dispatch falls back to its
+                # built-in Phase-A.
+                prefetched_probe=pv_probe,
             )
             self._metrics.record_dispatch_write(apply_ok)
             if apply_ok:
@@ -658,6 +698,8 @@ class Service:
                 lp_solution=lp_solution,
                 lp_dispatch=lp_dispatch,
                 system_state_post_dispatch=state_post_dispatch,
+                pv_probe=pv_probe,
+                pv_avail_slot_0_used_kw=pv_probe_lp_override_kw,
             )
             self._snapshots.write(snapshot)
             self._last_snapshot = snapshot
@@ -806,6 +848,13 @@ class Service:
         files. Used by /snapshots to build the DuckDB read_json glob."""
         return Path(self._config.storage.snapshot_dir)
 
+    @property
+    def battery_config(self):
+        """Battery config (SOC floor/ceiling, charge/discharge caps).
+        Exposed for /dashboard/config so the SOC panel draws the floor
+        line at the actually-configured value."""
+        return self._config.battery
+
     def _attach_log_handlers(self) -> None:
         """Attach the ring buffer and (if configured) a rotating file
         handler to the root logger.
@@ -866,6 +915,72 @@ class Service:
 
     # ── LP Execution ─────────────────────────────────────────────
 
+    async def _maybe_run_pv_probe(
+        self, state: SystemState, tick_id: str
+    ) -> PVProbeResult | None:
+        """Run a Phase-A "uncap and measure" PV probe with gating.
+
+        Skips when:
+          - PV at the pre-tick read is below ``PV_PROBE_MIN_KW`` (night,
+            deep cloud — no signal to recover).
+          - Last applied export cap is unknown (haven't dispatched yet
+            this session — saturation check would be missing the export
+            term and would falsely report unsaturated).
+
+        Otherwise writes 40032=max + mode 2, sleeps for the cascade
+        settle time, reads true MPP plus battery acceptance and
+        export, and returns a ``PVProbeResult``. The dispatch path
+        downstream consumes the same probe so the redundant Phase-A
+        sleep is paid only once per tick.
+
+        Failures (Modbus blip, telemetry blind during settle) return a
+        result with ``pv_kw=None``; the caller falls back to the
+        per-scenario forecast at the LP and to the in-dispatch Phase-A
+        retry inside ``_apply_mode2_adaptive_charge``.
+        """
+        if state.pv_power_kw is None or state.pv_power_kw < PV_PROBE_MIN_KW:
+            return None
+        # Saturation check needs export_cap_kw. Fall back to None when
+        # we haven't applied a cap yet this session (first tick after
+        # boot before any dispatch); the probe still runs but
+        # `saturated` is reported as False (no cap = no saturation
+        # signal) and the override path treats that as "trust the
+        # measurement".
+        export_cap_kw = self._last_export_limit_kw
+
+        probe = await self._sigenergy.measure_uncapped_pv(
+            export_cap_kw=export_cap_kw,
+        )
+        if probe is None:
+            # Hard write failure — the inverter's register state is
+            # unknown. Logged for visibility; downstream fallback path
+            # in `apply_lp_dispatch` will overwrite cap+mode anyway.
+            emit(
+                EventType.MODE2_TRIM_BLIND,
+                {
+                    "phase": "pre_lp_probe",
+                    "reason": "uncap_write_failed",
+                },
+                tick_id=tick_id,
+            )
+            return None
+        emit(
+            EventType.MODE2_TRIM,
+            {
+                "phase": "pre_lp_probe",
+                "pv_kw": probe.pv_kw,
+                "saturated": probe.saturated,
+                "bat_kw": probe.bat_kw,
+                "bat_avail_kw": probe.bat_avail_kw,
+                "grid_export_kw": probe.grid_export_kw,
+                "export_cap_kw": probe.export_cap_kw,
+                "house_kw": probe.house_kw,
+                "soc_pct": probe.soc_pct,
+            },
+            tick_id=tick_id,
+        )
+        return probe
+
     async def _run_lp(
         self,
         *,
@@ -874,6 +989,7 @@ class Service:
         pv_forecast,
         load_profile,
         managed_loads,
+        slot_0_pv_override_kw: float | None = None,
     ):
         """Run the stochastic LP with a wall-clock timeout, returning
         `(solution, dispatch)` on success or `(None, None)` after fallback.
@@ -912,6 +1028,7 @@ class Service:
                     battery_config=self._config.battery,
                     scenario_weights=self._config.planner.lp_scenario_weights,
                     price_scenario_mode=price_scenario_mode,
+                    slot_0_pv_override_kw=slot_0_pv_override_kw,
                 ),
                 timeout=self._config.planner.lp_wall_clock_timeout_s,
             )

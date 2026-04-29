@@ -17,6 +17,7 @@ from ..logging_utils import emit
 from ..time_utils import now_utc
 from ..types import (
     EventType,
+    PVProbeResult,
     RemoteEMSControlMode,
     SystemState,
 )
@@ -943,13 +944,25 @@ class SigenergyController:
     # bat=-0.02 kW; cutoff held at 950 across 256s of unrelated writes).
 
     async def apply_lp_dispatch(
-        self, dispatch: LPDispatch, *, export_cap_kw: float = 0.0
+        self,
+        dispatch: LPDispatch,
+        *,
+        export_cap_kw: float = 0.0,
+        prefetched_probe: PVProbeResult | None = None,
     ) -> bool:
         """Apply the LP's slot-0 decision via mode + cap registers.
 
         `export_cap_kw` is the resolved DNSP export cap currently in force
         (caller is responsible for writing 40038 BEFORE this call so the
         Phase-A surplus measurement reflects the real export window).
+
+        ``prefetched_probe`` is the result of an earlier-in-tick PV probe
+        (option 2 plumbing). When provided AND the dispatch resolves to
+        a mode-2 path, the redundant Phase-A measurement is skipped —
+        the caller has already done it. Required precondition: the
+        caller has not rewritten 40032 or 40031 since the probe ran.
+        Non-mode-2 dispatch paths ignore the prefetch (cap registers
+        will be overwritten anyway).
 
         **Write order: cap first, then mode.** If any write fails partway,
         the inverter must never be in (new mode, stale cap). Cap-first
@@ -977,7 +990,9 @@ class SigenergyController:
         # over the export cap — soaking the rest into the battery.
         if mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION:
             return await self._apply_mode2_adaptive_charge(
-                dispatch, export_cap_kw=export_cap_kw
+                dispatch,
+                export_cap_kw=export_cap_kw,
+                prefetched_probe=prefetched_probe,
             )
 
         if mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST:
@@ -1007,8 +1022,110 @@ class SigenergyController:
         )
         return True
 
+    async def measure_uncapped_pv(
+        self,
+        *,
+        settle_seconds: float = MODE2_PROBE_SECONDS,
+        export_cap_kw: float | None = None,
+    ) -> PVProbeResult | None:
+        """Phase-A "uncap and measure" PV probe.
+
+        Writes 40032 = max_dc_charge_kw + mode = 2 to make the cascade
+        absorb all available PV into the battery, sleeps for
+        ``settle_seconds`` (cascade + MPPT need ~3 s to converge), then
+        reads telemetry. Leaves 40032=max + mode 2 in force on return —
+        the caller is expected to issue the next write (Phase-B trim or
+        a fresh dispatch) immediately.
+
+        Returns:
+
+        - ``None`` when the uncap write to 40032 or the mode write to
+          40031 failed. The inverter is in an unknown register state —
+          the caller MUST treat this as a hard failure (abort dispatch,
+          trigger fallback). Distinct from the telemetry-blind case
+          below.
+        - ``PVProbeResult(pv_kw=None, ...)`` when the writes succeeded
+          but the post-settle ``read_state`` returned None (Modbus
+          blip). The cascade is in a known-safe "uncapped" state —
+          caller can leave it in force or overwrite. Equivalent to the
+          legacy "telemetry blind during Phase A" branch.
+        - ``PVProbeResult(pv_kw=X, ...)`` on a clean measurement.
+          ``saturated=True`` means the cascade had no slack (battery
+          at BMS acceptance AND export at cap), so measured_pv is only
+          a lower bound on true MPP — the LP override path should fall
+          back to forecast in that case.
+
+        ``export_cap_kw`` is the cap the caller has currently written
+        to 40038. It's used for the saturation check (we compare
+        measured export against it). The probe does not modify 40038
+        — keeping the operator's DNSP envelope intact during the 5 s
+        window.
+
+        Validity: if either battery or export had slack, ``pv_kw`` is
+        the unthrottled MPP, accurate to inverter telemetry precision
+        (~0.05 kW). When both are saturated, the cascade refused part
+        of the available PV and MPPT throttled. In that mode the
+        measurement is only useful as a lower bound, which is the
+        ``saturated=True`` case.
+        """
+        max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
+        if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw):
+            return None
+        if not await self._write_u16(
+            REG_REMOTE_EMS_CONTROL_MODE,
+            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
+        ):
+            return None
+
+        await asyncio.sleep(settle_seconds)
+
+        state = await self.read_state()
+        bat_avail_kw = await self._read_input_u32(
+            REG_ESS_AVAIL_MAX_CHARGING_POWER, gain=1000
+        )
+        if state is None or state.pv_power_kw is None:
+            return PVProbeResult(
+                pv_kw=None, saturated=False,
+                bat_kw=None, bat_avail_kw=bat_avail_kw,
+                grid_export_kw=None, export_cap_kw=export_cap_kw,
+                house_kw=None, soc_pct=None,
+            )
+
+        pv_kw = max(0.0, state.pv_power_kw)
+        bat_kw = state.battery_power_kw or 0.0
+        # `grid_power_kw` follows the convention: + = import, − = export.
+        grid_export_kw = max(0.0, -(state.grid_power_kw or 0.0))
+
+        # Saturation check: cascade had no slack iff BOTH sinks at cap.
+        # Tolerance covers BMS hunting / sub-second noise (~0.3 kW).
+        cap_tolerance_kw = 0.3
+        bat_at_cap = (
+            bat_avail_kw is not None
+            and bat_kw >= bat_avail_kw - cap_tolerance_kw
+        )
+        export_at_cap = (
+            export_cap_kw is not None
+            and grid_export_kw >= export_cap_kw - cap_tolerance_kw
+        )
+        saturated = bat_at_cap and export_at_cap
+
+        return PVProbeResult(
+            pv_kw=pv_kw,
+            saturated=saturated,
+            bat_kw=bat_kw,
+            bat_avail_kw=bat_avail_kw,
+            grid_export_kw=grid_export_kw,
+            export_cap_kw=export_cap_kw,
+            house_kw=state.house_load_kw,
+            soc_pct=state.soc_pct,
+        )
+
     async def _apply_mode2_adaptive_charge(
-        self, dispatch: LPDispatch, *, export_cap_kw: float
+        self,
+        dispatch: LPDispatch,
+        *,
+        export_cap_kw: float,
+        prefetched_probe: PVProbeResult | None = None,
     ) -> bool:
         """Two-phase mode-2 dispatch — covers both CHARGE and SELF_CONSUME.
 
@@ -1024,6 +1141,14 @@ class SigenergyController:
         Write 40032 = trim_kw. The mode-2 cascade then splits available
         PV: house at priority 1 (sub-second), battery up to `trim_kw`,
         export up to the DNSP cap, curtail anything left.
+
+        ``prefetched_probe`` is the Phase-A measurement from the pre-LP
+        PV probe (option 2 plumbing). When provided, this method skips
+        its own Phase-A — it's already happened — and goes straight to
+        Phase-B trim. Saves ~5 s per mode-2 tick. The caller must have
+        left 40032=max + mode 2 in force at the time of measurement and
+        not rewritten them since. When ``None`` the original two-phase
+        sequence runs.
 
         Why **PV alone** in the trim, not `pv − house`: the cascade
         already serves house at priority 1 from PV. Including house in
@@ -1052,21 +1177,26 @@ class SigenergyController:
 
         See SPEC-ENERGY-01.md §5.4, probe_two_phase.py, probe_no_cutoff.py.
         """
-        max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
-        if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw):
-            return False
-        if not await self._write_u16(
-            REG_REMOTE_EMS_CONTROL_MODE,
-            RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
-        ):
-            return False
-
-        await asyncio.sleep(MODE2_PROBE_SECONDS)
-
-        state = await self.read_state()
         kind_name = dispatch.kind.name if dispatch.kind is not None else "?"
         lp_rate = abs(dispatch.signed_intent_kw) if dispatch.signed_intent_kw else 0.0
-        if state is None or state.pv_power_kw is None:
+
+        if prefetched_probe is None:
+            probe = await self.measure_uncapped_pv(
+                settle_seconds=MODE2_PROBE_SECONDS,
+                export_cap_kw=export_cap_kw,
+            )
+            if probe is None:
+                # Hard write failure inside the probe — same semantics
+                # as a failed cap-or-mode write in the legacy inline
+                # Phase A. Caller's fallback path handles it.
+                return False
+        else:
+            # Pre-LP probe already ran; 40032=max + mode 2 are still in
+            # force from that step. Reuse the measurement directly.
+            # `prefetched_probe` is non-None here by the contract above.
+            probe = prefetched_probe
+
+        if probe.pv_kw is None:
             # Telemetry blind — leave Phase-A state in force (uncapped
             # charge). All PV soaks into battery for the rest of the slot,
             # which matches the "soak first" intent. Log AND emit so this
@@ -1082,11 +1212,12 @@ class SigenergyController:
                     "kind": kind_name,
                     "lp_rate_kw": lp_rate,
                     "export_cap_kw": export_cap_kw,
+                    "prefetched": prefetched_probe is not None,
                 },
             )
             return True
-        pv_a = max(0.0, state.pv_power_kw)
 
+        pv_a = probe.pv_kw
         trim_kw = max(
             lp_rate,
             max(0.0, pv_a - export_cap_kw) - MODE2_TRIM_FLOOR_HEADROOM_KW,
@@ -1107,14 +1238,15 @@ class SigenergyController:
             {
                 "kind": kind_name,
                 "phase_a_pv_kw": pv_a,
-                "phase_a_house_kw": state.house_load_kw,
-                "phase_a_grid_kw": state.grid_power_kw,
-                "phase_a_battery_kw": state.battery_power_kw,
-                "phase_a_soc_pct": state.soc_pct,
+                "phase_a_house_kw": probe.house_kw,
+                "phase_a_battery_kw": probe.bat_kw,
+                "phase_a_soc_pct": probe.soc_pct,
+                "phase_a_saturated": probe.saturated,
                 "lp_rate_kw": lp_rate,
                 "export_cap_kw": export_cap_kw,
                 "headroom_kw": MODE2_TRIM_FLOOR_HEADROOM_KW,
                 "trim_kw": trim_kw,
+                "prefetched": prefetched_probe is not None,
             },
         )
         return await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, trim_raw)

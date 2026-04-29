@@ -174,6 +174,27 @@ def _reconstruct_snapshot(raw: dict) -> TickSnapshot:
         reason=output_raw["reason"],
     )
 
+    # PV-probe fields are optional (introduced 2026-04-30). Old snapshots
+    # don't have them; replay falls through to forecast-only behaviour
+    # via `pv_avail_slot_0_used_kw=None`. Newer snapshots carry the value
+    # the live LP saw, so the candidate solve can reproduce it exactly
+    # — otherwise candidate would systematically beat deployed by virtue
+    # of using "future information" the deployed run didn't have.
+    pv_probe = None
+    pv_probe_raw = raw.get("pv_probe")
+    if pv_probe_raw is not None:
+        from .types import PVProbeResult  # local import to avoid cycle
+        pv_probe = PVProbeResult(
+            pv_kw=pv_probe_raw.get("pv_kw"),
+            saturated=pv_probe_raw.get("saturated", False),
+            bat_kw=pv_probe_raw.get("bat_kw"),
+            bat_avail_kw=pv_probe_raw.get("bat_avail_kw"),
+            grid_export_kw=pv_probe_raw.get("grid_export_kw"),
+            export_cap_kw=pv_probe_raw.get("export_cap_kw"),
+            house_kw=pv_probe_raw.get("house_kw"),
+            soc_pct=pv_probe_raw.get("soc_pct"),
+        )
+
     return TickSnapshot(
         tick_id=raw["tick_id"],
         timestamp=parse_iso(raw["timestamp"]),
@@ -192,6 +213,8 @@ def _reconstruct_snapshot(raw: dict) -> TickSnapshot:
         # queries against the NDJSON files directly).
         lp_solution=None,
         lp_dispatch=None,
+        pv_probe=pv_probe,
+        pv_avail_slot_0_used_kw=raw.get("pv_avail_slot_0_used_kw"),
     )
 
 
@@ -382,6 +405,12 @@ def _solve_candidate(
             lp_loads=lp_loads,
             battery_config=battery_config,
             scenario_weights=scenario_weights,
+            # Replay reproducibility: feed the live tick's slot-0 PV
+            # override (from a Phase-A probe, if it ran) into the
+            # candidate solve. Without this the candidate would see
+            # P10/P50/P90 forecast at slot-0 while the live LP saw a
+            # measured value, biasing the comparison.
+            slot_0_pv_override_kw=snap.pv_avail_slot_0_used_kw,
         )
     except Exception as exc:
         logger.warning("Candidate solve raised for %s: %s", snap.tick_id, exc)

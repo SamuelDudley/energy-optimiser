@@ -356,6 +356,35 @@ class Event:
 
 
 @dataclass(frozen=True, slots=True)
+class PVProbeResult:
+    """Output of a Phase-A "uncap and measure" PV probe.
+
+    Used to produce a true-MPP slot-0 PV reading for the LP, displacing
+    the (possibly curtailed) `system_state.pv_power_kw` and the
+    conservative P10 forecast. The probe writes 40032=max + mode 2,
+    waits for the cascade to settle, then reads.
+
+    `saturated` flags the case where measured_pv is only a *lower bound*
+    on true MPP — i.e. the cascade had no slack so MPPT may have
+    throttled. Saturation requires BOTH battery acceptance AND export to
+    be at their respective caps; if either had slack, true PV ≤
+    measured_pv_kw + telemetry noise.
+
+    `pv_kw` is None when the probe couldn't read state after settling
+    (Modbus blip during the 5-second window). Caller falls back to
+    Solcast in that case.
+    """
+    pv_kw: float | None
+    saturated: bool
+    bat_kw: float | None
+    bat_avail_kw: float | None
+    grid_export_kw: float | None
+    export_cap_kw: float | None
+    house_kw: float | None
+    soc_pct: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class TickSnapshot:
     tick_id: str
     timestamp: datetime
@@ -380,6 +409,18 @@ class TickSnapshot:
     # would otherwise show pre-dispatch state. None if the post-dispatch
     # read failed or the tick took the no-apply branch.
     system_state_post_dispatch: SystemState | None = None
+    # Phase-A "uncap and measure" probe result. Populated by the
+    # service when a probe ran this tick (gated on PV > threshold,
+    # planner enabled, etc.). None when the probe was skipped (night,
+    # degraded, recently fresh) or failed. See `service._tick_body`
+    # and `clients/sigenergy.measure_uncapped_pv`.
+    pv_probe: PVProbeResult | None = None
+    # The slot-0 PV value the LP actually consumed. Resolves the gating
+    # logic in one place: when the probe is fresh and unsaturated, this
+    # is `pv_probe.pv_kw`; when saturated or absent, this is None
+    # (LP fell back to Solcast). Replay reads this to reproduce the
+    # exact LP input the live tick saw.
+    pv_avail_slot_0_used_kw: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
