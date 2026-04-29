@@ -27,6 +27,15 @@ class AmberConfig:
     # Amber publishes up to ~79 30-min intervals (~40h); 96 is a small
     # over-ask that captures all of it. Anything higher is wasted bytes.
     forecast_intervals_30min: int = 96
+    # Rising-edge alert threshold for the 30-min planning horizon.
+    # Amber's daily AEMO-pre-dispatch refresh briefly drops the visible
+    # horizon to ~30 intervals (~15 h) before extending back to ~79 (~40
+    # h). Set this BELOW the transient-dip floor (~30) so the daily
+    # refresh doesn't generate false alarms, and ABOVE the LP horizon
+    # we depend on for multi-day arbitrage. 50 catches sustained
+    # shrinkage (an Amber API change, AEMO outage, plan/site change)
+    # without firing every day. Set to 0 to disable the alert.
+    horizon_alert_threshold_30min: int = 50
 
 
 @dataclass(frozen=True, slots=True)

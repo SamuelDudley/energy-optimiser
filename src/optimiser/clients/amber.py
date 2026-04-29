@@ -64,6 +64,12 @@ class AmberClient:
         # the same 5-min bucket and extends the lockout.
         self._rate_limited_until: datetime | None = None
         self._warned_rate_low: bool = False
+        # Rising-edge state for the 30-min horizon alert. Emit
+        # AMBER_HORIZON_SHORT once when the count crosses below the
+        # threshold; emit AMBER_HORIZON_RECOVERED on the way back up.
+        # Re-arm only after the recovery edge fires so a single dip
+        # doesn't generate a fetch-rate stream of warnings.
+        self._horizon_short: bool = False
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -136,7 +142,45 @@ class AmberClient:
         self._last_fetch = now_utc()
         self._last_log_rows_30min = log_rows
         logger.info("Fetched %d 30-min price intervals from Amber", len(prices))
+        self._check_horizon_alert(len(prices))
         return prices
+
+    def _check_horizon_alert(self, count: int) -> None:
+        """Rising/falling-edge horizon-shrinkage alert.
+
+        Amber's 30-min visible horizon usually sits near 79 intervals
+        (~40 h, the AEMO pre-dispatch ceiling). It briefly dips to ~30
+        during AEMO's daily refresh; once the new pre-dispatch publishes
+        it climbs back to 79. The threshold (`horizon_alert_threshold_
+        30min`, default 50) sits between the transient-dip floor and
+        the operational ceiling so the daily refresh is silent but
+        sustained shrinkage (Amber API change, plan/site mis-config,
+        AEMO outage) generates exactly one rising-edge event.
+        """
+        threshold = self._config.horizon_alert_threshold_30min
+        if threshold <= 0:
+            return  # alert disabled
+        if count < threshold and not self._horizon_short:
+            self._horizon_short = True
+            logger.warning(
+                "Amber 30-min horizon shrunk to %d intervals (< %d threshold) "
+                "— LP planning horizon will be capped",
+                count, threshold,
+            )
+            emit(
+                EventType.AMBER_HORIZON_SHORT,
+                {"interval_count": count, "threshold": threshold},
+            )
+        elif count >= threshold and self._horizon_short:
+            self._horizon_short = False
+            logger.info(
+                "Amber 30-min horizon recovered to %d intervals (>= %d threshold)",
+                count, threshold,
+            )
+            emit(
+                EventType.AMBER_HORIZON_RECOVERED,
+                {"interval_count": count, "threshold": threshold},
+            )
 
     async def get_5min_prices(self) -> list[PriceInterval]:
         """Fetch 5-min resolution prices for the immediate window.

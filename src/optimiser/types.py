@@ -107,6 +107,8 @@ class EventType(StrEnum):
     PV_CURTAILMENT_CLEARED = auto()  # Throttle signal cleared (back below ceiling)
     MODE2_TRIM = auto()  # Phase-A PV reading + Phase-B trim value (per dispatch)
     MODE2_TRIM_BLIND = auto()  # Phase-A telemetry unavailable — uncapped fallthrough
+    AMBER_HORIZON_SHORT = auto()  # 30-min interval count fell below alert threshold
+    AMBER_HORIZON_RECOVERED = auto()  # 30-min count climbed back above threshold
 
 
 # ── Value Objects ────────────────────────────────────────────────
