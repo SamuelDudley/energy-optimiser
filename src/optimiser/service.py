@@ -21,7 +21,13 @@ from .clients.unifi import UniFiOccupancyDetector
 from .config import Config
 from .curtailment import CurtailmentState
 from .curtailment import evaluate as evaluate_curtailment
-from .logging_utils import SnapshotWriter, emit, new_tick_id
+from .logging_utils import (
+    EventLogWriter,
+    SnapshotWriter,
+    emit,
+    new_tick_id,
+    set_event_log_writer,
+)
 from .lp.dispatch import dispatch_from_slot
 from .lp.fallback import trigger_fallback
 from .lp.loads import build_lp_loads
@@ -104,6 +110,11 @@ class Service:
         self._store = TelemetryStore(config.storage)
         self._state_machine = StateMachine()
         self._snapshots = SnapshotWriter(config.storage.snapshot_dir)
+        # Event log: persists every emit() to a daily NDJSON for the
+        # ops dashboard. Wired into the logging_utils global so all
+        # call sites benefit without threading a writer through.
+        self._event_log = EventLogWriter(config.storage.event_log_dir)
+        set_event_log_writer(self._event_log)
         self._metrics = Metrics()
         self._log_buffer: RingBufferHandler | None = None
         self._file_log_handler: logging.Handler | None = None
@@ -861,6 +872,13 @@ class Service:
         """Directory where TickSnapshots are persisted as daily .ndjson.gz
         files. Used by /snapshots to build the DuckDB read_json glob."""
         return Path(self._config.storage.snapshot_dir)
+
+    @property
+    def event_log_dir(self) -> Path:
+        """Directory where structured events are persisted as daily
+        events-YYYY-MM-DD.ndjson files. Used by /ops/* handlers to
+        build their DuckDB read_json glob."""
+        return Path(self._config.storage.event_log_dir)
 
     @property
     def battery_config(self):

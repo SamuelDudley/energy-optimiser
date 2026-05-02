@@ -39,6 +39,9 @@ class ServiceProbe(Protocol):
     # Directory where NDJSON snapshots live (daily .ndjson.gz). Powers
     # /snapshots range queries via DuckDB read_json over a glob.
     snapshot_dir: Path
+    # Directory where the daily event log lives (events-YYYY-MM-DD.ndjson).
+    # Powers /ops/* range queries via DuckDB read_json over a glob.
+    event_log_dir: Path
     # Battery configuration (capacity, SOC floor, charge/discharge caps).
     # Exposed for /dashboard/config so the SOC panel can draw the floor
     # line at the actual configured value rather than a hardcoded default.
@@ -48,9 +51,7 @@ class ServiceProbe(Protocol):
 # Typed app key — handlers retrieve the probe via
 # `request.app[SERVICE_PROBE_KEY]` instead of a bare string, which
 # gives static typing and silences aiohttp's NotAppKeyWarning.
-SERVICE_PROBE_KEY: web.AppKey[ServiceProbe] = web.AppKey(
-    "service_probe", ServiceProbe
-)
+SERVICE_PROBE_KEY: web.AppKey[ServiceProbe] = web.AppKey("service_probe", ServiceProbe)
 
 # Table-query handler reads the limit cap + timeout from this. Kept
 # off ServiceProbe because it's the API server's own config, not

@@ -209,6 +209,12 @@ class OccupancyConfig:
 class StorageConfig:
     db_path: str = "/var/lib/energy-optimiser/telemetry.duckdb"
     snapshot_dir: str = "/var/lib/energy-optimiser/snapshots"
+    # Daily NDJSON event log for ops observability. Written plain
+    # (un-gzipped) at emit time because event rate is high enough that
+    # per-emit gzip open/close would dominate; daily rotation by event
+    # date lets the /ops/* endpoints DuckDB-read_json over a glob.
+    # Operators can compress old days via logrotate.
+    event_log_dir: str = "/var/lib/energy-optimiser/events"
 
 
 @dataclass(frozen=True, slots=True)
