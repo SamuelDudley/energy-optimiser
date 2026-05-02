@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 import httpx
 
 from ..config import WeatherConfig
-from ..logging_utils import emit
+from ..logging_utils import api_call, emit
 from ..time_utils import now_utc
 from ..types import EventType, WeatherForecastInterval
 from ._retry import DEFAULT_USER_AGENT, bom_retry
@@ -73,8 +73,9 @@ class BOMClient:
             # retried — that's a policy decision by BOM. The outer
             # try/except catches retry exhaustion and falls back.
             async for attempt in bom_retry():
-                with attempt:
+                with attempt, api_call("bom", "observations") as call:
                     resp = await self._client.get(self._config.bom_url)
+                    call.set_response(resp)
                     resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -168,8 +169,9 @@ class BOMClient:
             return []
         try:
             async for attempt in bom_retry():
-                with attempt:
+                with attempt, api_call("bom", "hourly_forecast") as call:
                     resp = await self._client.get(url)
+                    call.set_response(resp)
                     resp.raise_for_status()
             payload = resp.json()
         except Exception:
@@ -178,9 +180,7 @@ class BOMClient:
 
         return self._parse_hourly_forecast(payload)
 
-    def _parse_hourly_forecast(
-        self, data: object
-    ) -> list[WeatherForecastInterval]:
+    def _parse_hourly_forecast(self, data: object) -> list[WeatherForecastInterval]:
         """Defensively parse BOM's hourly forecast JSON.
 
         Expected shape (undocumented, observed):

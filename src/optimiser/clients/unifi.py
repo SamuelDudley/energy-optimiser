@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import httpx
 
 from ..config import OccupancyConfig
+from ..logging_utils import api_call
 from ..time_utils import now_utc
 
 logger = logging.getLogger(__name__)
@@ -55,14 +56,16 @@ class UniFiOccupancyDetector:
         """Authenticate with the UniFi controller."""
         try:
             url = f"https://{self._config.unifi_host}:{self._config.unifi_port}/api/login"
-            resp = await self._client.post(
-                url,
-                json={
-                    "username": self._config.unifi_username,
-                    "password": self._config.unifi_password,
-                },
-            )
-            resp.raise_for_status()
+            with api_call("unifi", "login") as call:
+                resp = await self._client.post(
+                    url,
+                    json={
+                        "username": self._config.unifi_username,
+                        "password": self._config.unifi_password,
+                    },
+                )
+                call.set_response(resp)
+                resp.raise_for_status()
             # Session cookie is set automatically by httpx
             self._csrf = resp.headers.get("x-csrf-token")
             return True
@@ -126,8 +129,10 @@ class UniFiOccupancyDetector:
         if self._csrf:
             headers["x-csrf-token"] = self._csrf
 
-        resp = await self._client.get(url, headers=headers)
-        resp.raise_for_status()
+        with api_call("unifi", "list_clients") as call:
+            resp = await self._client.get(url, headers=headers)
+            call.set_response(resp)
+            resp.raise_for_status()
         data = resp.json()
 
         clients = data.get("data", [])

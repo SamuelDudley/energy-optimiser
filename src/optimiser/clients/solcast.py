@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta
 import httpx
 
 from ..config import SolcastConfig
-from ..logging_utils import emit
+from ..logging_utils import api_call, emit
 from ..time_utils import now_utc, parse_iso
 from ..types import EventType, PVForecast, PVForecastLogRow
 from ._retry import solcast_retry
@@ -140,8 +140,10 @@ class SolcastClient:
         # 429 is not retried (could be quota-exhausted or load-shedding;
         # either way, next scheduled poll is the right fallback).
         async for attempt in solcast_retry():
-            with attempt:
+            with attempt, api_call("solcast", "forecast") as call:
+                call.extra["calls_today"] = self._call_count_today
                 resp = await self._client.get(url, params=params)
+                call.set_response(resp)
                 resp.raise_for_status()
         # Successful response — count against quota
         self._call_count_today += 1
@@ -204,8 +206,10 @@ class SolcastClient:
         url = f"/rooftop_sites/{self._config.resource_id}/estimated_actuals"
         params = {"format": "json"}
         async for attempt in solcast_retry():
-            with attempt:
+            with attempt, api_call("solcast", "estimated_actuals") as call:
+                call.extra["calls_today"] = self._call_count_today
                 resp = await self._client.get(url, params=params)
+                call.set_response(resp)
                 resp.raise_for_status()
         self._call_count_today += 1
         return resp.json().get("estimated_actuals", [])
