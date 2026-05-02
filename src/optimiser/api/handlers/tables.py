@@ -40,6 +40,7 @@ TABLE_TIME_COLUMNS: dict[str, str] = {
     "pv_forecast_log": "fetched_at",
     "price_forecast_log": "fetched_at",
     "weather_forecast_log": "fetched_at",
+    "amber_usage": "ts",
 }
 QUERYABLE_TABLES = frozenset(TABLE_TIME_COLUMNS)
 

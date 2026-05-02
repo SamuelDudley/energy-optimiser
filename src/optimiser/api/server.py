@@ -16,6 +16,7 @@ from aiohttp import web
 
 from ..config import APIConfig
 from .auth import load_token, make_auth_middleware
+from .handlers.daily_spend import daily_spend
 from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
 from .handlers.logs import logs as logs_handler
@@ -49,9 +50,7 @@ class APIServer:
         # at startup rather than quietly shipping an open API.
         token = load_token(self._config.bearer_token_env)
 
-        app = web.Application(
-            middlewares=[make_auth_middleware(token, _PUBLIC_PATHS)]
-        )
+        app = web.Application(middlewares=[make_auth_middleware(token, _PUBLIC_PATHS)])
         app[SERVICE_PROBE_KEY] = self._probe
         app[API_CONFIG_KEY] = self._config
 
@@ -60,22 +59,20 @@ class APIServer:
         app.router.add_get("/readyz", readyz)
         app.router.add_get("/metrics", metrics_handler)
         app.router.add_get("/logs", logs_handler)
-        # /plan/current and /snapshots are concrete paths, registered
-        # before the /{table} catch-all so they don't get routed there.
+        # /plan/current, /snapshots, /daily_spend are concrete paths,
+        # registered before the /{table} catch-all so they don't get
+        # routed there.
         app.router.add_get("/plan/current", plan_current)
         app.router.add_get("/snapshots", snapshots)
+        app.router.add_get("/daily_spend", daily_spend)
         app.router.add_get("/{table}/schema", table_schema)
         app.router.add_get("/{table}", table_rows)
 
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
-        self._site = web.TCPSite(
-            self._runner, host=self._config.host, port=self._config.port
-        )
+        self._site = web.TCPSite(self._runner, host=self._config.host, port=self._config.port)
         await self._site.start()
-        logger.info(
-            "API server listening on %s:%d", self._config.host, self._config.port
-        )
+        logger.info("API server listening on %s:%d", self._config.host, self._config.port)
 
     async def stop(self) -> None:
         if self._site is not None:

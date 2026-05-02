@@ -118,12 +118,12 @@ class EventType(StrEnum):
 class PriceInterval:
     start: datetime
     end: datetime
-    import_per_kwh: float              # `perKwh` from Amber; AEMO-derived point estimate
+    import_per_kwh: float  # `perKwh` from Amber; AEMO-derived point estimate
     export_per_kwh: float
     spot_per_kwh: float
     renewables_pct: float
     spike_status: str
-    descriptor: str                    # Amber enum; see _FORECAST_DESCRIPTORS in amber.py
+    descriptor: str  # Amber enum; see _FORECAST_DESCRIPTORS in amber.py
     # advancedPrice on the `general` (import) channel. Populated only on
     # ForecastIntervals; None on Current/Actual.
     forecast_low: float | None = None
@@ -139,7 +139,9 @@ class PriceInterval:
     export_forecast_low: float | None = None
     export_forecast_high: float | None = None
     export_forecast_predicted: float | None = None
-    is_locked: bool | None = None            # CurrentInterval.estimate inverted: False=estimate, True=locked, None=Actual/Forecast
+    is_locked: bool | None = (
+        None  # CurrentInterval.estimate inverted: False=estimate, True=locked, None=Actual/Forecast
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,17 +150,18 @@ class PriceForecastLogRow:
     `price_forecast_log` in DuckDB for later calibration analysis.
     Not consumed by the LP — this is strictly an observability artefact.
     """
+
     fetched_at: datetime
-    resolution: int                          # 5 or 30 — which Amber endpoint cadence
+    resolution: int  # 5 or 30 — which Amber endpoint cadence
     interval_start: datetime
     interval_end: datetime
-    interval_type: str | None                # ActualInterval / CurrentInterval / ForecastInterval
-    per_kwh: float                           # AEMO point on the general channel
-    export_per_kwh: float                    # feedIn channel perKwh, sign-flipped to customer
+    interval_type: str | None  # ActualInterval / CurrentInterval / ForecastInterval
+    per_kwh: float  # AEMO point on the general channel
+    export_per_kwh: float  # feedIn channel perKwh, sign-flipped to customer
     spot_per_kwh: float
-    forecast_predicted: float | None         # general.advancedPrice.predicted
-    forecast_low: float | None               # general.advancedPrice.low
-    forecast_high: float | None              # general.advancedPrice.high
+    forecast_predicted: float | None  # general.advancedPrice.predicted
+    forecast_low: float | None  # general.advancedPrice.low
+    forecast_high: float | None  # general.advancedPrice.high
     spike_status: str
     descriptor: str
     is_locked: bool | None
@@ -186,6 +189,7 @@ class WeatherForecastInterval:
     """One hour of BOM hourly forecast. All fields optional — BOM's
     JSON sometimes omits keys for early/late intervals.
     """
+
     period_end: datetime
     temp_c: float | None
     apparent_temp_c: float | None
@@ -201,6 +205,7 @@ class WeatherForecastLogRow:
     pv_forecast_log pattern: redundant logging so a single table traces
     forecast evolution.
     """
+
     fetched_at: datetime
     period_end: datetime
     temp_c: float | None
@@ -220,6 +225,7 @@ class PVForecastLogRow:
     insert time; a backfill job (not yet implemented) would later populate
     it from the telemetry table's measured `pv_kw`.
     """
+
     fetched_at: datetime
     period_end: datetime  # forecast intervals are anchored to period_end in Solcast
     pv_estimate_kw: float
@@ -495,3 +501,30 @@ class LoadTelemetryRow:
     energy_today_kwh: float | None
     cycle_state: str | None
     relay_on: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class AmberUsageRow:
+    """One settled 5-min interval from Amber's /usage endpoint.
+
+    These are the actuals that land on the bill — fetched once a day after
+    the NEM day rolls over. `cost_cents` carries Amber's signed convention
+    (positive on the general/import channel, negative on feedIn/export),
+    so SUM(cost_cents) over a day is the net bill in cents.
+
+    `nem_date` is Amber's `date` field — the bill's date column. NEM is
+    UTC+10 year-round, which differs from local Canberra time during AEDT.
+    Using Amber's value avoids a DST-aware conversion at write time.
+    """
+
+    ts: datetime  # interval start, UTC
+    nem_date: str  # YYYY-MM-DD, NEM-day = bill date
+    channel: str  # "general" (import) | "feedIn" (export) | "controlledLoad"
+    kwh: float  # always >=0; direction is implied by channel
+    cost_cents: float  # signed: + on general, − on feedIn (per Amber)
+    per_kwh_cents: float  # c/kWh, sign matches cost
+    spot_per_kwh_cents: float | None
+    renewables_pct: float | None
+    descriptor: str | None  # veryLow | low | neutral | high | spike
+    spike_status: str | None  # none | potential | spike
+    quality: str | None  # billable | estimated | awaiting

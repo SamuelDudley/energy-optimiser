@@ -49,6 +49,12 @@ TABLE_DESCRIPTIONS: dict[str, str] = {
         "BOM hourly forecast intervals (temperature, precipitation "
         "probability, cloud, humidity). Used for load/HVAC heuristics."
     ),
+    "amber_usage": (
+        "Amber Electric settled per-5-min billing intervals. One row per "
+        "(ts, channel). cost_cents is signed: positive on `general` "
+        "(import, you paid), negative on `feedIn` (export, you earned). "
+        "Daily aggregate is exposed as /daily_spend."
+    ),
 }
 
 # Endpoint catalogue. Handwritten from the handler list. Keep in sync
@@ -144,6 +150,22 @@ def _endpoints_index() -> list[dict[str, Any]]:
                 "as produced by the tick loop. 503 until the first tick "
                 "completes. Same shape as one line of a snapshot .ndjson.gz."
             ),
+        },
+        {
+            "path": "/daily_spend",
+            "method": "GET",
+            "auth": True,
+            "description": (
+                "Per-day aggregate of `amber_usage` (settled bill data). "
+                "Each row carries import / export / net cost in AUD plus "
+                "kWh and volume-weighted price. Sorted descending by "
+                "nem_date so the dashboard sees most-recent first."
+            ),
+            "params": {
+                "since": "ISO date YYYY-MM-DD (inclusive, filters on nem_date) — optional",
+                "until": "ISO date YYYY-MM-DD (exclusive) — optional",
+                "limit": "int ≤ 366 (default 60)",
+            },
         },
         {
             "path": "/snapshots",

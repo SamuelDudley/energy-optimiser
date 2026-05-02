@@ -12,6 +12,7 @@ import duckdb
 from .config import StorageConfig
 from .logging_utils import emit
 from .types import (
+    AmberUsageRow,
     EventType,
     LoadTelemetryRow,
     PriceForecastLogRow,
@@ -217,6 +218,29 @@ PRICE_FORECAST_LOG_MIGRATIONS = [
     "ALTER TABLE price_forecast_log ADD COLUMN IF NOT EXISTS export_forecast_high      REAL",
 ]
 
+# Settled per-5-min usage from Amber's /usage endpoint. Each row is one
+# billed interval on one channel; SUM(cost_cents) GROUP BY nem_date is
+# the net bill for that day. Fetched once a day for the previous NEM day
+# (and on startup for any missing days). PK = (ts, channel) so re-runs
+# UPSERT cleanly — Amber occasionally re-publishes a day with refined
+# `quality` flags.
+AMBER_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS amber_usage (
+    ts                  TIMESTAMPTZ NOT NULL,
+    nem_date            VARCHAR     NOT NULL,
+    channel             VARCHAR     NOT NULL,
+    kwh                 REAL,
+    cost_cents          REAL,
+    per_kwh_cents       REAL,
+    spot_per_kwh_cents  REAL,
+    renewables_pct      REAL,
+    descriptor          VARCHAR,
+    spike_status        VARCHAR,
+    quality             VARCHAR,
+    PRIMARY KEY (ts, channel)
+);
+"""
+
 # Mirrors pv_forecast_log: every fetched interval logged with its
 # fetched_at, so forecast evolution and calibration can be analysed
 # downstream. Not consumed by the LP — strictly observational.
@@ -264,6 +288,7 @@ class TelemetryStore:
         self._db.execute(PV_FORECAST_LOG_DDL)
         self._db.execute(PRICE_FORECAST_LOG_DDL)
         self._db.execute(WEATHER_FORECAST_LOG_DDL)
+        self._db.execute(AMBER_USAGE_DDL)
         # Apply migrations for installs that predate any added columns.
         for stmt in (*TELEMETRY_MIGRATIONS, *PRICE_FORECAST_LOG_MIGRATIONS):
             try:
@@ -588,6 +613,70 @@ class TelemetryStore:
             for (period_end, p50, p10, p90) in rows
         ]
         return forecasts, fetched_at
+
+    def write_amber_usage(self, rows: list[AmberUsageRow]) -> None:
+        """UPSERT settled per-5-min Amber usage rows.
+
+        Idempotent on (ts, channel) — the daily wake loop refetches the
+        same day on startup if the recent backfill window overlaps, and
+        Amber occasionally re-publishes a day once `quality` settles.
+        Best-effort: failures are logged and swallowed (not critical
+        path — billing data drives observability, not control).
+        """
+        if not rows:
+            return
+        try:
+            self._db.executemany(
+                """INSERT INTO amber_usage VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ) ON CONFLICT (ts, channel) DO UPDATE SET
+                    nem_date           = EXCLUDED.nem_date,
+                    kwh                = EXCLUDED.kwh,
+                    cost_cents         = EXCLUDED.cost_cents,
+                    per_kwh_cents      = EXCLUDED.per_kwh_cents,
+                    spot_per_kwh_cents = EXCLUDED.spot_per_kwh_cents,
+                    renewables_pct     = EXCLUDED.renewables_pct,
+                    descriptor         = EXCLUDED.descriptor,
+                    spike_status       = EXCLUDED.spike_status,
+                    quality            = EXCLUDED.quality""",
+                [
+                    [
+                        r.ts,
+                        r.nem_date,
+                        r.channel,
+                        r.kwh,
+                        r.cost_cents,
+                        r.per_kwh_cents,
+                        r.spot_per_kwh_cents,
+                        r.renewables_pct,
+                        r.descriptor,
+                        r.spike_status,
+                        r.quality,
+                    ]
+                    for r in rows
+                ],
+            )
+        except Exception:
+            logger.exception(
+                "amber_usage write failed (%d rows dropped)", len(rows),
+            )
+
+    def latest_amber_usage_date(self) -> str | None:
+        """Return the most recent NEM date present in amber_usage, or None.
+
+        Used by the daily wake loop's startup backfill: pull from
+        latest+1 up to yesterday in one ≤7-day batch (Amber's max
+        window). Returns None on empty table → caller backfills the
+        configured number of recent days.
+        """
+        try:
+            row = self._db.sql(
+                "SELECT MAX(nem_date) FROM amber_usage"
+            ).fetchone()
+        except Exception:
+            logger.exception("latest_amber_usage_date failed")
+            return None
+        return row[0] if row and row[0] is not None else None
 
     def write_price_forecast_log(self, rows: list[PriceForecastLogRow]) -> None:
         """Append price forecast rows. Best-effort: failures are logged

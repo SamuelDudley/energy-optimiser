@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .api import APIServer
@@ -62,6 +62,20 @@ _VERSION = "0.2.0"
 # while blind". 15 min is ~3 missed Amber update cycles, well beyond any
 # transient 429 cool-down (≤300s observed in production).
 EXPORT_PRICE_STALE_THRESHOLD = timedelta(minutes=15)
+
+# Daily Amber usage fetch fires at 16:00 UTC every day (= 02:00 AEDT /
+# 03:00 AEST local Canberra time). The NEM day rolls over at 14:00 UTC,
+# so we land 2-3 hours after settlement and Amber has finished
+# publishing yesterday. The same handler also runs once at startup, so
+# this scheduled fire is the steady-state path; missed-day catch-up is
+# automatic via the backfill logic.
+_AMBER_USAGE_WAKE_OFFSET_S = 16 * 3600
+
+# How far back to backfill amber_usage on first run (empty table).
+# 30 days gives the dashboard a useful 30-day daily-summary panel
+# straight after deploy without burning a lot of API budget — at most
+# ceil(30/7)=5 calls (Amber's /usage window cap is 7 days).
+_AMBER_USAGE_BACKFILL_DAYS = 30
 
 # Pre-LP "uncap and measure" PV probe gate. The probe writes
 # 40032=max + mode 2, sleeps 5 s for cascade settle, then reads true MPP.
@@ -159,9 +173,7 @@ class Service:
                 forecasts, fetched_at = cached
                 self._solcast.seed_cache(forecasts, fetched_at)
                 self._pv_forecast = forecasts
-                age_min = (
-                    datetime.now(fetched_at.tzinfo) - fetched_at
-                ).total_seconds() / 60
+                age_min = (datetime.now(fetched_at.tzinfo) - fetched_at).total_seconds() / 60
                 logger.info(
                     "Seeded Solcast cache from log (%d intervals, %.0f min old)"
                     " — skipping initial fetch",
@@ -171,6 +183,11 @@ class Service:
             else:
                 await self._fetch_solcast()
         await self._fetch_bom()
+
+        # Backfill amber_usage so the dashboard daily-spend panel has
+        # historical context immediately. Best-effort; failure here just
+        # leaves the panel sparser until the daily wake loop catches up.
+        await self._backfill_amber_usage()
 
         # Notify state machine
         self._state_machine.on_startup_complete(modbus_ok, amber_ok)
@@ -225,6 +242,17 @@ class Service:
             # Excluding it here keeps the hourly re-assertion idempotent
             # against the startup write.
             WakeLoop("soc_limits", 3600, self._reassert_soc_limits),
+            # Daily Amber /usage fetch — settled per-5-min spend that
+            # lands on the bill. Fires at 16:00 UTC = 02:00 AEDT /
+            # 03:00 AEST, well after NEM midnight. The handler is the
+            # same backfill path used at startup, so a missed day (Amber
+            # outage, service down) is caught next run automatically.
+            WakeLoop(
+                "amber_usage",
+                86400,
+                self._backfill_amber_usage,
+                offset_s=_AMBER_USAGE_WAKE_OFFSET_S,
+            ),
         ]
         # BOM hourly forecast — separate cadence from current-obs. Only
         # spawn the loop if a forecast URL is configured; empty URL means
@@ -248,9 +276,7 @@ class Service:
             # pv_forecast_log starts accumulating from tick 1 and the
             # backfill is an analysis-time concern, not real-time.
             # Costs 1 of 10 daily Solcast quota.
-            self._wake_loops.append(
-                WakeLoop("pv_actuals", 86400, self._backfill_pv_actuals)
-            )
+            self._wake_loops.append(WakeLoop("pv_actuals", 86400, self._backfill_pv_actuals))
 
         logger.info("Spawning %d wake loops", len(self._wake_loops))
         try:
@@ -441,11 +467,7 @@ class Service:
             # below their respective caps). On any failure / saturation
             # we fall back silently to the per-scenario forecast.
             pv_probe = await self._maybe_run_pv_probe(state, tick_id)
-            if (
-                pv_probe is not None
-                and pv_probe.pv_kw is not None
-                and not pv_probe.saturated
-            ):
+            if pv_probe is not None and pv_probe.pv_kw is not None and not pv_probe.saturated:
                 pv_probe_lp_override_kw = pv_probe.pv_kw
 
             lp_solution, lp_dispatch = await self._run_lp(
@@ -479,9 +501,7 @@ class Service:
             # mode-2 adaptive trim path reads live PV/load with the cap
             # already in force, and uses (export_cap_kw) directly when
             # computing the Phase-B trim.
-            export_limit_kw = self._resolve_export_limit_kw(
-                output.grid_export_limit_kw, tick_id
-            )
+            export_limit_kw = self._resolve_export_limit_kw(output.grid_export_limit_kw, tick_id)
             if export_limit_kw is not None:
                 await self._sigenergy.set_export_limit_kw(export_limit_kw)
                 self._last_export_limit_kw = export_limit_kw
@@ -523,9 +543,7 @@ class Service:
                     self._sigenergy,
                     self._loads.controllers,
                     FallbackReason.LP_ERROR,
-                    export_price_ckwh=(
-                        current_5min.export_per_kwh if current_5min else None
-                    ),
+                    export_price_ckwh=(current_5min.export_per_kwh if current_5min else None),
                     extra_context={"phase": "apply_lp_dispatch"},
                 )
                 await self._lp_runtime.latch(FallbackReason.LP_ERROR)
@@ -552,9 +570,7 @@ class Service:
             price_age = self._amber.prices_5min_age
             stale = price_age is None or price_age > EXPORT_PRICE_STALE_THRESHOLD
             await self._sigenergy.set_fallback(
-                export_price_ckwh=(
-                    current_5min.export_per_kwh if current_5min else None
-                ),
+                export_price_ckwh=(current_5min.export_per_kwh if current_5min else None),
                 block_export=stale,
             )
 
@@ -811,9 +827,7 @@ class Service:
 
     @property
     def heartbeat_path(self) -> Path:
-        return Path(
-            os.environ.get("EO_HEARTBEAT_PATH", "/var/lib/energy-optimiser/heartbeat")
-        )
+        return Path(os.environ.get("EO_HEARTBEAT_PATH", "/var/lib/energy-optimiser/heartbeat"))
 
     @property
     def service_state(self) -> str:
@@ -887,11 +901,7 @@ class Service:
                     encoding="utf-8",
                 )
                 fh.setLevel(logging.INFO)
-                fh.setFormatter(
-                    logging.Formatter(
-                        "%(asctime)s %(levelname)s %(name)s %(message)s"
-                    )
-                )
+                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
                 root.addHandler(fh)
                 self._file_log_handler = fh
             except Exception:
@@ -915,9 +925,7 @@ class Service:
 
     # ── LP Execution ─────────────────────────────────────────────
 
-    async def _maybe_run_pv_probe(
-        self, state: SystemState, tick_id: str
-    ) -> PVProbeResult | None:
+    async def _maybe_run_pv_probe(self, state: SystemState, tick_id: str) -> PVProbeResult | None:
         """Run a Phase-A "uncap and measure" PV probe with gating.
 
         Skips when:
@@ -1047,9 +1055,7 @@ class Service:
         # solve_time_ms comes from the solver itself (wall-clock inside
         # the thread); prefer it over our wait_for measurement because
         # it excludes thread-scheduling overhead.
-        self._metrics.record_lp_solve(
-            solution.status.value.lower(), float(solution.solve_time_ms)
-        )
+        self._metrics.record_lp_solve(solution.status.value.lower(), float(solution.solve_time_ms))
 
         emit(
             EventType.LP_SOLVE_COMPLETE,
@@ -1170,6 +1176,83 @@ class Service:
         rows = self._solcast.drain_log_rows()
         if rows:
             self._store.write_pv_forecast_log(rows)
+
+    async def _backfill_amber_usage(self) -> None:
+        """Pull settled Amber /usage rows from the latest persisted day
+        up to yesterday (NEM date). Idempotent: re-fetched days UPSERT
+        on (ts, channel) so wake loop overlap and Amber's occasional
+        same-day re-publishes are both safe.
+
+        Called at startup AND on the daily wake loop — the wake handler
+        and the startup-catchup handler are the same code path. Empty
+        table on first run triggers a `_AMBER_USAGE_BACKFILL_DAYS` window
+        backfill so the dashboard's daily-spend panel has history straight
+        away. Each /usage call covers ≤7 days (Amber's cap) so the loop
+        chunks accordingly.
+        """
+        # NEM is UTC+10 year-round. "Yesterday's NEM date" is the date
+        # of the most recent fully-settled NEM day — that's the latest
+        # Amber will publish.
+        nem_now = now_utc() + timedelta(hours=10)
+        yesterday_nem = (nem_now - timedelta(days=1)).date()
+
+        latest = self._store.latest_amber_usage_date()
+        if latest is None:
+            start = yesterday_nem - timedelta(days=_AMBER_USAGE_BACKFILL_DAYS - 1)
+        else:
+            try:
+                start = date.fromisoformat(latest) + timedelta(days=1)
+            except ValueError:
+                logger.warning(
+                    "amber_usage latest_nem_date=%r unparseable; backfilling default window",
+                    latest,
+                )
+                start = yesterday_nem - timedelta(days=_AMBER_USAGE_BACKFILL_DAYS - 1)
+
+        if start > yesterday_nem:
+            return  # already up to date
+
+        cur = start
+        total = 0
+        actual_min: str | None = None
+        actual_max: str | None = None
+        while cur <= yesterday_nem:
+            chunk_end = min(cur + timedelta(days=6), yesterday_nem)
+            try:
+                rows = await self._amber.get_usage_intervals(
+                    cur.isoformat(),
+                    chunk_end.isoformat(),
+                )
+            except Exception:
+                logger.exception(
+                    "amber_usage fetch failed for %s..%s — stopping backfill",
+                    cur,
+                    chunk_end,
+                )
+                return
+            if rows:
+                self._store.write_amber_usage(rows)
+                total += len(rows)
+                # Track the date range Amber actually returned. The
+                # requested window can extend past Amber's retention
+                # (typically ~20 days for newer sites) — logging the
+                # requested range was misleading.
+                chunk_dates = sorted({r.nem_date for r in rows})
+                if chunk_dates:
+                    if actual_min is None or chunk_dates[0] < actual_min:
+                        actual_min = chunk_dates[0]
+                    if actual_max is None or chunk_dates[-1] > actual_max:
+                        actual_max = chunk_dates[-1]
+            cur = chunk_end + timedelta(days=1)
+        if total:
+            logger.info(
+                "amber_usage backfill: %d rows covering %s..%s (requested %s..%s)",
+                total,
+                actual_min,
+                actual_max,
+                start,
+                yesterday_nem,
+            )
 
     async def _backfill_pv_actuals(self) -> None:
         """Daily wake loop target: fetch Solcast estimated actuals for the

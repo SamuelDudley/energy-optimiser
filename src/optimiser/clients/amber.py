@@ -17,7 +17,7 @@ import httpx
 from ..config import AmberConfig
 from ..logging_utils import emit
 from ..time_utils import now_utc, parse_iso
-from ..types import EventType, PriceForecastLogRow, PriceInterval
+from ..types import AmberUsageRow, EventType, PriceForecastLogRow, PriceInterval
 from ._retry import amber_retry
 
 logger = logging.getLogger(__name__)
@@ -468,3 +468,52 @@ class AmberClient:
                 resp = await self._client.get(url, params=params)
                 resp.raise_for_status()
         return resp.json()
+
+    async def get_usage_intervals(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> list[AmberUsageRow]:
+        """Fetch settled per-5-min usage intervals as typed rows.
+
+        Both dates are NEM-day strings (YYYY-MM-DD) and inclusive. Amber
+        publishes a day's intervals after the NEM day rolls over (NEM is
+        UTC+10, so ~14:00 UTC); requesting today returns []. Window is
+        capped at 7 days by Amber.
+
+        Sign convention is preserved as Amber returns it: `cost_cents`
+        and `per_kwh_cents` are positive on `general` (you paid) and
+        negative on `feedIn` (you earned), so SUM(cost_cents) over a
+        day is the net bill in cents.
+        """
+        raw = await self.get_usage(start_date, end_date)
+        rows: list[AmberUsageRow] = []
+        for d in raw:
+            ts_raw = d.get("startTime")
+            if not ts_raw:
+                continue
+            # Same NEM `+1s` boundary normalisation we apply to the price
+            # parser (see `_fetch` decision-log entry): startTime comes
+            # back as e.g. "14:00:01Z" and we want it on the wall-clock
+            # boundary so downstream joins to telemetry/price logs line up.
+            ts = parse_iso(ts_raw).replace(second=0, microsecond=0)
+            rows.append(
+                AmberUsageRow(
+                    ts=ts,
+                    nem_date=d.get("date", ""),
+                    channel=d.get("channelType", "general"),
+                    kwh=float(d.get("kwh", 0.0)),
+                    cost_cents=float(d.get("cost", 0.0)),
+                    per_kwh_cents=float(d.get("perKwh", 0.0)),
+                    spot_per_kwh_cents=(
+                        float(d["spotPerKwh"]) if d.get("spotPerKwh") is not None else None
+                    ),
+                    renewables_pct=(
+                        float(d["renewables"]) if d.get("renewables") is not None else None
+                    ),
+                    descriptor=d.get("descriptor"),
+                    spike_status=d.get("spikeStatus"),
+                    quality=d.get("quality"),
+                )
+            )
+        return rows
