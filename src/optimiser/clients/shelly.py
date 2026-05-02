@@ -12,7 +12,7 @@ from datetime import datetime
 import httpx
 
 from ..config import ManagedLoadConfig
-from ..logging_utils import emit
+from ..logging_utils import api_call, emit
 from ..time_utils import now_utc
 from ..types import (
     EventType,
@@ -97,32 +97,41 @@ class ShellyLoadController:
             # for grid CT: act_power < 0 = export, > 0 = import — matches
             # the inverter's grid_power_kw convention for the validation
             # cross-check.
-            resp = await self._client.get(
-                f"{self._base_url}/rpc/EM1.GetStatus",
-                params={"id": self._config.shelly_channel},
-            )
-            resp.raise_for_status()
-            em_data = resp.json()
-            power_kw = em_data.get("act_power", 0) / 1000.0
+            with api_call("shelly", "em1_status") as call:
+                call.extra["load_id"] = self._config.load_id
+                resp = await self._client.get(
+                    f"{self._base_url}/rpc/EM1.GetStatus",
+                    params={"id": self._config.shelly_channel},
+                )
+                call.set_response(resp)
+                resp.raise_for_status()
+                em_data = resp.json()
+                power_kw = em_data.get("act_power", 0) / 1000.0
 
-            resp = await self._client.get(
-                f"{self._base_url}/rpc/EM1Data.GetStatus",
-                params={"id": self._config.shelly_channel},
-            )
-            resp.raise_for_status()
-            energy_data = resp.json()
-            energy_kwh = energy_data.get("total_act_energy", 0) / 1000.0
-            read_ok = True
+            with api_call("shelly", "em1_data") as call:
+                call.extra["load_id"] = self._config.load_id
+                resp = await self._client.get(
+                    f"{self._base_url}/rpc/EM1Data.GetStatus",
+                    params={"id": self._config.shelly_channel},
+                )
+                call.set_response(resp)
+                resp.raise_for_status()
+                energy_data = resp.json()
+                energy_kwh = energy_data.get("total_act_energy", 0) / 1000.0
+                read_ok = True
 
             # Read relay state if applicable
             if self._config.has_relay:
-                resp = await self._client.get(
-                    f"{self._base_url}/rpc/Switch.GetStatus",
-                    params={"id": 0},
-                )
-                resp.raise_for_status()
-                sw_data = resp.json()
-                relay_on = sw_data.get("output", False)
+                with api_call("shelly", "switch_status") as call:
+                    call.extra["load_id"] = self._config.load_id
+                    resp = await self._client.get(
+                        f"{self._base_url}/rpc/Switch.GetStatus",
+                        params={"id": 0},
+                    )
+                    call.set_response(resp)
+                    resp.raise_for_status()
+                    sw_data = resp.json()
+                    relay_on = sw_data.get("output", False)
 
         except Exception:
             logger.warning("Shelly read failed for %s", self._config.load_id)
@@ -176,11 +185,15 @@ class ShellyLoadController:
             return False
 
         try:
-            resp = await self._client.get(
-                f"{self._base_url}/rpc/Switch.Set",
-                params={"id": 0, "on": "true"},
-            )
-            resp.raise_for_status()
+            with api_call("shelly", "switch_set") as call:
+                call.extra["load_id"] = self._config.load_id
+                call.extra["on"] = True
+                resp = await self._client.get(
+                    f"{self._base_url}/rpc/Switch.Set",
+                    params={"id": 0, "on": "true"},
+                )
+                call.set_response(resp)
+                resp.raise_for_status()
 
             self._cycle_state = LoadCycleState.RUNNING
             self._cycle_started = now_utc()
@@ -197,11 +210,15 @@ class ShellyLoadController:
         if not self._config.has_relay:
             return False
         try:
-            resp = await self._client.get(
-                f"{self._base_url}/rpc/Switch.Set",
-                params={"id": 0, "on": "false"},
-            )
-            resp.raise_for_status()
+            with api_call("shelly", "switch_set") as call:
+                call.extra["load_id"] = self._config.load_id
+                call.extra["on"] = False
+                resp = await self._client.get(
+                    f"{self._base_url}/rpc/Switch.Set",
+                    params={"id": 0, "on": "false"},
+                )
+                call.set_response(resp)
+                resp.raise_for_status()
             return True
         except Exception:
             logger.exception("Failed to stop relay for %s", self._config.load_id)
@@ -220,11 +237,15 @@ class ShellyLoadController:
             )
             return False
         try:
-            resp = await self._client.get(
-                f"{self._base_url}/rpc/Switch.Set",
-                params={"id": 0, "on": "true" if on else "false"},
-            )
-            resp.raise_for_status()
+            with api_call("shelly", "switch_set") as call:
+                call.extra["load_id"] = self._config.load_id
+                call.extra["on"] = on
+                resp = await self._client.get(
+                    f"{self._base_url}/rpc/Switch.Set",
+                    params={"id": 0, "on": "true" if on else "false"},
+                )
+                call.set_response(resp)
+                resp.raise_for_status()
             return True
         except Exception:
             logger.exception(

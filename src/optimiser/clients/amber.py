@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import httpx
 
 from ..config import AmberConfig
-from ..logging_utils import emit
+from ..logging_utils import api_call, emit
 from ..time_utils import now_utc, parse_iso
 from ..types import AmberUsageRow, EventType, PriceForecastLogRow, PriceInterval
 from ._retry import amber_retry
@@ -165,7 +165,8 @@ class AmberClient:
             logger.warning(
                 "Amber 30-min horizon shrunk to %d intervals (< %d threshold) "
                 "— LP planning horizon will be capped",
-                count, threshold,
+                count,
+                threshold,
             )
             emit(
                 EventType.AMBER_HORIZON_SHORT,
@@ -175,7 +176,8 @@ class AmberClient:
             self._horizon_short = False
             logger.info(
                 "Amber 30-min horizon recovered to %d intervals (>= %d threshold)",
-                count, threshold,
+                count,
+                threshold,
             )
             emit(
                 EventType.AMBER_HORIZON_RECOVERED,
@@ -209,10 +211,7 @@ class AmberClient:
         the cool-down runs long enough to matter to the state machine.
         """
         now = now_utc()
-        if (
-            self._rate_limited_until is not None
-            and now < self._rate_limited_until
-        ):
+        if self._rate_limited_until is not None and now < self._rate_limited_until:
             return True
         if (
             self._rate_remaining is not None
@@ -255,11 +254,22 @@ class AmberClient:
         """
         url = f"/sites/{self._config.site_id}/prices/current"
         params = {"next": next_count, "previous": previous, "resolution": resolution}
+        op = "prices_5min" if resolution == 5 else "prices_30min"
 
         try:
             async for attempt in amber_retry():
-                with attempt:
+                with attempt, api_call("amber", op) as call:
+                    call.extra["resolution"] = resolution
                     resp = await self._client.get(url, params=params)
+                    call.set_response(resp)
+                    # Rate-limit headroom is on every response (success
+                    # and 4xx alike) — attaching it here keeps the
+                    # signal on the API_CALL stream without a separate
+                    # event. None when headers absent (test mocks).
+                    if self._rate_remaining is not None:
+                        call.extra["rl_remaining"] = self._rate_remaining
+                    if self._rate_limit is not None:
+                        call.extra["rl_limit"] = self._rate_limit
                     resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             # 429 is non-retryable (would re-trigger the same bucket).
@@ -287,6 +297,7 @@ class AmberClient:
         fetched_at = now_utc()
         prices: list[PriceInterval] = []
         log_rows: list[PriceForecastLogRow] = []
+
         # Amber's feedIn channel is signed from their ledger perspective —
         # negative = revenue to customer, positive = customer pays (solar
         # glut). The LP's internal convention is the customer's:
@@ -410,15 +421,20 @@ class AmberClient:
 
         if self._rate_remaining <= _RATE_LIMIT_WARNING_THRESHOLD:
             if not self._warned_rate_low:
-                emit(EventType.PRICE_STALE, {
-                    "message": "Amber rate limit low",
-                    "remaining": self._rate_remaining,
-                    "limit": self._rate_limit,
-                    "reset_seconds": self._rate_reset_seconds,
-                })
+                emit(
+                    EventType.PRICE_STALE,
+                    {
+                        "message": "Amber rate limit low",
+                        "remaining": self._rate_remaining,
+                        "limit": self._rate_limit,
+                        "reset_seconds": self._rate_reset_seconds,
+                    },
+                )
                 logger.warning(
                     "Amber rate limit low: %s/%s remaining, resets in %ss",
-                    self._rate_remaining, self._rate_limit, self._rate_reset_seconds,
+                    self._rate_remaining,
+                    self._rate_limit,
+                    self._rate_reset_seconds,
                 )
                 self._warned_rate_low = True
         else:
@@ -446,13 +462,17 @@ class AmberClient:
             reset_s = 60
 
         self._rate_limited_until = now_utc() + timedelta(seconds=reset_s)
-        emit(EventType.PRICE_STALE, {
-            "message": "Amber 429 — deferring fetches",
-            "defer_seconds": reset_s,
-        })
+        emit(
+            EventType.PRICE_STALE,
+            {
+                "message": "Amber 429 — deferring fetches",
+                "defer_seconds": reset_s,
+            },
+        )
         logger.warning(
             "Amber returned 429 — skipping fetches for %ss (until %s)",
-            reset_s, self._rate_limited_until.isoformat(),
+            reset_s,
+            self._rate_limited_until.isoformat(),
         )
 
     async def get_usage(
@@ -464,8 +484,9 @@ class AmberClient:
         url = f"/sites/{self._config.site_id}/usage"
         params = {"startDate": start_date, "endDate": end_date}
         async for attempt in amber_retry():
-            with attempt:
+            with attempt, api_call("amber", "usage") as call:
                 resp = await self._client.get(url, params=params)
+                call.set_response(resp)
                 resp.raise_for_status()
         return resp.json()
 
