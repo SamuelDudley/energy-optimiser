@@ -12,7 +12,7 @@ from typing import Protocol, runtime_checkable
 import duckdb
 from aiohttp import web
 
-from ..config import APIConfig
+from ..config import APIConfig, BatteryConfig
 from ..types import TickSnapshot
 from .log_buffer import RingBufferHandler
 from .metrics import Metrics
@@ -39,6 +39,10 @@ class ServiceProbe(Protocol):
     # Directory where NDJSON snapshots live (daily .ndjson.gz). Powers
     # /snapshots range queries via DuckDB read_json over a glob.
     snapshot_dir: Path
+    # Battery configuration (capacity, SOC floor, charge/discharge caps).
+    # Exposed for /dashboard/config so the SOC panel can draw the floor
+    # line at the actual configured value rather than a hardcoded default.
+    battery_config: BatteryConfig
 
 
 # Typed app key — handlers retrieve the probe via

@@ -6,6 +6,13 @@ services:
     volumes:
       - ./config.toml:/etc/energy-optimiser/config.toml:ro
       - optimiser-data:/var/lib/energy-optimiser
+      # Dashboard static assets mounted read-only from the host. Lets
+      # HTML / CSS / JS edits hot-reload (the handler reads each file
+      # on every request) without rebuilding the image. Python edits
+      # still require a rebuild + restart. To bake the assets back
+      # into the image, comment out this mount and the matching
+      # EO_DASHBOARD_STATIC_DIR env var below.
+      - ./src/optimiser/api/static:/app/dashboard-static:ro
     # Network: needs access to Sigenergy (Modbus), Shelly (HTTP),
     # UniFi (HTTPS), and external APIs (Amber, Solcast, BOM)
     network_mode: host
@@ -15,6 +22,10 @@ services:
       # api/auth.py refuses to start if this is empty when
       # config.toml's [api].enabled = true.
       EO_API_TOKEN: ${EO_API_TOKEN}
+      # Tells the dashboard handler where to find HTML/CSS/JS. Pairs
+      # with the bind-mount above. Unset / commented to fall back to
+      # the package's baked-in static dir.
+      EO_DASHBOARD_STATIC_DIR: /app/dashboard-static
     logging:
       driver: json-file
       options:

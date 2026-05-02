@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Energy Optimiser — Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/static/dashboard.css" />
+  <!-- Plotly via CDN. To run offline, vendor plotly-2.x.min.js into
+       /dashboard/static and update _STATIC_FILES + this src. -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+  <header id="status-strip" class="strip">
+    <div class="status-block">
+      <div class="status-label">Service</div>
+      <div id="status-state" class="status-value">—</div>
+      <div id="status-tick-age" class="status-sub">—</div>
+    </div>
+    <div class="status-block">
+      <div class="status-label">SOC</div>
+      <div id="status-soc" class="status-value">—</div>
+      <div id="status-soh" class="status-sub">—</div>
+    </div>
+    <div class="status-block">
+      <div class="status-label">Dispatch</div>
+      <div id="status-dispatch-mode" class="status-value">—</div>
+      <div id="status-dispatch-detail" class="status-sub">—</div>
+    </div>
+    <div class="tile-row">
+      <div class="tile" id="tile-pv">
+        <div class="tile-label">PV</div>
+        <div class="tile-value">—</div>
+      </div>
+      <div class="tile" id="tile-batt">
+        <div class="tile-label">Battery</div>
+        <div class="tile-value">—</div>
+      </div>
+      <div class="tile" id="tile-grid">
+        <div class="tile-label">Grid</div>
+        <div class="tile-value">—</div>
+      </div>
+      <div class="tile" id="tile-load">
+        <div class="tile-label">House</div>
+        <div class="tile-value">—</div>
+      </div>
+    </div>
+    <div class="status-block right">
+      <div class="status-label">Cursor</div>
+      <div id="cursor-time" class="status-value">—</div>
+      <div id="cursor-mode" class="status-sub">live</div>
+      <button id="cursor-now-btn" type="button">Snap to now</button>
+    </div>
+  </header>
+
+  <nav id="range-bar" class="range-bar" aria-label="Date range">
+    <span class="range-label">View</span>
+    <div class="preset-row">
+      <button type="button" data-preset="live" class="primary" aria-pressed="true">Live</button>
+      <button type="button" data-preset="today">Today</button>
+      <button type="button" data-preset="yesterday">Yesterday</button>
+      <button type="button" data-preset="7d">7 days</button>
+    </div>
+    <span class="range-label">From</span>
+    <input type="date" id="range-from" />
+    <span class="range-label">To</span>
+    <input type="date" id="range-to" />
+    <button type="button" id="range-apply">Apply</button>
+    <span id="range-mode" class="mode-indicator live">live · last 24h + 48h forecast</span>
+  </nav>
+
+  <main>
+    <section class="panel panel-charts">
+      <div id="ts-figure"></div>
+    </section>
+
+    <section class="panel panel-sankey panel-sankey-cursor">
+      <div class="panel-header">
+        <h2 id="sankey-title">Energy flow</h2>
+        <span id="sankey-subtitle" class="muted">—</span>
+      </div>
+      <div id="sankey-figure"></div>
+    </section>
+
+    <section class="panel panel-sankey panel-sankey-today">
+      <div class="panel-header">
+        <h2 id="sankey-today-heading">Today</h2>
+        <span id="sankey-today-subtitle" class="muted">—</span>
+      </div>
+      <div id="sankey-today-figure"></div>
+    </section>
+
+    <section class="panel panel-spend">
+      <div class="panel-header">
+        <h2>Daily spend</h2>
+        <span id="spend-subtitle" class="muted">—</span>
+      </div>
+      <div id="spend-figure"></div>
+    </section>
+
+    <section class="panel panel-loads">
+      <div class="panel-header">
+        <h2>Managed loads</h2>
+      </div>
+      <div id="loads-grid" class="loads-grid">
+        <div class="muted">—</div>
+      </div>
+    </section>
+
+    <section class="panel panel-events">
+      <div class="panel-header">
+        <h2>Recent events</h2>
+      </div>
+      <ol id="events-list" class="events-list">
+        <li class="muted">—</li>
+      </ol>
+    </section>
+  </main>
+
+  <footer id="error-bar" class="error-bar hidden"></footer>
+
+  <script src="/dashboard/static/dashboard.js"></script>
+</body>
+</html>

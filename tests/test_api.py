@@ -19,6 +19,11 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from optimiser.api.auth import make_auth_middleware
+from optimiser.api.handlers.dashboard import (
+    dashboard_config,
+    dashboard_index,
+    dashboard_static,
+)
 from optimiser.api.handlers.discovery import TABLE_DESCRIPTIONS, root, table_schema
 from optimiser.api.handlers.health import healthz, readyz
 from optimiser.api.handlers.logs import logs as logs_handler
@@ -29,10 +34,19 @@ from optimiser.api.handlers.tables import table_rows
 from optimiser.api.log_buffer import RingBufferHandler
 from optimiser.api.metrics import Metrics
 from optimiser.api.probe import API_CONFIG_KEY, SERVICE_PROBE_KEY
-from optimiser.config import APIConfig
+from optimiser.api.server import _favicon
+from optimiser.config import APIConfig, BatteryConfig
 
 TOKEN = "test-token-xyz"
-_PUBLIC = ("/", "/healthz", "/readyz")
+_PUBLIC = (
+    "/",
+    "/healthz",
+    "/readyz",
+    "/favicon.ico",
+    "/dashboard",
+    "/dashboard/static/dashboard.css",
+    "/dashboard/static/dashboard.js",
+)
 
 
 @dataclass
@@ -47,6 +61,7 @@ class _Probe:
     log_buffer: RingBufferHandler | None = None
     last_snapshot: object = None  # Actual type: TickSnapshot | None
     snapshot_dir: Path | None = None
+    battery_config: BatteryConfig | None = None
 
     def __post_init__(self) -> None:
         if self.metrics is None:
@@ -55,6 +70,8 @@ class _Probe:
             # Default to a path that doesn't exist — /snapshots treats
             # this as an empty result, which is what most tests want.
             self.snapshot_dir = Path("/nonexistent-snapshot-dir")
+        if self.battery_config is None:
+            self.battery_config = BatteryConfig()
 
 
 def _fresh_heartbeat(tmp_path: Path) -> Path:
@@ -85,10 +102,14 @@ def _build_app(
     app.router.add_get("/", root)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/readyz", readyz)
+    app.router.add_get("/favicon.ico", _favicon)
     app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/logs", logs_handler)
     app.router.add_get("/plan/current", plan_current)
     app.router.add_get("/snapshots", snapshots_handler)
+    app.router.add_get("/dashboard", dashboard_index)
+    app.router.add_get("/dashboard/static/{filename}", dashboard_static)
+    app.router.add_get("/dashboard/config", dashboard_config)
     app.router.add_get("/{table}/schema", table_schema)
     app.router.add_get("/{table}", table_rows)
     return app
@@ -112,6 +133,15 @@ class TestAuth:
             for path in ("/", "/healthz", "/readyz"):
                 r = await c.get(path)
                 assert r.status in (200, 503), (path, r.status)
+
+    async def test_favicon_returns_204_without_auth(self, tmp_path: Path) -> None:
+        # Browsers auto-request /favicon.ico on every page load. The
+        # route returns 204 directly so it doesn't fall through to the
+        # /{table} catch-all and spam the events log with auth denials.
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/favicon.ico")
+            assert r.status == 204
 
     async def test_protected_path_rejects_missing_bearer(
         self, tmp_path: Path
@@ -1108,3 +1138,148 @@ class TestSnapshots:
             r = await c.get("/snapshots?limit=999", headers=_auth())
             body = await r.json()
             assert body["count"] == 5
+
+
+class TestDashboard:
+    """Coverage for the operator dashboard handler.
+
+    The HTML / CSS / JS files are checked for presence and correct
+    content-types. /dashboard/config is gated by bearer auth and surfaces
+    BatteryConfig fields the SOC panel needs (soc_floor_pct etc.).
+    """
+
+    async def test_dashboard_index_serves_html(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard")
+            assert r.status == 200
+            assert r.content_type == "text/html"
+            body = await r.text()
+            assert "<title>" in body
+            assert "ts-figure" in body  # the time-series figure container
+
+    async def test_dashboard_index_is_public(self, tmp_path: Path) -> None:
+        # The HTML page itself contains no data — must work without a token.
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard")
+            assert r.status == 200
+
+    async def test_dashboard_static_serves_js(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/static/dashboard.js")
+            assert r.status == 200
+            assert r.content_type == "application/javascript"
+            body = await r.text()
+            assert "Plotly" in body  # we reference Plotly.* throughout
+
+    async def test_dashboard_static_serves_css(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/static/dashboard.css")
+            assert r.status == 200
+            assert r.content_type == "text/css"
+
+    async def test_dashboard_static_blocks_unknown_filename(
+        self, tmp_path: Path
+    ) -> None:
+        # Layered defence: only the explicit dashboard.css / .js entries
+        # are in the public-paths whitelist, so the auth middleware
+        # rejects any other path *before* the handler runs (401). The
+        # handler's own _STATIC_FILES whitelist is the second layer
+        # (would return 404 if reached). Either way, no leak.
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/static/secret.txt")
+            assert r.status in (401, 404), r.status
+            # With a token, the handler's whitelist must still reject.
+            r = await c.get("/dashboard/static/secret.txt", headers=_auth())
+            assert r.status == 404, r.status
+
+    async def test_dashboard_static_blocks_path_traversal(
+        self, tmp_path: Path
+    ) -> None:
+        # An attempted ../etc/passwd must not return passwd contents,
+        # whether blocked by auth (401), the handler whitelist (404), or
+        # request normalisation (400). With a valid token the handler's
+        # whitelist is what enforces this.
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get(
+                "/dashboard/static/..%2F..%2Fetc%2Fpasswd", headers=_auth()
+            )
+            assert r.status in (400, 404), r.status
+            if r.status != 400:
+                body = await r.text()
+                assert "root:" not in body  # /etc/passwd content sentinel
+
+    async def test_dashboard_config_requires_token(
+        self, tmp_path: Path
+    ) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/config")
+            assert r.status == 401
+
+    async def test_dashboard_config_returns_battery_fields(
+        self, tmp_path: Path
+    ) -> None:
+        probe = _Probe(
+            heartbeat_path=_fresh_heartbeat(tmp_path),
+            battery_config=BatteryConfig(soc_floor_pct=22.5, capacity_kwh=40.0),
+        )
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/config", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["battery"]["soc_floor_pct"] == 22.5
+            assert body["battery"]["capacity_kwh"] == 40.0
+            # SOC panel needs all of these to draw axes / floor line.
+            for k in ("max_ac_charge_kw", "max_dc_charge_kw", "max_discharge_kw"):
+                assert k in body["battery"]
+
+    async def test_static_dir_env_override(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Setting EO_DASHBOARD_STATIC_DIR makes the handler read from a
+        different directory — used by docker-compose so dev edits to
+        HTML/CSS/JS don't require rebuilding the image."""
+        # Drop a sentinel CSS file in a tmp dir; point the handler at it
+        # via the env var; reload the module so _STATIC_DIR re-resolves.
+        import importlib
+
+        from optimiser.api.handlers import dashboard as dashboard_mod
+
+        custom = tmp_path / "static-override"
+        custom.mkdir()
+        (custom / "dashboard.css").write_text("/* sentinel */")
+        (custom / "dashboard.html").write_text("<html><body>OVR</body></html>")
+        # The JS must exist even if we don't fetch it (the index page
+        # references it but we're only testing static-asset routing).
+        (custom / "dashboard.js").write_text("// sentinel")
+
+        monkeypatch.setenv("EO_DASHBOARD_STATIC_DIR", str(custom))
+        importlib.reload(dashboard_mod)
+
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        # Build the app with the *reloaded* handler references.
+        app = web.Application(middlewares=[make_auth_middleware(TOKEN, _PUBLIC)])
+        app[SERVICE_PROBE_KEY] = probe
+        app[API_CONFIG_KEY] = APIConfig(
+            bearer_token_env="EO_API_TOKEN", query_max_limit=100, query_timeout_s=5.0
+        )
+        app.router.add_get("/dashboard", dashboard_mod.dashboard_index)
+        app.router.add_get(
+            "/dashboard/static/{filename}", dashboard_mod.dashboard_static
+        )
+        async with TestClient(TestServer(app)) as c:
+            r = await c.get("/dashboard")
+            body = await r.text()
+            assert "OVR" in body, body
+            r = await c.get("/dashboard/static/dashboard.css")
+            assert "sentinel" in await r.text()
+
+        # Restore the un-overridden module so other tests see the real assets.
+        monkeypatch.delenv("EO_DASHBOARD_STATIC_DIR", raising=False)
+        importlib.reload(dashboard_mod)

@@ -1,0 +1,346 @@
+:root {
+  --bg: #0e1116;
+  --bg-elev: #161b22;
+  --bg-soft: #1d242c;
+  --border: #2a313a;
+  --text: #e8edf2;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --good: #3fb950;
+  --warn: #d29922;
+  --bad:  #f85149;
+  --buy:  #d29922;
+  --sell: #3fb950;
+  --import: #f0883e;
+  --export: #56d364;
+  --pv:   #f2cc60;
+  --batt: #79c0ff;
+  --load: #c9d1d9;
+  --planned: #8b949e;
+
+  --ts-figure-h: 980px;
+  --sankey-figure-h: 460px;
+  --spend-figure-h: 320px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+header.strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  align-items: center;
+  padding: 12px 20px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.status-block { line-height: 1.2; flex: 0 0 auto; }
+.status-block.right { text-align: right; margin-left: auto; }
+.status-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.status-value { font-size: 20px; font-weight: 600; }
+.status-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+.status-state-active     { color: var(--good); }
+.status-state-degraded   { color: var(--warn); }
+.status-state-fallback   { color: var(--bad);  }
+.status-state-unknown    { color: var(--muted); }
+
+.tile-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-self: center;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+  min-width: 0;
+}
+.tile {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  min-width: 84px;
+  flex: 0 1 auto;
+}
+.tile-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.tile-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
+
+#cursor-now-btn {
+  margin-top: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  cursor: pointer;
+}
+#cursor-now-btn:hover { border-color: var(--accent); }
+#cursor-now-btn[disabled] { opacity: 0.4; cursor: default; }
+
+/* Range picker bar — sits below the status strip, above the charts. */
+.range-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 10px 20px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  position: sticky;
+  top: 0;
+  z-index: 9;
+}
+.range-bar .range-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.range-bar input[type="date"] {
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font: inherit;
+  color-scheme: dark;
+  min-width: 0;
+}
+.range-bar button {
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+.range-bar button:hover { border-color: var(--accent); }
+.range-bar button.primary {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+.range-bar button.primary:hover { filter: brightness(1.1); }
+.range-bar button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.range-bar .preset-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.range-bar .mode-indicator {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+.range-bar .mode-indicator.live { color: var(--good); }
+.range-bar .mode-indicator.historical { color: var(--accent); }
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto auto;
+  gap: 16px;
+  padding: 16px 20px;
+  max-width: 1800px;
+  margin: 0 auto;
+}
+
+.panel {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.panel-header h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.panel-charts {
+  grid-column: 1 / span 2;
+  padding: 4px 4px 0 4px;
+}
+#ts-figure { width: 100%; height: var(--ts-figure-h); }
+
+/* Sankey row: the two diagrams sit side-by-side in their own grid
+   cells so each can use its full column width and a generous height
+   without the previous "stacked-in-one-panel" layout clipping them.
+   Managed loads + events drop to the row below. */
+.panel-sankey-cursor { grid-column: 1 / span 1; }
+.panel-sankey-today  { grid-column: 2 / span 1; }
+#sankey-figure, #sankey-today-figure { width: 100%; height: var(--sankey-figure-h); }
+
+.panel-spend  { grid-column: 1 / span 2; padding: 8px 8px 0 8px; }
+#spend-figure { width: 100%; height: var(--spend-figure-h); }
+
+.panel-loads  { grid-column: 1 / span 1; }
+.panel-events { grid-column: 2 / span 1; }
+.loads-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+.load-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.load-card-header { display: flex; justify-content: space-between; font-size: 12px; }
+.load-card-name { color: var(--text); font-weight: 600; }
+.load-card-state { color: var(--muted); }
+.load-card-power { font-size: 18px; font-weight: 600; margin-top: 4px; }
+.load-card-energy { font-size: 11px; color: var(--muted); }
+.relay-on  { color: var(--good); }
+.relay-off { color: var(--muted); }
+
+.events-list { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; }
+.events-list li {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 4px 0;
+}
+.events-list li:last-child { border-bottom: none; }
+.event-ts   { color: var(--muted); margin-right: 8px; }
+.event-type { color: var(--accent); margin-right: 8px; }
+.event-warn { color: var(--warn); }
+.event-bad  { color: var(--bad); }
+
+.muted { color: var(--muted); }
+
+.error-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--bad);
+  color: white;
+  padding: 8px 16px;
+  font-size: 13px;
+  z-index: 100;
+}
+.error-bar.hidden { display: none; }
+
+/* ── Tablet (≤ 1100px): two-column grid stays, but tighter ──────── */
+@media (max-width: 1100px) {
+  :root {
+    --ts-figure-h: 820px;
+    --sankey-figure-h: 360px;
+    --spend-figure-h: 280px;
+  }
+}
+
+/* ── Phone-sized (≤ 760px): single column everywhere ───────────── */
+@media (max-width: 760px) {
+  :root {
+    --ts-figure-h: 720px;
+    --sankey-figure-h: 320px;
+    --spend-figure-h: 260px;
+  }
+
+  html, body { font-size: 13px; }
+
+  header.strip {
+    padding: 10px 12px;
+    gap: 10px 16px;
+  }
+  .status-value { font-size: 16px; }
+  .status-block.right {
+    margin-left: 0;
+    text-align: left;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .status-block.right .status-label,
+  .status-block.right .status-value,
+  .status-block.right .status-sub { margin: 0; }
+  .status-block.right #cursor-now-btn { margin-top: 0; }
+
+  .tile-row {
+    width: 100%;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .tile {
+    flex: 1 1 calc(50% - 6px);
+    min-width: 0;
+    padding: 6px 8px;
+  }
+  .tile-value { font-size: 15px; }
+
+  .range-bar {
+    padding: 8px 12px;
+    gap: 6px 8px;
+  }
+  .range-bar input[type="date"] { flex: 1 1 calc(50% - 4px); }
+  .range-bar .preset-row { width: 100%; justify-content: space-between; }
+  .range-bar .preset-row button { flex: 1 1 0; }
+  .range-bar .mode-indicator {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  main {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 6px 4px;
+  }
+  /* Tighten panel padding so the plot area gets the screen width.
+     Most panels use 12px → 4px; the chart panels were already 4–8 px
+     so we drop them to 2 px to claw back every pixel we can. */
+  .panel { padding: 6px 4px; }
+  .panel-charts { padding: 2px 2px 0 2px; }
+  .panel-spend { padding: 4px 2px 0 2px; }
+  .panel-loads { padding: 8px; }    /* text content — keep readable margin */
+  .panel-events { padding: 8px; }
+
+  .panel-charts,
+  .panel-sankey-cursor,
+  .panel-sankey-today,
+  .panel-spend,
+  .panel-loads,
+  .panel-events {
+    grid-column: 1 / -1;
+  }
+
+  .events-list { max-height: 240px; }
+}
+
+/* ── Very narrow (≤ 420px): tighten further ────────────────────── */
+@media (max-width: 420px) {
+  :root {
+    --ts-figure-h: 640px;
+  }
+  .status-value { font-size: 15px; }
+  .tile-value { font-size: 14px; }
+}

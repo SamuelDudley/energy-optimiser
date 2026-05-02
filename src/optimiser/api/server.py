@@ -17,6 +17,11 @@ from aiohttp import web
 from ..config import APIConfig
 from .auth import load_token, make_auth_middleware
 from .handlers.daily_spend import daily_spend
+from .handlers.dashboard import (
+    dashboard_config,
+    dashboard_index,
+    dashboard_static,
+)
 from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
 from .handlers.logs import logs as logs_handler
@@ -30,8 +35,25 @@ logger = logging.getLogger(__name__)
 
 # Endpoints that skip bearer-token auth. Liveness probes and the
 # self-describing index are open so operators and agents can bootstrap
-# without a token.
-_PUBLIC_PATHS = ("/", "/healthz", "/readyz")
+# without a token. The dashboard HTML / CSS / JS are also public — the
+# files themselves carry no data; the in-page JS prompts the user for
+# the bearer token and uses it for the data fetches.
+_PUBLIC_PATHS = (
+    "/",
+    "/healthz",
+    "/readyz",
+    "/favicon.ico",
+    "/dashboard",
+    "/dashboard/static/dashboard.css",
+    "/dashboard/static/dashboard.js",
+)
+
+
+async def _favicon(_request: web.Request) -> web.Response:
+    # Browsers auto-request /favicon.ico on every dashboard load. Return
+    # a quiet 204 so the request doesn't fall through to the /{table}
+    # matcher and pollute the events log with auth denials.
+    return web.Response(status=204)
 
 
 class APIServer:
@@ -50,13 +72,16 @@ class APIServer:
         # at startup rather than quietly shipping an open API.
         token = load_token(self._config.bearer_token_env)
 
-        app = web.Application(middlewares=[make_auth_middleware(token, _PUBLIC_PATHS)])
+        app = web.Application(
+            middlewares=[make_auth_middleware(token, _PUBLIC_PATHS)]
+        )
         app[SERVICE_PROBE_KEY] = self._probe
         app[API_CONFIG_KEY] = self._config
 
         app.router.add_get("/", root)
         app.router.add_get("/healthz", healthz)
         app.router.add_get("/readyz", readyz)
+        app.router.add_get("/favicon.ico", _favicon)
         app.router.add_get("/metrics", metrics_handler)
         app.router.add_get("/logs", logs_handler)
         # /plan/current, /snapshots, /daily_spend are concrete paths,
@@ -65,14 +90,24 @@ class APIServer:
         app.router.add_get("/plan/current", plan_current)
         app.router.add_get("/snapshots", snapshots)
         app.router.add_get("/daily_spend", daily_spend)
+        # Dashboard: HTML page + whitelisted static assets (public) +
+        # config bundle (authed). All registered before the /{table}
+        # catch-all so the path matcher routes them correctly.
+        app.router.add_get("/dashboard", dashboard_index)
+        app.router.add_get("/dashboard/static/{filename}", dashboard_static)
+        app.router.add_get("/dashboard/config", dashboard_config)
         app.router.add_get("/{table}/schema", table_schema)
         app.router.add_get("/{table}", table_rows)
 
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, host=self._config.host, port=self._config.port)
+        self._site = web.TCPSite(
+            self._runner, host=self._config.host, port=self._config.port
+        )
         await self._site.start()
-        logger.info("API server listening on %s:%d", self._config.host, self._config.port)
+        logger.info(
+            "API server listening on %s:%d", self._config.host, self._config.port
+        )
 
     async def stop(self) -> None:
         if self._site is not None:
