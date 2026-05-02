@@ -707,27 +707,28 @@ def _add_non_anticipativity(
     other_name: str,
     lp_loads: list[LPLoad],
 ) -> None:
-    """Tie slot-0 decisions across scenarios.
+    """Tie cross-scenario decisions: slot-0 battery + every-slot relays.
 
-    Only what we genuinely commit to at slot 0 is tied — physically,
-    this is the battery setpoint (signed kW) and load relay states.
-    Everything else (per-scenario PV allocation, grid import) is derived
-    from the actual PV that materialises in each scenario via the
-    energy balance.
+    Battery: only the slot-0 net kW is tied — that's the single commitment
+    we send to register 40031. Per-scenario allocations (PV → house /
+    battery / export, grid import) and slot-1+ trajectories diverge so
+    each scenario can plan against its own PV trajectory. `grid_export[0]`
+    is deliberately NOT tied: the cap we write to register 40038 is a
+    ceiling, derived post-solve across scenarios in
+    `solver.py::_extract_solution`.
 
-    `grid_export[0]` is deliberately NOT tied. The value we actually
-    write to register 40038 is a *ceiling*, not a setpoint — each
-    scenario's slot-0 export flow may legitimately differ inside that
-    ceiling. The cap is derived post-solve across all scenarios in
-    `solver.py::_extract_solution`: any scenario planning positive
-    export → write the DNSP cap (so a better-than-expected PV
-    realisation can flow out); all scenarios agree on zero → pin to 0
-    (so transient PV above plan can't leak at a negative export price).
-
-    Tying the individual PV variables would over-constrain the problem:
-    different scenarios have different `pv_avail[0]` values, and the
-    `pv_alloc` constraint (allocations sum to availability) can't hold
-    for three different totals with identical allocations.
+    Relays: tied across scenarios at *every* slot, not just slot 0. The HP
+    relay schedule is independent of the PV stochastic axis — HP draw is
+    constant, and the only LP coupling to PV is via export prices, which
+    are deterministic in POINT mode. Treating the full HP schedule as a
+    first-stage decision is therefore equivalent to allowing per-scenario
+    schedules under POINT, but lets HiGHS presolve eliminate ~(N-1)/N of
+    the binary-relay variables. In practice this dropped the worst-case
+    wall-clock solve time from 20.4 s (timeLimit) to ~5 s on the
+    evening-peak / hot-water-deadline ticks where the binary relay is the
+    binding cost. If price scenarios become non-deterministic (CROSS
+    mode, KNOWN-ISSUES #24), this constraint can be relaxed back to
+    slot-0-only at a per-scenario relay cost.
     """
     # Net battery kW at slot 0 (signed: + charge, − discharge) — the
     # single commitment we send to register 40031.
@@ -735,7 +736,7 @@ def _add_non_anticipativity(
     other_net = other.bat_charge_grid[0] + other.bat_charge_pv[0] - other.bat_discharge[0]
     prob += (other_net == base_net, f"nonanti_bat_net_{other_name}")
 
-    # Per-load slot-0 binaries (relay states).
+    # Per-load relay state — tied at every slot (see docstring).
     for load_id, base_lv in base.loads.items():
         other_lv = other.loads.get(load_id)
         if other_lv is None:
@@ -744,10 +745,11 @@ def _add_non_anticipativity(
             base_extra = base_lv.extras.get(extra_name)
             other_extra = other_lv.extras.get(extra_name)
             if base_extra is not None and other_extra is not None:
-                prob += (
-                    other_extra[0] == base_extra[0],
-                    f"nonanti_{load_id}_{extra_name}_{other_name}",
-                )
+                for t in range(len(base_extra)):
+                    prob += (
+                        other_extra[t] == base_extra[t],
+                        f"nonanti_{load_id}_{extra_name}_{other_name}_t{t}",
+                    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────

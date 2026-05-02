@@ -271,6 +271,34 @@ class TestNonAnticipativity:
                 f"slot-0 relay differs: {name}={val}, baseline={baseline}"
             )
 
+    def test_relay_tied_across_scenarios_at_every_slot(self) -> None:
+        """Every-slot relay tie collapses 3× the relay binaries via HiGHS
+        presolve and is what holds the worst-case solve time well under
+        the wall-clock timeout. Regression: ensure we generated one
+        nonanti tie per (non-base scenario × slot × relay-load).
+        """
+        cfg = _hw_cfg()
+        prob, svars = build_stochastic_lp(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=_pv_forecast(p50_kw=5.0, p10_kw=3.0, p90_kw=7.0),
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenLoad(cfg)],
+            battery_config=BatteryConfig(),
+        )
+        n_slots = len(svars.slots)
+        n_other_scenarios = len(svars.scenarios) - 1  # base isn't tied to itself
+
+        relay_ties = [
+            name for name in prob.constraints if name.startswith("nonanti_hot_water_relay_")
+        ]
+        expected = n_slots * n_other_scenarios
+        assert len(relay_ties) == expected, (
+            f"expected {expected} nonanti relay ties "
+            f"({n_slots} slots × {n_other_scenarios} other scenarios), got {len(relay_ties)}"
+        )
+
 
 # ── Behavioural properties ──────────────────────────────────────
 
@@ -580,8 +608,7 @@ class TestExportUntied:
         # P90 has more PV than P10; with SOC near ceiling, the surplus
         # has nowhere to go but export. Export is free to differ now.
         assert exports["p90"] > exports["p10"] + 0.1, (
-            f"export tie still active: p10={exports['p10']:.3f}, "
-            f"p90={exports['p90']:.3f}"
+            f"export tie still active: p10={exports['p10']:.3f}, p90={exports['p90']:.3f}"
         )
 
         # Battery net kW is still tied — regression guard on the
@@ -592,11 +619,11 @@ class TestExportUntied:
                 + (v.bat_charge_pv[0].value() or 0.0)
                 - (v.bat_discharge[0].value() or 0.0)
             )
+
         baseline = _net(svars.pv_scenario("p50"))
         for name, vars in svars.scenarios.items():
             assert _net(vars) == pytest.approx(baseline, abs=0.001), (
-                f"battery-net tie broken: {name} net={_net(vars):.3f}, "
-                f"p50 baseline={baseline:.3f}"
+                f"battery-net tie broken: {name} net={_net(vars):.3f}, p50 baseline={baseline:.3f}"
             )
 
     def test_cap_equals_dnsp_when_any_scenario_plans_export(self) -> None:
