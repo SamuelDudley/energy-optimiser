@@ -122,8 +122,7 @@ class StochasticLPVars:
         ]
         if not candidates:
             raise KeyError(
-                f"no compound scenario for pv_name={pv_name!r}; "
-                f"available={list(self.scenarios)}"
+                f"no compound scenario for pv_name={pv_name!r}; available={list(self.scenarios)}"
             )
         return max(candidates, key=lambda nv: nv[1].weight)[1]
 
@@ -143,6 +142,7 @@ def build_lp(
     horizon_hours: int = HORIZON_HOURS,
     slot_minutes: int = SLOT_MINUTES,
     pv_percentile: str = "p50",
+    terminal_floor_override_pct: float | None = None,
 ) -> tuple[pulp.LpProblem, LPVars]:
     """Build a single-scenario deterministic LP.
 
@@ -179,6 +179,7 @@ def build_lp(
         battery_config=battery_config,
         wear_cost_per_kwh=wear_cost_per_kwh,
         price_scenario=point_scenario,
+        terminal_floor_override_pct=terminal_floor_override_pct,
     )
     prob += pulp.lpSum(cost_terms), "total_cost_cents"
     return prob, vars
@@ -201,6 +202,7 @@ def build_stochastic_lp(
     slot_minutes: int = SLOT_MINUTES,
     price_scenario_mode: PriceScenarioMode | None = None,
     slot_0_pv_override_kw: float | None = None,
+    terminal_floor_override_pct: float | None = None,
 ) -> tuple[pulp.LpProblem, StochasticLPVars]:
     """Build a two-stage stochastic LP across compound (PV × price) scenarios.
 
@@ -288,6 +290,7 @@ def build_stochastic_lp(
                 wear_cost_per_kwh=wear_cost_per_kwh,
                 price_scenario=price_scenario,
                 slot_0_pv_override_kw=slot_0_pv_override_kw,
+                terminal_floor_override_pct=terminal_floor_override_pct,
             )
             scenarios[compound_name] = vars
             all_cost_terms.extend(cost_terms)
@@ -343,6 +346,7 @@ def _add_scenario_to_problem(
     wear_cost_per_kwh: float,
     price_scenario: PriceScenario,
     slot_0_pv_override_kw: float | None = None,
+    terminal_floor_override_pct: float | None = None,
 ) -> tuple[LPVars, list[pulp.LpAffineExpression]]:
     """Add one scenario's variables, constraints, and weighted cost terms
     to the problem. Returns the LPVars and the list of cost terms (already
@@ -434,9 +438,7 @@ def _add_scenario_to_problem(
     # Slack on the upper side of the operating band, per slot. Penalty
     # is large enough to dominate any arbitrage gain but finite (not
     # big-M) so the LP stays numerically well-conditioned.
-    soc_over_ceiling = [
-        pulp.LpVariable(f"{prefix}soc_over_{t}", lowBound=0.0) for t in range(n)
-    ]
+    soc_over_ceiling = [pulp.LpVariable(f"{prefix}soc_over_{t}", lowBound=0.0) for t in range(n)]
 
     # Effective per-slot floor. Same hierarchy as the terminal floor
     # (max of the three configured floor-like bounds) but excluding
@@ -595,15 +597,18 @@ def _add_scenario_to_problem(
     # table + rationale, and `TERMINAL-VALUE-PLAN.md` for the path
     # toward replacing this hand-calibrated curve with a fitted V.
     terminal_time_nem = slots[n - 1] + timedelta(hours=10)
+    terminal_floor_from_table = (
+        terminal_floor_override_pct
+        if terminal_floor_override_pct is not None
+        else terminal_soc_floor_pct(terminal_time_nem)
+    )
     terminal_floor = max(
         battery_config.soc_floor_pct,
         battery_config.backup_soc_pct,
         battery_config.discharge_cutoff_pct,
-        terminal_soc_floor_pct(terminal_time_nem),
+        terminal_floor_from_table,
     )
-    soc_terminal_slack = pulp.LpVariable(
-        f"{prefix}soc_terminal_slack", lowBound=0.0
-    )
+    soc_terminal_slack = pulp.LpVariable(f"{prefix}soc_terminal_slack", lowBound=0.0)
     prob += (
         soc_pct[n - 1] >= terminal_floor - soc_terminal_slack,
         f"{prefix}terminal_soc",
@@ -639,10 +644,7 @@ def _add_scenario_to_problem(
         # prices — the term is conditional on ep ≤ 0.
         if ep <= 0:
             cost_terms.append(
-                weight
-                * grid_export[t]
-                * EXPORT_TIE_BREAK_PENALTY_PER_KWH
-                * slot_hours
+                weight * grid_export[t] * EXPORT_TIE_BREAK_PENALTY_PER_KWH * slot_hours
             )
         # Import tie-break: mirror of the export rule. At non-positive
         # import prices (paid-to-take electricity), subtract a tiny
@@ -652,10 +654,7 @@ def _add_scenario_to_problem(
         # are unaffected.
         if ip <= 0:
             cost_terms.append(
-                -weight
-                * grid_import[t]
-                * IMPORT_TIE_BREAK_REWARD_PER_KWH
-                * slot_hours
+                -weight * grid_import[t] * IMPORT_TIE_BREAK_REWARD_PER_KWH * slot_hours
             )
         cost_terms.append(
             weight
@@ -669,16 +668,12 @@ def _add_scenario_to_problem(
         # Penalty is below wear so genuine forced-curtail cases (battery
         # at hard ceiling, scenario PV exceeds all sinks) still resolve
         # correctly. See constants.PV_CURTAIL_PENALTY_PER_KWH for sizing.
-        cost_terms.append(
-            weight * pv_curtailed[t] * PV_CURTAIL_PENALTY_PER_KWH * slot_hours
-        )
+        cost_terms.append(weight * pv_curtailed[t] * PV_CURTAIL_PENALTY_PER_KWH * slot_hours)
         # SOC over-ceiling penalty only (no lower-band slack; see the
         # `soc_over_ceiling` block above). Weighted like any other cost
         # term so all scenarios contribute their share; slack is zero
         # in nominal conditions.
-        cost_terms.append(
-            weight * SOC_BOUND_PENALTY * soc_over_ceiling[t]
-        )
+        cost_terms.append(weight * SOC_BOUND_PENALTY * soc_over_ceiling[t])
     # Terminal SOC slack (one variable for the whole horizon).
     cost_terms.append(weight * SOC_BOUND_PENALTY * soc_terminal_slack)
 

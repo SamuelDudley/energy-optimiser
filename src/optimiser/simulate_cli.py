@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
 from .config import load_config
 from .simulate import ScenarioModifier, simulate
@@ -71,6 +70,17 @@ def main() -> None:
         help="Override soc_floor_pct (default: from config)",
     )
     p.add_argument(
+        "--terminal-floor",
+        type=float,
+        default=None,
+        help=(
+            "Override the LP's terminal-slot SOC floor (%) for the entire "
+            "horizon. Replaces the lp.constants._TERMINAL_FLOOR_BY_NEM_HOUR "
+            "lookup with a constant value. Use to A/B the hand-calibrated "
+            "table — see KNOWN-ISSUES on terminal-value V function."
+        ),
+    )
+    p.add_argument(
         "--ceiling",
         type=float,
         default=None,
@@ -93,6 +103,7 @@ def main() -> None:
     bcfg = cfg.battery
     if args.floor is not None or args.ceiling is not None:
         import dataclasses as _dc
+
         overrides: dict = {}
         if args.floor is not None:
             overrides["soc_floor_pct"] = args.floor
@@ -116,13 +127,14 @@ def main() -> None:
     )
 
     def progress(done: int, total: int) -> None:
-        print(f"  {done}/{total} steps  ({done/total*100:.0f}%)", end="\r", file=sys.stderr)
+        print(f"  {done}/{total} steps  ({done / total * 100:.0f}%)", end="\r", file=sys.stderr)
 
     result = simulate(
         snapshots=args.snapshots,
         battery_config=bcfg,
         scenario_weights=weights,
         wear_cost_per_kwh=args.wear_cost,
+        terminal_floor_override_pct=args.terminal_floor,
         modifier=mod,
         initial_soc_pct=args.initial_soc,
         progress=progress,

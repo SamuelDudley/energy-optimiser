@@ -1028,6 +1028,8 @@ class Service:
                     battery_config=self._config.battery,
                     scenario_weights=self._config.planner.lp_scenario_weights,
                     price_scenario_mode=price_scenario_mode,
+                    wear_cost_per_kwh=self._config.planner.lp_wear_cost_per_kwh,
+                    terminal_floor_override_pct=self._config.planner.lp_terminal_floor_override_pct,
                     slot_0_pv_override_kw=slot_0_pv_override_kw,
                 ),
                 timeout=self._config.planner.lp_wall_clock_timeout_s,

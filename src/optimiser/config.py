@@ -164,9 +164,7 @@ class WeatherConfig:
     # Set to empty string to disable — no fetch, no table writes.
     # Note: BOM's ToS assert the API is not for redistribution; personal
     # use is fine but don't build a commercial product on this endpoint.
-    bom_forecast_url: str = (
-        "https://api.weather.bom.gov.au/v1/locations/r3dp4v/forecasts/hourly"
-    )
+    bom_forecast_url: str = "https://api.weather.bom.gov.au/v1/locations/r3dp4v/forecasts/hourly"
     forecast_poll_interval_s: int = 3600
 
 
@@ -204,6 +202,19 @@ class PlannerConfig:
     # weighted scenarios. String here so config.toml stays plain;
     # parsed via the property below.
     lp_price_scenario_mode: str = "point"
+    # One-way battery throughput cost in c/kWh (round-trip ≈ 2×).
+    # `None` falls back to lp.constants.WEAR_COST_PER_KWH (the
+    # marginal-degradation calibration). Override here when tuning
+    # against forecast-band bias (see KNOWN-ISSUES #24).
+    lp_wear_cost_per_kwh: float | None = None
+    # Terminal-slot SOC floor (%) for the LP horizon. `None` falls
+    # back to the hand-calibrated _TERMINAL_FLOOR_BY_NEM_HOUR table
+    # in lp.constants (varies by NEM hour the horizon ends at).
+    # Setting a constant overrides the table entirely — useful as a
+    # tuning knob until the V-function lands. Always wrapped in
+    # max(operational floor, backup, cutoff) inside the LP, so it
+    # cannot drop below the safety floor.
+    lp_terminal_floor_override_pct: float | None = None
 
     @property
     def lp_scenario_weights(self) -> dict[str, float]:

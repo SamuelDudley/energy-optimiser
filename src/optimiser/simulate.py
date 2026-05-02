@@ -48,24 +48,21 @@ import dataclasses
 import gzip
 import json
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import BatteryConfig
 from .lp.constants import SLOT_MINUTES
-from .lp.dispatch import DispatchKind, dispatch_from_slot
+from .lp.dispatch import dispatch_from_slot
 from .lp.loads import build_lp_loads
 from .lp.result import SolveStatus
 from .lp.solver import solve_stochastic
+from .replay import _reconstruct_snapshot
 from .types import (
-    PriceInterval,
-    PVForecast,
-    SystemState,
     TickSnapshot,
 )
-from .replay import _reconstruct_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -175,15 +172,15 @@ class SimulationStep:
     ts: datetime
     soc_pct_start: float
     soc_pct_end: float
-    bat_kw: float                 # signed slot-0 plan
-    grid_import_kw: float         # realised after physics
-    grid_export_kw: float         # realised after physics
-    pv_actual_kw: float           # ground-truth PV at this tick
+    bat_kw: float  # signed slot-0 plan
+    grid_import_kw: float  # realised after physics
+    grid_export_kw: float  # realised after physics
+    pv_actual_kw: float  # ground-truth PV at this tick
     house_load_kw: float
     import_price: float
     export_price: float
-    cost_cents: float             # realised this slot (positive = paid grid)
-    dispatch_kind: str            # for the audit trail
+    cost_cents: float  # realised this slot (positive = paid grid)
+    dispatch_kind: str  # for the audit trail
     solve_status: str
     solve_ms: float
     lp_planned_soc_pct_end: float
@@ -233,9 +230,7 @@ class SimulationResult:
 
     @property
     def n_solve_failures(self) -> int:
-        return sum(
-            1 for s in self.steps if s.solve_status not in ("optimal", "feasible")
-        )
+        return sum(1 for s in self.steps if s.solve_status not in ("optimal", "feasible"))
 
     def summary(self) -> dict:
         return {
@@ -358,6 +353,7 @@ def simulate(
     battery_config: BatteryConfig,
     scenario_weights: dict[str, float] | None = None,
     wear_cost_per_kwh: float | None = None,
+    terminal_floor_override_pct: float | None = None,
     modifier: ScenarioModifier | None = None,
     initial_soc_pct: float | None = None,
     start_ts: datetime | None = None,
@@ -408,11 +404,7 @@ def simulate(
     sim_end = end_ts or sorted_ts[-1]
 
     first_snap = index[sorted_ts[0]]
-    soc = (
-        initial_soc_pct
-        if initial_soc_pct is not None
-        else first_snap.system_state.soc_pct
-    )
+    soc = initial_soc_pct if initial_soc_pct is not None else first_snap.system_state.soc_pct
 
     slot_hours = SLOT_MINUTES / 60.0
     step_delta = timedelta(minutes=SLOT_MINUTES)
@@ -448,12 +440,10 @@ def simulate(
             battery_config=battery_config,
             scenario_weights=scenario_weights,
             wear_cost_per_kwh=wear_cost_per_kwh,
+            terminal_floor_override_pct=terminal_floor_override_pct,
         )
 
-        if (
-            sol.status not in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
-            or sol.slot_0 is None
-        ):
+        if sol.status not in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE) or sol.slot_0 is None:
             # Fallback: SELF_CONSUME. Battery doesn't charge/discharge;
             # PV serves house, surplus exports.
             bat_kw = 0.0

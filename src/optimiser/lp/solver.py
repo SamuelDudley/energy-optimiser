@@ -83,6 +83,7 @@ def solve_stochastic(
     wear_cost_per_kwh: float | None = None,
     price_scenario_mode=None,  # type: ignore[no-untyped-def]
     slot_0_pv_override_kw: float | None = None,
+    terminal_floor_override_pct: float | None = None,
 ) -> LPSolution:
     """Build and solve the stochastic LP across compound (PV × price)
     scenarios.
@@ -99,6 +100,7 @@ def solve_stochastic(
     sweep gate.
     """
     from .constants import WEAR_COST_PER_KWH as _DEFAULT_WEAR
+
     wear = wear_cost_per_kwh if wear_cost_per_kwh is not None else _DEFAULT_WEAR
     t0 = time.monotonic()
     try:
@@ -114,6 +116,7 @@ def solve_stochastic(
             wear_cost_per_kwh=wear,
             price_scenario_mode=price_scenario_mode,
             slot_0_pv_override_kw=slot_0_pv_override_kw,
+            terminal_floor_override_pct=terminal_floor_override_pct,
         )
     except Exception as exc:
         logger.exception("Stochastic LP build failed")
@@ -313,14 +316,10 @@ def _extract_solution(
     #     becomes advisory — useful for snapshot/logging, not the
     #     commit.
     if scenarios is not None:
-        any_plans_export = any(
-            _v(s.grid_export[0]) >= NUMERIC_EPS for s in scenarios.values()
-        )
+        any_plans_export = any(_v(s.grid_export[0]) >= NUMERIC_EPS for s in scenarios.values())
     else:
         any_plans_export = slot_0.grid_export_kw >= NUMERIC_EPS
-    export_limit: float | None = (
-        battery_config.export_limit_kw if any_plans_export else 0.0
-    )
+    export_limit: float | None = battery_config.export_limit_kw if any_plans_export else 0.0
 
     raw_cost = pulp.value(prob.objective) or 0.0
 
@@ -351,11 +350,7 @@ def _extract_solution(
     # `cost` is the economic expected cost; `raw_cost` retains the
     # slack-inflated value for debugging. Only log raw_cost when the
     # penalty is non-negligible so steady-state logs stay tidy.
-    penalty_note = (
-        f" (penalty={penalty_cost:.0f}c)"
-        if penalty_cost > 1.0
-        else ""
-    )
+    penalty_note = f" (penalty={penalty_cost:.0f}c)" if penalty_cost > 1.0 else ""
     reason = (
         f"LP {status.value}{extra}: bat={slot_0.battery_kw:+.2f}kW, "
         f"export={slot_0.grid_export_kw:.2f}kW, "
