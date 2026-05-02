@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from pymodbus.client import AsyncModbusTcpClient
@@ -155,6 +156,23 @@ class SigenergyController:
         # grid-sensor fault.
         self._warned_grid_sensor_offline = False
         self._warned_absurd_derivation = False
+        # Set on every successful read of REG_GRID_SENSOR_STATUS in
+        # read_state. Initialised here so MODBUS_READ_BATCH can be
+        # emitted in the finally block even on first-call reconnect
+        # failures (no attribute-error from the unread state).
+        self._grid_sensor_status: int = 0
+        # Per-call counters for MODBUS_READ_BATCH. Each `_read_*` helper
+        # increments `_reads_total`; failed reads (isError or exception)
+        # increment `_reads_failed`. read_state snapshots both at entry
+        # and computes deltas at exit so the batch event reflects only
+        # this tick's reads.
+        self._reads_total = 0
+        self._reads_failed = 0
+        # Reconnect telemetry. _reconnect_attempts is monotonic since
+        # process start so the dashboard can compute attempts/hr from
+        # any window of MODBUS_RECONNECTED events.
+        self._reconnect_attempts = 0
+        self._last_reconnect_ms: float | None = None
 
     @property
     def connected(self) -> bool:
@@ -193,12 +211,21 @@ class SigenergyController:
         Called after any successful Modbus operation (read_state's reconnect,
         successful writes that recover from a prior drop). The rising-edge
         guard means steady-state ticks don't spam the event stream.
+
+        Payload includes ``attempts`` (cumulative since process start) and
+        ``ms`` (last reconnect latency) so a flapping link is visible as a
+        rising attempt count even though each rising-edge emit is unique.
         """
         if not self._connected:
             logger.info("Modbus connection restored")
             emit(
                 EventType.MODBUS_RECONNECTED,
-                {"host": self._config.host, "port": self._config.port},
+                {
+                    "host": self._config.host,
+                    "port": self._config.port,
+                    "attempts": self._reconnect_attempts,
+                    "ms": self._last_reconnect_ms,
+                },
             )
         self._connected = True
 
@@ -211,11 +238,15 @@ class SigenergyController:
             multi-hour Wi-Fi/inverter outage would otherwise produce dozens
             of stack traces.
           * Emits MODBUS_RECONNECTED via `_mark_connected` on success so the
-            recovery is queryable in the NDJSON event stream.
+            recovery is queryable in the NDJSON event stream. Latency_ms +
+            cumulative attempt count are attached so the ops dashboard can
+            distinguish a one-shot blip from a reconnect storm.
 
         pymodbus's `AsyncModbusTcpClient.connect()` is idempotent — fast when
         already connected at the TCP layer, fails fast on host-unreachable.
         """
+        self._reconnect_attempts += 1
+        t0 = perf_counter()
         try:
             connected = await self._client.connect()
         except Exception as exc:
@@ -223,6 +254,7 @@ class SigenergyController:
             self._connected = False
             return False
         if connected:
+            self._last_reconnect_ms = round((perf_counter() - t0) * 1000.0, 2)
             self._mark_connected()
             return True
         # connect() returned False (host unreachable) — quiet, will retry next tick.
@@ -233,6 +265,7 @@ class SigenergyController:
 
     async def _read_input_u16(self, address: int) -> int | None:
         """Read a single U16 input register."""
+        self._reads_total += 1
         try:
             # Sigenergy uses absolute addressing
             result = await self._client.read_input_registers(
@@ -242,15 +275,18 @@ class SigenergyController:
             )
             if result.isError():
                 logger.warning("Modbus read error at %d: %s", address, result)
+                self._reads_failed += 1
                 return None
             return result.registers[0]
         except Exception:
             logger.exception("Modbus read failed at %d", address)
             self._connected = False
+            self._reads_failed += 1
             return None
 
     async def _read_input_s32(self, address: int) -> float | None:
         """Read an S32 input register pair (gain=1000 → kW)."""
+        self._reads_total += 1
         try:
             result = await self._client.read_input_registers(
                 address=address,
@@ -259,6 +295,7 @@ class SigenergyController:
             )
             if result.isError():
                 logger.warning("Modbus read error at %d: %s", address, result)
+                self._reads_failed += 1
                 return None
             # Combine two U16 into S32 (big-endian)
             raw = (result.registers[0] << 16) | result.registers[1]
@@ -269,10 +306,12 @@ class SigenergyController:
         except Exception:
             logger.exception("Modbus read failed at %d", address)
             self._connected = False
+            self._reads_failed += 1
             return None
 
     async def _read_holding_u16(self, address: int) -> int | None:
         """Read a single U16 holding register."""
+        self._reads_total += 1
         try:
             result = await self._client.read_holding_registers(
                 address=address,
@@ -280,11 +319,13 @@ class SigenergyController:
                 device_id=self._config.slave_id,
             )
             if result.isError():
+                self._reads_failed += 1
                 return None
             return result.registers[0]
         except Exception:
             logger.exception("Modbus holding read failed at %d", address)
             self._connected = False
+            self._reads_failed += 1
             return None
 
     # The helpers below are used exclusively for extended observational
@@ -309,6 +350,7 @@ class SigenergyController:
         to the plant slave; pass the inverter slave explicitly for
         per-inverter registers (305xx-306xx, 310xx range).
         """
+        self._reads_total += 1
         try:
             result = await self._client.read_input_registers(
                 address=address,
@@ -316,6 +358,7 @@ class SigenergyController:
                 device_id=slave_id if slave_id is not None else self._config.slave_id,
             )
             if result.isError():
+                self._reads_failed += 1
                 return None
             raw = result.registers[0]
             if raw >= 0x8000:
@@ -323,6 +366,7 @@ class SigenergyController:
             return raw / gain
         except Exception:
             logger.debug("Best-effort S16 read failed at %d", address)
+            self._reads_failed += 1
             return None
 
     async def _read_input_u32(
@@ -338,6 +382,7 @@ class SigenergyController:
         doesn't populate) is to return 0xFFFFFFFF. Treat that as None
         so the validation layer doesn't see 42,949,672.95 as an outlier.
         """
+        self._reads_total += 1
         try:
             result = await self._client.read_input_registers(
                 address=address,
@@ -345,6 +390,7 @@ class SigenergyController:
                 device_id=slave_id if slave_id is not None else self._config.slave_id,
             )
             if result.isError():
+                self._reads_failed += 1
                 return None
             raw = (result.registers[0] << 16) | result.registers[1]
             if raw == 0xFFFFFFFF:
@@ -352,6 +398,7 @@ class SigenergyController:
             return raw / gain
         except Exception:
             logger.debug("Best-effort U32 read failed at %d", address)
+            self._reads_failed += 1
             return None
 
     async def _read_input_u64(
@@ -365,6 +412,7 @@ class SigenergyController:
         Sentinel 0xFFFFFFFFFFFFFFFF means "not applicable" per Sigenergy
         convention — returned as None rather than a ~1.8e17 outlier.
         """
+        self._reads_total += 1
         try:
             result = await self._client.read_input_registers(
                 address=address,
@@ -372,6 +420,7 @@ class SigenergyController:
                 device_id=slave_id if slave_id is not None else self._config.slave_id,
             )
             if result.isError():
+                self._reads_failed += 1
                 return None
             r = result.registers
             raw = (r[0] << 48) | (r[1] << 32) | (r[2] << 16) | r[3]
@@ -380,6 +429,7 @@ class SigenergyController:
             return raw / gain
         except Exception:
             logger.debug("Best-effort U64 read failed at %d", address)
+            self._reads_failed += 1
             return None
 
     async def _read_input_u16_scaled(
@@ -393,6 +443,7 @@ class SigenergyController:
         Uses a local try/except rather than delegating to _read_input_u16
         so a failure doesn't mark the controller disconnected.
         """
+        self._reads_total += 1
         try:
             result = await self._client.read_input_registers(
                 address=address,
@@ -400,10 +451,12 @@ class SigenergyController:
                 device_id=slave_id if slave_id is not None else self._config.slave_id,
             )
             if result.isError():
+                self._reads_failed += 1
                 return None
             return result.registers[0] / gain
         except Exception:
             logger.debug("Best-effort U16 read failed at %d", address)
+            self._reads_failed += 1
             return None
 
     async def _read_input_u16_best_effort(
@@ -412,6 +465,7 @@ class SigenergyController:
         slave_id: int | None = None,
     ) -> int | None:
         """Read a raw U16 input register without flipping connection state."""
+        self._reads_total += 1
         try:
             result = await self._client.read_input_registers(
                 address=address,
@@ -419,16 +473,17 @@ class SigenergyController:
                 device_id=slave_id if slave_id is not None else self._config.slave_id,
             )
             if result.isError():
+                self._reads_failed += 1
                 return None
             return result.registers[0]
         except Exception:
             logger.debug("Best-effort U16 read failed at %d", address)
+            self._reads_failed += 1
             return None
 
-    async def _read_holding_u16_best_effort(
-        self, address: int
-    ) -> int | None:
+    async def _read_holding_u16_best_effort(self, address: int) -> int | None:
         """Read a holding register without flipping connection state on failure."""
+        self._reads_total += 1
         try:
             result = await self._client.read_holding_registers(
                 address=address,
@@ -436,10 +491,12 @@ class SigenergyController:
                 device_id=self._config.slave_id,
             )
             if result.isError():
+                self._reads_failed += 1
                 return None
             return result.registers[0]
         except Exception:
             logger.debug("Best-effort holding read failed at %d", address)
+            self._reads_failed += 1
             return None
 
     async def read_state(
@@ -447,104 +504,130 @@ class SigenergyController:
         outdoor_temp_c: float | None = None,
         occupied: bool = True,
     ) -> SystemState | None:
-        """Read current inverter/battery/grid state."""
-        if not self._connected:
-            # Sticky-disconnect recovery. A prior read raised
-            # ConnectionException (Wi-Fi outage, inverter reboot, router
-            # cycle) and flipped `_connected = False`. Without an explicit
-            # reconnect path the flag stays False forever — pymodbus's
-            # internal auto-reconnect heals the socket transparently, but
-            # nothing here knew to re-arm. Attempt a reconnect; on failure
-            # return None and let the next tick retry.
-            if not await self._attempt_reconnect():
-                return None
+        """Read current inverter/battery/grid state.
 
+        Emits a single ``MODBUS_READ_BATCH`` event on every invocation —
+        success, partial-success, or hard-failure — capturing wall-clock
+        ms, register count, error count, whether a reconnect happened
+        this tick, and grid-sensor liveness. The ops dashboard reads
+        these to produce the read latency p95 panel and the per-tick
+        error-rate signal.
+        """
+        t0 = perf_counter()
+        reads_before = self._reads_total
+        errs_before = self._reads_failed
+        reconnected = False
         try:
-            ems_mode = await self._read_input_u16(REG_EMS_WORK_MODE)
-            self._grid_sensor_status = await self._read_input_u16(REG_GRID_SENSOR_STATUS) or 0
-            grid_kw = await self._read_input_s32(REG_GRID_ACTIVE_POWER)
-            soc_raw = await self._read_input_u16(REG_PLANT_ESS_SOC)
-            battery_kw = await self._read_input_s32(REG_PLANT_ESS_POWER)
-            pv_kw = await self._read_input_s32(REG_PLANT_PV_POWER)
+            if not self._connected:
+                # Sticky-disconnect recovery. A prior read raised
+                # ConnectionException (Wi-Fi outage, inverter reboot, router
+                # cycle) and flipped `_connected = False`. Without an explicit
+                # reconnect path the flag stays False forever — pymodbus's
+                # internal auto-reconnect heals the socket transparently, but
+                # nothing here knew to re-arm. Attempt a reconnect; on failure
+                # return None and let the next tick retry.
+                if not await self._attempt_reconnect():
+                    return None
+                reconnected = True
 
-            if soc_raw is None or grid_kw is None or battery_kw is None or pv_kw is None:
-                return None
+            try:
+                ems_mode = await self._read_input_u16(REG_EMS_WORK_MODE)
+                self._grid_sensor_status = await self._read_input_u16(REG_GRID_SENSOR_STATUS) or 0
+                grid_kw = await self._read_input_s32(REG_GRID_ACTIVE_POWER)
+                soc_raw = await self._read_input_u16(REG_PLANT_ESS_SOC)
+                battery_kw = await self._read_input_s32(REG_PLANT_ESS_POWER)
+                pv_kw = await self._read_input_s32(REG_PLANT_PV_POWER)
 
-            soc_pct = soc_raw / 10.0
+                if soc_raw is None or grid_kw is None or battery_kw is None or pv_kw is None:
+                    return None
 
-            # Null-over-wrong policy (see CLAUDE.md). Two paths produce a
-            # nulled house_load / grid reading:
-            #
-            #  1. Grid sensor explicitly offline (status ≠ 1): the `grid_kw`
-            #     register holds whatever the last valid reading was (or
-            #     stale garbage). We can't derive house load without a
-            #     trusted grid reading, and we don't want to poison the
-            #     load profile with a guess.
-            #
-            #  2. Derivation is absurd (house_load < deadband negative):
-            #     either a sign-convention error somewhere in the register
-            #     chain (see KNOWN-ISSUES #3 — verify on first deploy) or
-            #     a transient bad read from one of the three registers.
-            #     Either way, null over wrong.
-            grid_power_kw: float | None = grid_kw
-            house_load_kw: float | None
-            if self._grid_sensor_status != 1:
-                grid_power_kw = None
-                house_load_kw = None
-                if not self._warned_grid_sensor_offline:
-                    emit(
-                        EventType.VALIDATION_WARNING,
-                        {
-                            "message": "Grid sensor offline (status != 1) — grid/house_load nulled",
-                            "grid_sensor_status": self._grid_sensor_status,
-                        },
-                    )
-                    self._warned_grid_sensor_offline = True
-            else:
-                # Condition cleared — re-arm for next transition
-                self._warned_grid_sensor_offline = False
-                # Energy balance: pv + grid_import = house_load + battery_charge
-                # Therefore: house_load = pv + grid - battery
-                derived = pv_kw + grid_kw - battery_kw
-                if derived < -0.1:
-                    if not self._warned_absurd_derivation:
+                soc_pct = soc_raw / 10.0
+
+                # Null-over-wrong policy (see CLAUDE.md). Two paths produce a
+                # nulled house_load / grid reading:
+                #
+                #  1. Grid sensor explicitly offline (status ≠ 1): the `grid_kw`
+                #     register holds whatever the last valid reading was (or
+                #     stale garbage). We can't derive house load without a
+                #     trusted grid reading, and we don't want to poison the
+                #     load profile with a guess.
+                #
+                #  2. Derivation is absurd (house_load < deadband negative):
+                #     either a sign-convention error somewhere in the register
+                #     chain (see KNOWN-ISSUES #3 — verify on first deploy) or
+                #     a transient bad read from one of the three registers.
+                #     Either way, null over wrong.
+                grid_power_kw: float | None = grid_kw
+                house_load_kw: float | None
+                if self._grid_sensor_status != 1:
+                    grid_power_kw = None
+                    house_load_kw = None
+                    if not self._warned_grid_sensor_offline:
                         emit(
                             EventType.VALIDATION_WARNING,
                             {
-                                "message": (
-                                    "Derived house_load is negative — suspect sign "
-                                    "convention error or bad read; nulled"
-                                ),
-                                "derived_house_load_kw": derived,
-                                "pv_kw": pv_kw,
-                                "grid_kw": grid_kw,
-                                "battery_kw": battery_kw,
+                                "message": "Grid sensor offline (status != 1) — grid/house_load nulled",
+                                "grid_sensor_status": self._grid_sensor_status,
                             },
                         )
-                        self._warned_absurd_derivation = True
-                    house_load_kw = None
+                        self._warned_grid_sensor_offline = True
                 else:
-                    self._warned_absurd_derivation = False
-                    house_load_kw = derived
+                    # Condition cleared — re-arm for next transition
+                    self._warned_grid_sensor_offline = False
+                    # Energy balance: pv + grid_import = house_load + battery_charge
+                    # Therefore: house_load = pv + grid - battery
+                    derived = pv_kw + grid_kw - battery_kw
+                    if derived < -0.1:
+                        if not self._warned_absurd_derivation:
+                            emit(
+                                EventType.VALIDATION_WARNING,
+                                {
+                                    "message": (
+                                        "Derived house_load is negative — suspect sign "
+                                        "convention error or bad read; nulled"
+                                    ),
+                                    "derived_house_load_kw": derived,
+                                    "pv_kw": pv_kw,
+                                    "grid_kw": grid_kw,
+                                    "battery_kw": battery_kw,
+                                },
+                            )
+                            self._warned_absurd_derivation = True
+                        house_load_kw = None
+                    else:
+                        self._warned_absurd_derivation = False
+                        house_load_kw = derived
 
-            extended = await self._read_extended_telemetry()
+                extended = await self._read_extended_telemetry()
 
-            return SystemState(
-                timestamp=now_utc(),
-                soc_pct=soc_pct,
-                battery_power_kw=battery_kw,
-                pv_power_kw=pv_kw,
-                grid_power_kw=grid_power_kw,
-                house_load_kw=house_load_kw,
-                ems_mode=ems_mode or 0,
-                outdoor_temp_c=outdoor_temp_c,
-                occupied=occupied,
-                **extended,
+                return SystemState(
+                    timestamp=now_utc(),
+                    soc_pct=soc_pct,
+                    battery_power_kw=battery_kw,
+                    pv_power_kw=pv_kw,
+                    grid_power_kw=grid_power_kw,
+                    house_load_kw=house_load_kw,
+                    ems_mode=ems_mode or 0,
+                    outdoor_temp_c=outdoor_temp_c,
+                    occupied=occupied,
+                    **extended,
+                )
+            except Exception:
+                logger.exception("Failed to read system state")
+                self._connected = False
+                return None
+        finally:
+            ms = (perf_counter() - t0) * 1000.0
+            emit(
+                EventType.MODBUS_READ_BATCH,
+                {
+                    "ms": round(ms, 2),
+                    "reg_count": self._reads_total - reads_before,
+                    "err_count": self._reads_failed - errs_before,
+                    "reconnected": reconnected,
+                    "grid_sensor_ok": self._grid_sensor_status == 1,
+                },
             )
-        except Exception:
-            logger.exception("Failed to read system state")
-            self._connected = False
-            return None
 
     async def _read_extended_telemetry(self) -> dict[str, float | int | None]:
         """Read the ~35 extended observational registers.
@@ -562,9 +645,7 @@ class SigenergyController:
         inv = self._config.inverter_slave_id
 
         # Battery health & thermal (inverter slave)
-        soh_pct = await self._read_input_u16_scaled(
-            REG_INVERTER_ESS_SOH, gain=10, slave_id=inv
-        )
+        soh_pct = await self._read_input_u16_scaled(REG_INVERTER_ESS_SOH, gain=10, slave_id=inv)
         cell_temp_avg_c = await self._read_input_s16(
             REG_INVERTER_ESS_CELL_TEMP_AVG, gain=10, slave_id=inv
         )
@@ -583,9 +664,7 @@ class SigenergyController:
         cell_volt_min_v = await self._read_input_u16_scaled(
             REG_INVERTER_ESS_CELL_VOLT_MIN, gain=1000, slave_id=inv
         )
-        pcs_temp_c = await self._read_input_s16(
-            REG_INVERTER_PCS_TEMP, gain=10, slave_id=inv
-        )
+        pcs_temp_c = await self._read_input_s16(REG_INVERTER_PCS_TEMP, gain=10, slave_id=inv)
 
         # Dynamic power constraints (plant slave)
         available_charge_kw = await self._read_input_u32(
@@ -610,21 +689,11 @@ class SigenergyController:
 
         # Lifetime energy counters (plant slave)
         lifetime_pv_kwh = await self._read_input_u64(REG_LIFETIME_PV_KWH, gain=100)
-        lifetime_load_kwh = await self._read_input_u64(
-            REG_LIFETIME_LOAD_KWH, gain=100
-        )
-        lifetime_charge_kwh = await self._read_input_u64(
-            REG_LIFETIME_CHARGE_KWH, gain=100
-        )
-        lifetime_discharge_kwh = await self._read_input_u64(
-            REG_LIFETIME_DISCHARGE_KWH, gain=100
-        )
-        lifetime_import_kwh = await self._read_input_u64(
-            REG_LIFETIME_IMPORT_KWH, gain=100
-        )
-        lifetime_export_kwh = await self._read_input_u64(
-            REG_LIFETIME_EXPORT_KWH, gain=100
-        )
+        lifetime_load_kwh = await self._read_input_u64(REG_LIFETIME_LOAD_KWH, gain=100)
+        lifetime_charge_kwh = await self._read_input_u64(REG_LIFETIME_CHARGE_KWH, gain=100)
+        lifetime_discharge_kwh = await self._read_input_u64(REG_LIFETIME_DISCHARGE_KWH, gain=100)
+        lifetime_import_kwh = await self._read_input_u64(REG_LIFETIME_IMPORT_KWH, gain=100)
+        lifetime_export_kwh = await self._read_input_u64(REG_LIFETIME_EXPORT_KWH, gain=100)
 
         # Per-MPPT strings (inverter slave)
         mppt1_voltage_v = await self._read_input_s16(
@@ -670,9 +739,7 @@ class SigenergyController:
         # currently has as its commanded remote EMS mode. Closes the
         # loop against our writes; diverging from our last write is a
         # red flag.
-        remote_ems_mode = await self._read_holding_u16_best_effort(
-            REG_REMOTE_EMS_CONTROL_MODE
-        )
+        remote_ems_mode = await self._read_holding_u16_best_effort(REG_REMOTE_EMS_CONTROL_MODE)
 
         return {
             "soh_pct": soh_pct,
@@ -716,12 +783,14 @@ class SigenergyController:
 
     async def _write_u16(self, address: int, value: int) -> bool:
         """Write a single U16 holding register."""
+        t0 = perf_counter()
         try:
             result = await self._client.write_register(
                 address=address,
                 value=value,
                 device_id=self._config.slave_id,
             )
+            ms = round((perf_counter() - t0) * 1000.0, 2)
             if result.isError():
                 logger.warning("Modbus write error at %d: %s", address, result)
                 emit(
@@ -730,6 +799,7 @@ class SigenergyController:
                         "register": address,
                         "value": value,
                         "error": str(result),
+                        "ms": ms,
                     },
                 )
                 return False
@@ -738,16 +808,24 @@ class SigenergyController:
             # re-arms it so the next tick's read_state proceeds without a
             # separate reconnect round-trip.
             self._mark_connected()
-            emit(EventType.MODBUS_WRITE, {"register": address, "value": value})
+            emit(
+                EventType.MODBUS_WRITE,
+                {"register": address, "value": value, "ms": ms},
+            )
             return True
         except Exception:
+            ms = round((perf_counter() - t0) * 1000.0, 2)
             logger.exception("Modbus write failed at %d", address)
-            emit(EventType.MODBUS_ERROR, {"register": address, "value": value})
+            emit(
+                EventType.MODBUS_ERROR,
+                {"register": address, "value": value, "ms": ms},
+            )
             self._connected = False
             return False
 
     async def _write_u32(self, address: int, value: int) -> bool:
         """Write a U32 as two consecutive holding registers."""
+        t0 = perf_counter()
         try:
             hi = (value >> 16) & 0xFFFF
             lo = value & 0xFFFF
@@ -756,16 +834,27 @@ class SigenergyController:
                 values=[hi, lo],
                 device_id=self._config.slave_id,
             )
+            ms = round((perf_counter() - t0) * 1000.0, 2)
             if result.isError():
                 logger.warning("Modbus write error at %d: %s", address, result)
-                emit(EventType.MODBUS_ERROR, {"register": address, "value": value})
+                emit(
+                    EventType.MODBUS_ERROR,
+                    {"register": address, "value": value, "ms": ms},
+                )
                 return False
             self._mark_connected()
-            emit(EventType.MODBUS_WRITE, {"register": address, "value": value})
+            emit(
+                EventType.MODBUS_WRITE,
+                {"register": address, "value": value, "ms": ms},
+            )
             return True
         except Exception:
+            ms = round((perf_counter() - t0) * 1000.0, 2)
             logger.exception("Modbus write failed at %d", address)
-            emit(EventType.MODBUS_ERROR, {"register": address, "value": value})
+            emit(
+                EventType.MODBUS_ERROR,
+                {"register": address, "value": value, "ms": ms},
+            )
             self._connected = False
             return False
 
@@ -809,8 +898,7 @@ class SigenergyController:
         discharge_cutoff_raw = int(self._battery.discharge_cutoff_pct * 10)
         backup_raw = int(self._battery.backup_soc_pct * 10)
         logger.info(
-            "Asserting battery SOC limits: ceiling=%.1f%% "
-            "discharge_cutoff=%.1f%% backup=%.1f%%",
+            "Asserting battery SOC limits: ceiling=%.1f%% discharge_cutoff=%.1f%% backup=%.1f%%",
             self._battery.soc_ceiling_pct,
             self._battery.discharge_cutoff_pct,
             self._battery.backup_soc_pct,
@@ -886,11 +974,13 @@ class SigenergyController:
             export_cap_kw = self._battery.export_limit_kw
             export_reason = (
                 f"price={export_price_ckwh:.2f}c/kWh"
-                if export_price_ckwh is not None else "price=unknown"
+                if export_price_ckwh is not None
+                else "price=unknown"
             )
         logger.info(
             "Setting fallback: Maximum Self Consumption + export=%.1fkW (%s)",
-            export_cap_kw, export_reason,
+            export_cap_kw,
+            export_reason,
         )
         if not self._remote_ems_enabled:
             if not await self.enable_remote_ems():
@@ -902,9 +992,7 @@ class SigenergyController:
         # apply_lp_dispatch's mode-2 branch; fallback inherits the same
         # hazard because mode 2's cascade honours 40032.
         max_charge_raw = int(round(self._battery.max_dc_charge_kw * 1000))
-        charge_cap_ok = await self._write_u32(
-            REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw
-        )
+        charge_cap_ok = await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, max_charge_raw)
         mode_ok = await self._write_u16(
             REG_REMOTE_EMS_CONTROL_MODE,
             RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION.value,
@@ -1018,7 +1106,10 @@ class SigenergyController:
 
         logger.info(
             "Applied LP dispatch: mode=%s kind=%s cap=%.2fkW intent=%+.2fkW",
-            mode.name, kind_name, dispatch.cap_kw, dispatch.signed_intent_kw,
+            mode.name,
+            kind_name,
+            dispatch.cap_kw,
+            dispatch.signed_intent_kw,
         )
         return True
 
@@ -1080,15 +1171,17 @@ class SigenergyController:
         await asyncio.sleep(settle_seconds)
 
         state = await self.read_state()
-        bat_avail_kw = await self._read_input_u32(
-            REG_ESS_AVAIL_MAX_CHARGING_POWER, gain=1000
-        )
+        bat_avail_kw = await self._read_input_u32(REG_ESS_AVAIL_MAX_CHARGING_POWER, gain=1000)
         if state is None or state.pv_power_kw is None:
             return PVProbeResult(
-                pv_kw=None, saturated=False,
-                bat_kw=None, bat_avail_kw=bat_avail_kw,
-                grid_export_kw=None, export_cap_kw=export_cap_kw,
-                house_kw=None, soc_pct=None,
+                pv_kw=None,
+                saturated=False,
+                bat_kw=None,
+                bat_avail_kw=bat_avail_kw,
+                grid_export_kw=None,
+                export_cap_kw=export_cap_kw,
+                house_kw=None,
+                soc_pct=None,
             )
 
         pv_kw = max(0.0, state.pv_power_kw)
@@ -1099,13 +1192,9 @@ class SigenergyController:
         # Saturation check: cascade had no slack iff BOTH sinks at cap.
         # Tolerance covers BMS hunting / sub-second noise (~0.3 kW).
         cap_tolerance_kw = 0.3
-        bat_at_cap = (
-            bat_avail_kw is not None
-            and bat_kw >= bat_avail_kw - cap_tolerance_kw
-        )
+        bat_at_cap = bat_avail_kw is not None and bat_kw >= bat_avail_kw - cap_tolerance_kw
         export_at_cap = (
-            export_cap_kw is not None
-            and grid_export_kw >= export_cap_kw - cap_tolerance_kw
+            export_cap_kw is not None and grid_export_kw >= export_cap_kw - cap_tolerance_kw
         )
         saturated = bat_at_cap and export_at_cap
 
@@ -1202,8 +1291,7 @@ class SigenergyController:
             # which matches the "soak first" intent. Log AND emit so this
             # is queryable in the NDJSON event stream.
             logger.warning(
-                "mode-2 adaptive (%s): phase-A telemetry unavailable; "
-                "staying uncapped (40032=max)",
+                "mode-2 adaptive (%s): phase-A telemetry unavailable; staying uncapped (40032=max)",
                 kind_name,
             )
             emit(
@@ -1227,7 +1315,11 @@ class SigenergyController:
         logger.info(
             "Mode-2 adaptive (%s): phaseA pv=%.2fkW "
             "→ phaseB trim=%.2fkW (lp_rate=%.2fkW, export_cap=%.2fkW)",
-            kind_name, pv_a, trim_kw, lp_rate, export_cap_kw,
+            kind_name,
+            pv_a,
+            trim_kw,
+            lp_rate,
+            export_cap_kw,
         )
         # Structured event so replay / analytics can answer "what did
         # Phase A read at this tick, and how did the trim formula

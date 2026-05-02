@@ -112,6 +112,23 @@ class EventType(StrEnum):
     MODE2_TRIM_BLIND = auto()  # Phase-A telemetry unavailable — uncapped fallthrough
     AMBER_HORIZON_SHORT = auto()  # 30-min interval count fell below alert threshold
     AMBER_HORIZON_RECOVERED = auto()  # 30-min count climbed back above threshold
+    # Ops-dashboard observability events. Emitted at every external call
+    # site so the /ops endpoints can compute per-client error rates,
+    # latency percentiles, and Modbus read/write health from NDJSON
+    # alone (no additional in-memory metrics surface). Payload schemas:
+    #   API_CALL: {client, op, http_status, ms, ok, extra?}
+    #     - client: "amber"|"solcast"|"bom"|"shelly"|"unifi"
+    #     - op: short verb describing the request ("prices_5min", "status", ...)
+    #     - http_status: int or None (None = transport-level failure)
+    #     - ms: float, wall-clock duration of the call
+    #     - ok: bool — True iff the call returned usable data
+    #     - extra: optional dict for client-specific fields (rl_remaining, device_id)
+    #   MODBUS_READ_BATCH: {ms, reg_count, err_count, reconnected, grid_sensor_ok}
+    #     - One per read_state(). Per-register events would be ~1200/min;
+    #       the batch keeps NDJSON volume sane while preserving the
+    #       tick-budget signal that matters for ops.
+    API_CALL = auto()
+    MODBUS_READ_BATCH = auto()
 
 
 # ── Value Objects ────────────────────────────────────────────────

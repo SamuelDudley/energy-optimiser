@@ -11,9 +11,12 @@ import json
 import logging
 import sys
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from .time_utils import now_utc
@@ -68,6 +71,63 @@ def emit(
             tick_id=tick_id,
         )
     )
+
+
+class _ApiCallScope:
+    """Mutable handle yielded by ``api_call`` so callers can record the
+    response (or override the ok flag) before the context manager exits."""
+
+    __slots__ = ("http_status", "ok", "extra")
+
+    def __init__(self) -> None:
+        self.http_status: int | None = None
+        self.ok: bool = False
+        self.extra: dict[str, Any] = {}
+
+    def set_response(self, resp: Any) -> None:
+        """Capture status + 2xx-ness from an httpx.Response-like object."""
+        try:
+            self.http_status = int(resp.status_code)
+            self.ok = bool(getattr(resp, "is_success", 200 <= self.http_status < 300))
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+
+@contextmanager
+def api_call(client: str, op: str) -> Iterator[_ApiCallScope]:
+    """Time an external API call and emit ``API_CALL`` on exit.
+
+    Always emits — success, non-2xx, and exception paths all produce one
+    event with ``ms`` measured from entry. Callers record the response
+    via ``scope.set_response(resp)``; exceptions raised inside the block
+    propagate but ``ok=False`` is recorded first.
+
+    Schema: ``{client, op, http_status, ms, ok, extra?}`` — see
+    EventType.API_CALL docstring in types.py.
+    """
+    scope = _ApiCallScope()
+    t0 = perf_counter()
+    exc_class: str | None = None
+    try:
+        yield scope
+    except BaseException as exc:
+        exc_class = type(exc).__name__
+        scope.ok = False
+        raise
+    finally:
+        ms = (perf_counter() - t0) * 1000.0
+        data: dict[str, Any] = {
+            "client": client,
+            "op": op,
+            "http_status": scope.http_status,
+            "ms": round(ms, 2),
+            "ok": scope.ok,
+        }
+        if exc_class is not None:
+            scope.extra["exception"] = exc_class
+        if scope.extra:
+            data["extra"] = scope.extra
+        emit(EventType.API_CALL, data)
 
 
 class SnapshotWriter:
