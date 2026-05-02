@@ -700,19 +700,60 @@ choices, each of which needs data we don't yet have:
      Cross-channel correlation from (a) informs which non-POINT mode
      to test: ρ ≈ +1 ⇒ try SHARED first (CROSS over-hedges
      implausible combinations); ρ ≈ 0 ⇒ try CROSS first.
-- e) ⏳ **Flip default.** Once (d) is convincing, change
-     `PRICE_SCENARIO_MODE` and/or the config default to the winning
-     mode. Add a CLAUDE.md decision-log entry recording the
-     calibration outcome and the chosen mode.
 
-Steps (a), (b), (c) ship without any LP behaviour change — they
-land the infrastructure and start data collection. Steps (d) and
-(e) are gated on data and a measurement decision.
+**First calibration pass (24h, 2026-04-29) — provisional findings:**
+The plan above assumed the bands were ~1σ honest probabilistic
+intervals with only the *composition* question (POINT/SHARED/CROSS)
+left to decide. The first calibration run shows that's not the case
+— the bands have **horizon-dependent asymmetric bias**, and feeding
+them into SHARED/CROSS unmodified would amplify the same systematic
+error the 2026-04-29 wear-cost workaround is currently masking.
+Three findings (n=1027 at 0–0.5h, n=147 at 6.5h):
+
+  i.   **Near-horizon (0–2 h): upside band too narrow.** 42.3% of
+       realised import values exceed `high` at 0–0.5h horizon
+       (vs ~17% expected for a 1σ band). Below-low breaches sit
+       around 7–13%. Heavy right-tail leak — the named "high" is
+       barely a median for upside spikes.
+  ii.  **Central forecast biased low near-term, high far-term.**
+       Signed `realised − predicted` runs +0.47 c/kWh at 0–0.5h,
+       crosses zero around 4 h, becomes −0.13 to −0.40 c/kWh at
+       5–6.5h. Classic "predict-the-mean" decay. Hits the LP's
+       midday-charge / evening-discharge plan from both sides:
+       midday charging is at near-horizon (predicted runs *low* →
+       realised cost slightly higher than expected), evening
+       discharge commits at 6–12 h (predicted runs *high* →
+       realised revenue lower than expected).
+  iii. **Cross-channel ρ = 1.000** — import and export errors
+       move in lockstep. SHARED is the right composition; **don't
+       ship CROSS**.
+
+Updated steps (d) and (e) accordingly:
+
+- d) ⏳ **Sweep validation, with bias correction in the loop.** Before
+     the sweep, the calibration script must produce a per-lookahead
+     `mean_err` table; scenarios construct from `(low, predicted +
+     correction, high)`, NOT raw `(low, predicted, high)`. Otherwise
+     SHARED/CROSS amplifies the systematic error rather than hedging
+     against it. Also: at 0–2 h horizon the `high` band is so under-
+     calibrated that using it as the upper scenario is worse than
+     using the spot point price as that scenario's substitute. The
+     sweep needs a small matrix: SHARED-with-correction vs
+     SHARED-with-correction-and-widened-high vs POINT-with-wear=2.0
+     (current production). Decision rule unchanged.
+- e) ⏳ **Flip default.** Same as before, but if SHARED-with-
+     correction wins, that's the new default *and* the wear-cost
+     hack (currently 2.0) can be unwound back toward the marginal-
+     degradation 2.5. The two are coupled: the wear hack works
+     because `predicted` is biased; once bias is corrected, raising
+     wear back to 2.5 stops costing real money. Re-run the wear
+     sweep at the same time.
 
 **Priority:** post-deploy enhancement, gated on (a)+data — first
-calibration pass should run after ~5 days of fresh data (so from
-~2026-05-03 onward). The code as-shipped is correct — this is an
-improvement, not a fix.
+calibration pass run 2026-04-29 (24h, n=147–1027 by horizon, see
+above). Re-run with ~1 week of fresh data after 2026-05-03 before
+drawing strong conclusions on the far-horizon side. The code as-
+shipped is correct — this is an improvement, not a fix.
 
 ### 25. Mode-2 adaptive trim ignores house load — revisit when load model matures
 **File:** `clients/sigenergy.py::_apply_mode2_adaptive_charge`
