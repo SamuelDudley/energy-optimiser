@@ -104,6 +104,22 @@ class BinarySignalDrivenLoad:
             )
         self._cfg = config
         self.load_id = config.load_id
+        # Subclasses (e.g. BinarySignalDrivenContinuousLoad) set this to
+        # True to force every slot's relay var to be binary, overriding
+        # the global RELAX_FUTURE_BINARIES optimisation. Required when
+        # the load adds constraints (min-on / min-off) that only enforce
+        # correctly under integrality.
+        self._force_binary_relay: bool = False
+
+    def _slot_state(self, slot_t: datetime) -> str:
+        """Look up the schedule override for this slot's local date.
+
+        Returns 'off', 'on', or 'auto' (default when the date isn't in
+        the override map). Cheap when the map is empty — the common case.
+        """
+        if not self._cfg.schedule_overrides:
+            return "auto"
+        return self._cfg.schedule_overrides.get(utc_to_local(slot_t).date().isoformat(), "auto")
 
     def add_to(
         self,
@@ -123,7 +139,7 @@ class BinarySignalDrivenLoad:
         # continuous in [0, 1] when RELAX_FUTURE_BINARIES is True.
         relay: list[pulp.LpVariable] = []
         for t in range(n):
-            if t == 0 or not RELAX_FUTURE_BINARIES:
+            if t == 0 or self._force_binary_relay or not RELAX_FUTURE_BINARIES:
                 v = pulp.LpVariable(
                     f"{var_prefix}{self.load_id}_relay_{t}",
                     cat=pulp.LpBinary,
@@ -136,6 +152,24 @@ class BinarySignalDrivenLoad:
                     cat=pulp.LpContinuous,
                 )
             relay.append(v)
+
+        # ── Per-slot schedule overrides (off / on) ────────────────
+        # Each slot's local-date is looked up in `schedule_overrides`.
+        # 'off' forces relay[t]=0; 'on' forces relay[t]=1; 'auto' lets
+        # the LP decide. Any in-progress min-on block carry-over (from
+        # the subclass) defers to these — user intent overrides safety.
+        for t in range(n):
+            state = self._slot_state(slots[t])
+            if state == "off":
+                prob += (
+                    relay[t] == 0,
+                    f"{var_prefix}{self.load_id}_sched_off_t{t}",
+                )
+            elif state == "on":
+                prob += (
+                    relay[t] == 1,
+                    f"{var_prefix}{self.load_id}_sched_on_t{t}",
+                )
 
         # ── Daily-target constraints ──────────────────────────────
         # A constraint is added for every local-calendar-day deadline
@@ -178,6 +212,14 @@ class BinarySignalDrivenLoad:
                 day_start_utc = local_to_utc(day_midnight_local)
                 deadline_utc = local_to_utc(deadline_local)
 
+                # Schedule override: skipped/forced days drop the daily-
+                # target constraint AND zero any rolled-forward shortfall
+                # (a skipped day forgives, doesn't defer).
+                day_date_iso = day_midnight_local.date().isoformat()
+                if self._cfg.schedule_overrides.get(day_date_iso, "auto") != "auto":
+                    rolled_forward_kwh = 0.0
+                    continue
+
                 # This day's pre-deadline window, intersected with horizon.
                 window_start = max(day_start_utc, horizon_start)
                 window_end = min(deadline_utc, horizon_end_excl)
@@ -190,11 +232,6 @@ class BinarySignalDrivenLoad:
                 if day_offset == 0:
                     # Today. Already-delivered comes from Shelly.
                     day_target = max(0.0, target - already_today)
-                    if not in_horizon_slots:
-                        # Deadline already passed for today. Roll the
-                        # unmet remainder forward to the next deadline.
-                        rolled_forward_kwh = day_target
-                        continue
                 else:
                     # Future day. Already-delivered at that day's start
                     # is zero (the Shelly counter resets at midnight).
@@ -211,12 +248,30 @@ class BinarySignalDrivenLoad:
                         # target vs the cap applied.
                         day_target = cap
 
-                    if not in_horizon_slots:
-                        # This day's window lies outside the horizon
-                        # entirely. Nothing to constrain.
-                        continue
-
                 if day_target <= 0:
+                    continue
+
+                # Feasibility check (uniform across days). The day's
+                # in-horizon window has a hard kWh ceiling: every slot
+                # ON × slot_hours × draw. If day_target exceeds that
+                # ceiling — because the window is empty (deadline past,
+                # or window beyond horizon end) or because Amber's
+                # price coverage truncates the LP horizon partway
+                # through this day — demanding it produces an
+                # infeasible LP. Roll the unmet target into the next
+                # iteration; the cap on day_offset >= 1 prevents
+                # cascading days from piling up impossible amounts.
+                # When day 2 (the last iteration) hits this branch the
+                # roll-forward simply drops on the floor, which is the
+                # right outcome — what falls beyond the horizon will
+                # be re-decided on the next tick when the horizon
+                # advances. (Min-on / min-off block constraints make
+                # the *true* ceiling lower than this naive bound;
+                # partial-fitting against blocks is fragile so we
+                # don't try.)
+                max_kwh = len(in_horizon_slots) * slot_hours * draw
+                if not in_horizon_slots or day_target > max_kwh:
+                    rolled_forward_kwh = day_target
                     continue
 
                 prob += (
@@ -249,6 +304,126 @@ class BinarySignalDrivenLoad:
                 f"{target:.2f} kWh)"
             ),
         )
+
+
+# ── BinarySignalDrivenContinuousLoad (HW heat pump — runs in blocks) ──
+
+
+class BinarySignalDrivenContinuousLoad(BinarySignalDrivenLoad):
+    """`BinarySignalDrivenLoad` that additionally enforces contiguous
+    run-blocks: once the relay turns on, it must stay on for at least
+    `min_on_slots` consecutive slots; once it turns off, it must stay off
+    for at least `min_off_slots` before re-asserting.
+
+    Required for appliances whose compressors / internal control don't
+    tolerate stop-start (HW heat pumps in PV mode). The plain
+    `BinarySignalDrivenLoad` is free to flap each slot, which is fine for
+    a contactor-only EV charger but harmful for an HP.
+
+    Limitation: the constraints apply *within* the LP horizon. A block
+    started at slot 0 commits the next `min_on_slots-1` future slots; a
+    block carried over from a prior tick (relay already on at slot 0) is
+    not counted toward the minimum — slot 0 is free to turn off. In
+    practice the daily-target constraint and the block's continuity over
+    successive horizons keep the LP committed once it commits.
+    """
+
+    def __init__(self, config: ManagedLoadConfig) -> None:
+        super().__init__(config)
+        if config.min_on_slots is None or config.min_off_slots is None:
+            raise ValueError(
+                f"BinarySignalDrivenContinuousLoad {config.load_id!r} requires "
+                f"min_on_slots and min_off_slots"
+            )
+        if config.min_on_slots < 1 or config.min_off_slots < 1:
+            raise ValueError(
+                f"BinarySignalDrivenContinuousLoad {config.load_id!r}: "
+                f"min_on_slots and min_off_slots must be ≥ 1"
+            )
+        self._min_on = config.min_on_slots
+        self._min_off = config.min_off_slots
+        # Min-on/min-off only enforce contiguous blocks under integrality;
+        # under LP relaxation the LP can satisfy `sum >= L * jump` with a
+        # fractional band that the threshold-based block check then
+        # mis-counts. Force every slot binary for this load.
+        self._force_binary_relay = True
+
+    def add_to(
+        self,
+        prob: pulp.LpProblem,
+        slots: list[datetime],
+        slot_hours: float,
+        status: ManagedLoadStatus,
+        var_prefix: str = "",
+    ) -> LoadVars:
+        vars = super().add_to(prob, slots, slot_hours, status, var_prefix)
+        relay = vars.extras["relay"]
+        n = len(relay)
+
+        # Min-up time: if a turn-ON occurs at slot t (relay[t]=1, relay[t-1]=0),
+        # the next L_on slots (including t) must all be 1.
+        #   sum(relay[t..t+L_on-1]) ≥ L_on * (relay[t] - relay[t-1])
+        # Window truncates at horizon end (sum/L drop together → still valid).
+        for t in range(1, n):
+            window = list(range(t, min(t + self._min_on, n)))
+            block = len(window)
+            prob += (
+                pulp.lpSum(relay[k] for k in window) >= block * (relay[t] - relay[t - 1]),
+                f"{var_prefix}{self.load_id}_min_on_t{t}",
+            )
+
+        # Min-down time: if a turn-OFF occurs at slot t (relay[t]=0, relay[t-1]=1),
+        # the next L_off slots (including t) must all be 0.
+        #   sum(relay[t..t+L_off-1]) ≤ block * (1 - (relay[t-1] - relay[t]))
+        for t in range(1, n):
+            window = list(range(t, min(t + self._min_off, n)))
+            block = len(window)
+            prob += (
+                pulp.lpSum(relay[k] for k in window) <= block * (1 - (relay[t - 1] - relay[t])),
+                f"{var_prefix}{self.load_id}_min_off_t{t}",
+            )
+
+        # ── Slot-0 carry-over (cross-tick block enforcement) ──────
+        # The min-up/min-down constraints above only fire for t ≥ 1
+        # because they reference relay[t-1]. Without binding slot 0 to
+        # the prior tick's commitment, the LP rebuilds each tick with
+        # no memory and could turn off mid-block. `relay_state_since`
+        # carries that memory: how long has the relay been in its
+        # current state? If we haven't yet served a full block, force
+        # slot 0 to match the current state.
+        if status.relay_state_since is not None and status.relay_on is not None and n > 0:
+            slot_seconds = slot_hours * 3600.0
+            elapsed_s = (slots[0] - status.relay_state_since).total_seconds()
+            elapsed_slots = max(0, int(elapsed_s // slot_seconds))
+
+            if status.relay_on:
+                # Currently asserted — must hold for at least min_on slots
+                # total (counting slots already served).
+                remaining = self._min_on - elapsed_slots
+                for k in range(min(remaining, n)):
+                    # Defer to schedule overrides: a non-auto slot is
+                    # already bound by the parent; forcing relay=1 here
+                    # would conflict with an "off" override and produce
+                    # an infeasible LP.
+                    if self._slot_state(slots[k]) != "auto":
+                        continue
+                    prob += (
+                        relay[k] == 1,
+                        f"{var_prefix}{self.load_id}_carryover_on_{k}",
+                    )
+            else:
+                # Currently de-asserted — must stay off for at least
+                # min_off slots before re-asserting.
+                remaining = self._min_off - elapsed_slots
+                for k in range(min(remaining, n)):
+                    if self._slot_state(slots[k]) != "auto":
+                        continue
+                    prob += (
+                        relay[k] == 0,
+                        f"{var_prefix}{self.load_id}_carryover_off_{k}",
+                    )
+
+        return vars
 
 
 # ── ObservableLoad (mains, oven — measured, not controlled) ──────
@@ -314,6 +489,8 @@ def build_lp_loads(configs: list[ManagedLoadConfig]) -> list[LPLoad]:
     for cfg in configs:
         if cfg.category == LoadCategory.SIGNAL_DRIVEN:
             loads.append(BinarySignalDrivenLoad(cfg))
+        elif cfg.category == LoadCategory.SIGNAL_DRIVEN_CONTINUOUS:
+            loads.append(BinarySignalDrivenContinuousLoad(cfg))
         elif cfg.category == LoadCategory.OBSERVABLE:
             loads.append(ObservableLoad(cfg))
         else:

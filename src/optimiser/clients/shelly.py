@@ -37,7 +37,11 @@ class ShellyLoadController:
         self._client = httpx.AsyncClient(timeout=5.0)
         self._base_url = f"http://{config.shelly_host}"
 
-        # Cycle state tracking (for shiftable loads)
+        # Cycle state. Surfaces on the load card via ManagedLoadStatus.
+        # SHIFTABLE drives this off measured power (one-shot run model);
+        # SIGNAL_DRIVEN_CONTINUOUS drives it off relay state + daily-target
+        # progress. OBSERVABLE / SIGNAL_DRIVEN leave the field unset (None
+        # is returned in status()).
         self._cycle_state = LoadCycleState.IDLE
         self._cycle_started: datetime | None = None
         self._energy_at_cycle_start: float = 0.0
@@ -51,9 +55,24 @@ class ShellyLoadController:
         # Issue #2 fix: queue async relay stop from sync transition
         self._pending_relay_stop: bool = False
 
+        # Relay state-change tracking for SIGNAL_DRIVEN_CONTINUOUS block
+        # enforcement. `_last_relay_state` is the most recently observed
+        # value; `_relay_state_since` is when the current state began.
+        # Both stay None until the first successful relay read.
+        self._last_relay_state: bool | None = None
+        self._relay_state_since: datetime | None = None
+
     @property
     def load_id(self) -> str:
         return self._config.load_id
+
+    @property
+    def has_relay(self) -> bool:
+        """Whether this controller drives a dry-contact relay. False for
+        measurement-only loads (e.g. the grid CT on the Shelly's second
+        channel). The fallback path uses this to skip relay-less loads
+        rather than trip the `set_relay → no relay` error log."""
+        return self._config.has_relay
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -72,17 +91,27 @@ class ShellyLoadController:
         read_ok = False
 
         try:
-            # Read energy meter status
+            # Pro EM 50: live power on EM1.GetStatus, lifetime energy on
+            # EM1Data.GetStatus (different endpoint from the 3-phase Pro
+            # 3EM, which exposes both inside EM.GetStatus). Sign convention
+            # for grid CT: act_power < 0 = export, > 0 = import — matches
+            # the inverter's grid_power_kw convention for the validation
+            # cross-check.
             resp = await self._client.get(
-                f"{self._base_url}/rpc/EM.GetStatus",
+                f"{self._base_url}/rpc/EM1.GetStatus",
                 params={"id": self._config.shelly_channel},
             )
             resp.raise_for_status()
             em_data = resp.json()
-            # Power in watts, convert to kW
             power_kw = em_data.get("act_power", 0) / 1000.0
-            # Total energy in Wh
-            energy_kwh = em_data.get("total_act_energy", 0) / 1000.0
+
+            resp = await self._client.get(
+                f"{self._base_url}/rpc/EM1Data.GetStatus",
+                params={"id": self._config.shelly_channel},
+            )
+            resp.raise_for_status()
+            energy_data = resp.json()
+            energy_kwh = energy_data.get("total_act_energy", 0) / 1000.0
             read_ok = True
 
             # Read relay state if applicable
@@ -106,6 +135,15 @@ class ShellyLoadController:
             # Update cycle state for shiftable loads
             if self._config.category == LoadCategory.SHIFTABLE:
                 self._update_cycle_state(power_kw)
+            elif self._config.category == LoadCategory.SIGNAL_DRIVEN_CONTINUOUS:
+                self._update_cycle_state_continuous(relay_on)
+
+        # Track relay state-change timestamp for SIGNAL_DRIVEN_CONTINUOUS
+        # block enforcement. Only on successful read with an observed
+        # relay value — None values (read failure) leave state untouched
+        # so a transient blip doesn't reset the elapsed-time window.
+        if read_ok and relay_on is not None:
+            self._track_relay_state(relay_on)
 
         return ManagedLoadStatus(
             load_id=self._config.load_id,
@@ -114,8 +152,10 @@ class ShellyLoadController:
             energy_today_kwh=self._energy_today_kwh,
             relay_on=relay_on,
             cycle_state=self._cycle_state
-            if self._config.category == LoadCategory.SHIFTABLE
+            if self._config.category
+            in (LoadCategory.SHIFTABLE, LoadCategory.SIGNAL_DRIVEN_CONTINUOUS)
             else None,
+            relay_state_since=self._relay_state_since,
         )
 
     async def start_cycle(self) -> bool:
@@ -193,6 +233,18 @@ class ShellyLoadController:
                 self._config.load_id,
             )
             return False
+
+    def _track_relay_state(self, relay_on: bool) -> None:
+        """Record the timestamp when `relay_on` last transitioned.
+
+        Called from `status()` after each successful read. On the first
+        observation post-startup the timestamp anchors to now: worst case
+        the LP holds an extra full block before allowing a transition,
+        which is the safe direction (won't violate min-on/min-off).
+        """
+        if self._last_relay_state is None or self._last_relay_state != relay_on:
+            self._relay_state_since = now_utc()
+        self._last_relay_state = relay_on
 
     def _track_daily_energy(self, total_energy_kwh: float) -> None:
         """Track accumulated energy today, resetting at midnight.
@@ -290,6 +342,24 @@ class ShellyLoadController:
         elif self._cycle_state == LoadCycleState.COMPLETE_TODAY:
             # Reset at midnight (handled by _track_daily_energy)
             pass
+
+    def _update_cycle_state_continuous(self, relay_on: bool | None) -> None:
+        """Cycle state for SIGNAL_DRIVEN_CONTINUOUS loads.
+
+        The appliance handles its own internal compressor cycles while
+        the LP holds the dry contact. So relay_on directly maps to
+        RUNNING/IDLE — there's no "wait for power to drop" semantic
+        like SHIFTABLE has. Once the day's target is hit, latch to
+        COMPLETE_TODAY until midnight rolls energy_today_kwh back to 0
+        (handled by `_track_daily_energy`).
+        """
+        target = self._config.daily_target_kwh
+        if target is not None and self._energy_today_kwh >= target:
+            self._cycle_state = LoadCycleState.COMPLETE_TODAY
+        elif relay_on:
+            self._cycle_state = LoadCycleState.RUNNING
+        else:
+            self._cycle_state = LoadCycleState.IDLE
 
 
 class ManagedLoadManager:

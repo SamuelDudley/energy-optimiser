@@ -100,9 +100,7 @@ class TestDispatchFromSlot:
         # 5 kW charge with grid contributing more than PV → mode 3,
         # cap = total intended rate. No cutoff write (mode 3 doesn't
         # consult 40047).
-        d = dispatch_from_slot(
-            _slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0)
-        )
+        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0))
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
         assert d.kind == DispatchKind.CHARGE
         assert d.cap_kw == 5.0
@@ -144,9 +142,7 @@ class TestDispatchFromSlot:
 
     def test_charge_grid_only_picks_mode_3(self) -> None:
         # No PV available (e.g. overnight cheap charging) → grid-first
-        d = dispatch_from_slot(
-            _slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0)
-        )
+        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0))
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
 
     def test_charge_grid_lead_below_hysteresis_stays_on_mode_2(self) -> None:
@@ -274,40 +270,30 @@ class TestVerifyBatteryResponse:
     # apply — see the dedicated mode-2 tests further down.
 
     def test_charge_at_cap_is_ok(self) -> None:
-        d = dispatch_from_slot(
-            _slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0)
-        )
+        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0))
         # Inverter charging at exactly cap → OK
         assert verify_battery_response(d, measured_kw=5.0) == DeviationKind.OK
 
     def test_charge_under_cap_is_ok(self) -> None:
         # Inverter charging at less than cap (e.g. grid constrained) is
         # acceptable — not all our headroom must be used.
-        d = dispatch_from_slot(
-            _slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0)
-        )
+        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0))
         assert verify_battery_response(d, measured_kw=2.0) == DeviationKind.OK
         assert verify_battery_response(d, measured_kw=0.0) == DeviationKind.OK
 
     def test_charge_with_small_negative_within_floor_is_ok(self) -> None:
         # Measurement noise near zero — 200W discharge while we asked
         # for charge isn't a real deviation, just sensor jitter.
-        d = dispatch_from_slot(
-            _slot(battery_kw=3.0, pv_to_battery_kw=0.0, grid_to_battery_kw=3.0)
-        )
+        d = dispatch_from_slot(_slot(battery_kw=3.0, pv_to_battery_kw=0.0, grid_to_battery_kw=3.0))
         assert verify_battery_response(d, measured_kw=-0.2) == DeviationKind.OK
 
     def test_charge_actually_discharging_is_wrong_direction(self) -> None:
-        d = dispatch_from_slot(
-            _slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0)
-        )
+        d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0))
         # Inverter discharging at 2kW when we asked for charge
         assert verify_battery_response(d, measured_kw=-2.0) == DeviationKind.WRONG_DIRECTION
 
     def test_charge_well_over_cap_is_over_cap(self) -> None:
-        d = dispatch_from_slot(
-            _slot(battery_kw=3.0, pv_to_battery_kw=0.0, grid_to_battery_kw=3.0)
-        )
+        d = dispatch_from_slot(_slot(battery_kw=3.0, pv_to_battery_kw=0.0, grid_to_battery_kw=3.0))
         # 5% tolerance: 3.0 × 1.05 = 3.15 — above that is OVER_CAP
         assert verify_battery_response(d, measured_kw=3.1) == DeviationKind.OK
         assert verify_battery_response(d, measured_kw=4.0) == DeviationKind.OVER_CAP
@@ -331,10 +317,7 @@ class TestVerifyBatteryResponse:
         assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
         assert d.cap_kw == 3.0  # LP rate — trim floor
         # Wrong direction still caught
-        assert (
-            verify_battery_response(d, measured_kw=-2.0)
-            == DeviationKind.WRONG_DIRECTION
-        )
+        assert verify_battery_response(d, measured_kw=-2.0) == DeviationKind.WRONG_DIRECTION
         # Charging above LP rate is OK under mode-2 adaptive trim
         assert verify_battery_response(d, measured_kw=8.0) == DeviationKind.OK
         assert verify_battery_response(d, measured_kw=12.5) == DeviationKind.OK
@@ -501,3 +484,26 @@ class TestFallback:
         assert "hot_water" not in result.relays_opened
         assert "aircon" in result.relays_opened
         good.set_relay.assert_awaited_once_with(False)
+
+    @pytest.mark.asyncio
+    async def test_skips_loads_without_a_relay(self) -> None:
+        """Measurement-only entries (e.g. the grid CT on a shared Shelly
+        device, has_relay=False) must be skipped — set_relay would just
+        log a 'no relay configured' error otherwise."""
+        sig = MagicMock()
+        sig.set_fallback = AsyncMock(return_value=True)
+
+        ct_only = MagicMock(load_id="mains", has_relay=False)
+        ct_only.set_relay = AsyncMock()
+        relay_load = MagicMock(load_id="hot_water", has_relay=True)
+        relay_load.set_relay = AsyncMock()
+
+        result = await trigger_fallback(
+            sig,
+            [ct_only, relay_load],
+            FallbackReason.LP_ERROR,
+        )
+        assert "mains" not in result.relays_opened
+        assert "hot_water" in result.relays_opened
+        ct_only.set_relay.assert_not_awaited()
+        relay_load.set_relay.assert_awaited_once_with(False)

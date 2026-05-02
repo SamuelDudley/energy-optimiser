@@ -237,18 +237,21 @@ SOC_BOUND_PENALTY: float = 1e4
 # ── Solver ───────────────────────────────────────────────────────
 
 # Hard wall-clock limit for the LP solve. Past this, the optimiser
-# falls back to SELF_CONSUME mode + all relays off. The 10s budget is
-# generous for our problem size and covers all three PRICE_SCENARIO_MODE
-# settings:
-#   - POINT  (default):  3 compound scenarios. Typical solve <250 ms.
-#   - SHARED:            9 compound scenarios. Typical solve <750 ms.
-#   - CROSS:            27 compound scenarios. Typical solve <2.5 s,
-#                       outlier P99 estimated <5 s.
+# falls back to SELF_CONSUME mode + all relays off. The 20s budget
+# absorbs the cost of `_force_binary_relay = True` on
+# SIGNAL_DRIVEN_CONTINUOUS loads (every slot's relay is binary, ~390
+# binaries per scenario at 5-min × 32h coverage); with the HP HW
+# wired in 2026-05-02 typical solve climbed to ~10s. Bumped 10→20
+# to give headroom for additional binary loads (future EV) and the
+# heavier price-scenario modes:
+#   - POINT  (default):  3 compound scenarios. Typical <10s with HW.
+#   - SHARED:            9 compound scenarios. Typical <15s with HW.
+#   - CROSS:            27 compound scenarios. Risk of timeout — measure first.
 # The wall-clock timeout (lp_wall_clock_timeout_s in PlannerConfig)
-# defaults to 12s — slightly larger than this so HiGHS' own timeLimit
+# defaults to 22s — slightly larger than this so HiGHS' own timeLimit
 # fires first and produces a graceful "best feasible" return rather
 # than the hard fallback path.
-SOLVER_TIMEOUT_S: int = 10
+SOLVER_TIMEOUT_S: int = 20
 
 # Mixed-integer treatment: only slot 0 binaries are integer-constrained
 # (the decision we commit to this tick). Future-slot binaries are

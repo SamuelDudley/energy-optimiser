@@ -15,6 +15,7 @@ import pytest
 from optimiser.config import BatteryConfig, ManagedLoadConfig
 from optimiser.lp.constants import HORIZON_HOURS, SLOT_MINUTES
 from optimiser.lp.loads import (
+    BinarySignalDrivenContinuousLoad,
     BinarySignalDrivenLoad,
     ObservableLoad,
     build_lp_loads,
@@ -34,9 +35,9 @@ UTC = UTC
 NOW = datetime(2026, 4, 2, 22, 0, 0, tzinfo=UTC)  # 09:00 Canberra Apr 3
 
 
-def _state(soc: float = 50.0) -> SystemState:
+def _state(soc: float = 50.0, now: datetime = NOW) -> SystemState:
     return SystemState(
-        timestamp=NOW,
+        timestamp=now,
         soc_pct=soc,
         battery_power_kw=0.0,
         pv_power_kw=0.0,
@@ -48,13 +49,15 @@ def _state(soc: float = 50.0) -> SystemState:
     )
 
 
-def _flat_prices(import_c: float = 20.0, export_c: float = 5.0) -> list[PriceInterval]:
+def _flat_prices(
+    import_c: float = 20.0, export_c: float = 5.0, start: datetime = NOW
+) -> list[PriceInterval]:
     """Build prices_planning covering the full LP horizon at 30-min cadence."""
     n_intervals = HORIZON_HOURS * 2  # 30-min
     return [
         PriceInterval(
-            start=NOW + timedelta(minutes=30 * i),
-            end=NOW + timedelta(minutes=30 * (i + 1)),
+            start=start + timedelta(minutes=30 * i),
+            end=start + timedelta(minutes=30 * (i + 1)),
             import_per_kwh=import_c,
             export_per_kwh=export_c,
             spot_per_kwh=import_c * 0.3,
@@ -150,6 +153,82 @@ class TestLPSolves:
         )
         assert hw_total >= 4.0 - 0.01, f"HW only delivered {hw_total:.2f} kWh"
 
+    def test_partial_last_day_below_capacity_skipped_not_infeasible(self) -> None:
+        """A future iteration whose in-horizon window is too short to
+        meet day_target (e.g. Amber's prices truncate the LP horizon
+        partway through day 2) must skip the constraint, not return
+        infeasible. Reproduces the 2026-05-02 production failure where
+        day 2 had only 4 h of in-horizon window vs a 4 kWh / 0.9 kW
+        target = 3.6 kWh max-achievable.
+        """
+        # 32 hours of prices (instead of 48). With NOW = 09:00 Apr 3
+        # local, day 2's window starts at Apr 5 00:00 local = Apr 4
+        # 14:00 UTC, but horizon ends at Apr 4 06:00 UTC — day 2 is
+        # entirely outside the horizon. Use 42h to make day 2 partial.
+        n_intervals = 42 * 2  # 30-min cadence, 42h
+        prices = [
+            PriceInterval(
+                start=NOW + timedelta(minutes=30 * i),
+                end=NOW + timedelta(minutes=30 * (i + 1)),
+                import_per_kwh=20.0,
+                export_per_kwh=5.0,
+                spot_per_kwh=6.0,
+                renewables_pct=40.0,
+                spike_status="none",
+                descriptor="neutral",
+            )
+            for i in range(n_intervals)
+        ]
+        cfg = _hw_cfg()  # target=4, draw=1.0, deadline=22
+        sol = solve(
+            state=_state(),
+            prices_planning=prices,
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), (
+            f"LP must skip un-meetable partial last day, got: {sol.reason}"
+        )
+
+    def test_unmeetable_today_rolls_forward_not_infeasible(self) -> None:
+        """If today's remaining window can't physically deliver the
+        daily target, the LP must roll the unmet target forward to
+        tomorrow rather than return infeasible. Reproduces the 2026-
+        05-02 19:11 deploy failure (deployed late, only ~3 h left
+        before today's 22:00 deadline → max 2.7 kWh achievable
+        against a 4 kWh target → infeasible without this fix).
+        """
+        # 19:00 Canberra Apr 3 = 09:00 UTC. ~3 h to today's 22:00
+        # deadline → today caps at 0.9 × 3 = 2.7 kWh (< 4 kWh target).
+        # Tomorrow's 22 h window holds the rolled-forward 8 kWh easily.
+        late_now = datetime(2026, 4, 3, 9, 0, 0, tzinfo=UTC)
+        cfg = ManagedLoadConfig(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN,
+            shelly_host="test",
+            has_relay=True,
+            daily_target_kwh=4.0,
+            draw_kw=0.9,
+            deadline_hour_local=22,
+        )
+        sol = solve(
+            state=_state(now=late_now),
+            prices_planning=_flat_prices(start=late_now),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), (
+            f"LP should roll forward, not fail infeasible: {sol.reason}"
+        )
+
 
 # ── Properties: SOC bounds ───────────────────────────────────────
 
@@ -194,15 +273,12 @@ class TestSOCBounds:
         # final SOC should be ≤ ceiling by end of horizon.
         final = sol.forward_trajectory[-1].soc_pct_end
         assert final <= cfg.soc_ceiling_pct + 0.5, (
-            f"LP failed to return SOC below ceiling by end of horizon: "
-            f"final={final:.2f}%"
+            f"LP failed to return SOC below ceiling by end of horizon: final={final:.2f}%"
         )
 
     def test_initial_soc_below_floor_stays_feasible(self) -> None:
         """Mirror case: initial SOC < effective floor must also solve."""
-        cfg = BatteryConfig(
-            soc_floor_pct=15.0, soc_ceiling_pct=95.0, backup_soc_pct=15.0
-        )
+        cfg = BatteryConfig(soc_floor_pct=15.0, soc_ceiling_pct=95.0, backup_soc_pct=15.0)
         sol = solve(
             state=_state(soc=5.0),  # battery is near empty — below floor
             prices_planning=_flat_prices(),
@@ -239,8 +315,7 @@ class TestSOCBounds:
         # 20c import, ~5c export sits well under 2000c even in the worst
         # arbitrage. The raw (penalty-inflated) objective would be 1e5+.
         assert sol.expected_total_cost_cents < 2000.0, (
-            f"cost={sol.expected_total_cost_cents:.0f}c — penalty not "
-            "subtracted?"
+            f"cost={sol.expected_total_cost_cents:.0f}c — penalty not subtracted?"
         )
 
 
@@ -518,8 +593,404 @@ class TestLoadFactory:
         with caplog.at_level("WARNING", logger="optimiser.lp.loads"):
             loads = build_lp_loads([cfg])
         assert loads == []
-        assert any("oven" in r.message for r in caplog.records), \
+        assert any("oven" in r.message for r in caplog.records), (
             "expected a warning naming the skipped load"
+        )
+
+    def test_build_lp_loads_signal_driven_continuous(self) -> None:
+        cfg = ManagedLoadConfig(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            shelly_host="test",
+            has_relay=True,
+            daily_target_kwh=4.0,
+            draw_kw=1.0,
+            min_on_slots=6,
+            min_off_slots=4,
+        )
+        loads = build_lp_loads([cfg])
+        assert len(loads) == 1
+        assert isinstance(loads[0], BinarySignalDrivenContinuousLoad)
+        assert loads[0].load_id == "hot_water"
+
+
+# ── BinarySignalDrivenContinuousLoad: block constraints ──────────
+
+
+def _hw_continuous_cfg(min_on: int = 6, min_off: int = 4, target: float = 4.0) -> ManagedLoadConfig:
+    return ManagedLoadConfig(
+        load_id="hot_water",
+        category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+        shelly_host="test",
+        has_relay=True,
+        daily_target_kwh=target,
+        draw_kw=1.0,
+        deadline_hour_local=22,
+        min_on_slots=min_on,
+        min_off_slots=min_off,
+    )
+
+
+def _relay_runs(traj: list, draw: float = 1.0) -> list[tuple[int, int]]:
+    """Return list of (start_index, length) for each contiguous on-block.
+
+    'On' is `load_kw['hot_water'] >= draw/2` to handle LP relaxation of
+    future binaries (slot 0 is a true binary; slot ≥1 may be fractional).
+    """
+    on = [d.load_kw.get("hot_water", 0.0) >= draw / 2 for d in traj]
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < len(on):
+        if on[i]:
+            j = i
+            while j < len(on) and on[j]:
+                j += 1
+            runs.append((i, j - i))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+class TestSignalDrivenContinuous:
+    def test_constructor_requires_min_on_and_min_off(self) -> None:
+        cfg = ManagedLoadConfig(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            shelly_host="test",
+            has_relay=True,
+            daily_target_kwh=4.0,
+            draw_kw=1.0,
+            min_on_slots=None,
+            min_off_slots=None,
+        )
+        with pytest.raises(ValueError, match="min_on_slots and min_off_slots"):
+            BinarySignalDrivenContinuousLoad(cfg)
+
+    def test_runs_in_blocks_meeting_min_on(self) -> None:
+        """Each on-block in the LP plan is ≥ min_on slots wide (modulo
+        the final block which may be truncated by horizon end)."""
+        cfg = _hw_continuous_cfg(min_on=6, min_off=4)
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        runs = _relay_runs(sol.forward_trajectory)
+        assert runs, "LP must schedule at least one HW run-block to meet target"
+        n_slots = len(sol.forward_trajectory)
+        for idx, (start, length) in enumerate(runs):
+            ends_at_horizon = (start + length) >= n_slots
+            if ends_at_horizon:
+                continue  # truncation by horizon end is allowed
+            assert length >= cfg.min_on_slots, (
+                f"on-block #{idx} at slot {start} is {length} slots, "
+                f"below min_on_slots={cfg.min_on_slots}"
+            )
+
+    def test_off_gaps_meet_min_off(self) -> None:
+        """Gap between two on-blocks is ≥ min_off slots wide."""
+        cfg = _hw_continuous_cfg(min_on=6, min_off=4)
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        runs = _relay_runs(sol.forward_trajectory)
+        for prev, nxt in zip(runs, runs[1:], strict=False):
+            gap = nxt[0] - (prev[0] + prev[1])
+            assert gap >= cfg.min_off_slots, (
+                f"off-gap between blocks {prev} and {nxt} is {gap} slots, "
+                f"below min_off_slots={cfg.min_off_slots}"
+            )
+
+    def test_carryover_holds_relay_on_when_block_unfinished(self) -> None:
+        """Cross-tick: relay was turned on `elapsed` ago (< min_on_slots).
+        Slot 0 must be forced ON, even with the daily target already met.
+        """
+        cfg = _hw_continuous_cfg(min_on=6, min_off=4)
+        # Daily target satisfied → LP would otherwise pick OFF
+        status = ManagedLoadStatus(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            power_kw=1.0,
+            energy_today_kwh=4.0,  # already at target
+            relay_on=True,
+            cycle_state=None,
+            relay_state_since=NOW - timedelta(minutes=10),  # 2 slots in
+        )
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[status],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        # 10 min elapsed @ 5-min slots = 2 slots in. min_on = 6 →
+        # remaining = 4. Slots 0..3 must be ON.
+        for k in range(4):
+            assert sol.forward_trajectory[k].load_kw.get("hot_water", 0.0) >= 0.99, (
+                f"slot {k} should be forced ON by carry-over, got "
+                f"{sol.forward_trajectory[k].load_kw.get('hot_water', 0.0):.2f}"
+            )
+
+    def test_carryover_holds_relay_off_when_cooldown_unfinished(self) -> None:
+        """Mirror case: relay just turned off, must stay off for min_off slots."""
+        cfg = _hw_continuous_cfg(min_on=6, min_off=4)
+        status = ManagedLoadStatus(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            power_kw=0.0,
+            energy_today_kwh=0.0,  # daily target unmet → LP wants ON
+            relay_on=False,
+            cycle_state=None,
+            relay_state_since=NOW - timedelta(minutes=5),  # 1 slot in
+        )
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[status],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        # 5 min elapsed = 1 slot. min_off = 4 → remaining = 3 forced OFF.
+        for k in range(3):
+            assert sol.forward_trajectory[k].load_kw.get("hot_water", 0.0) <= 0.01, (
+                f"slot {k} should be forced OFF by carry-over, got "
+                f"{sol.forward_trajectory[k].load_kw.get('hot_water', 0.0):.2f}"
+            )
+
+    def test_carryover_releases_after_block_complete(self) -> None:
+        """When elapsed ≥ min_on, no carry-over constraint — LP free
+        to turn off. With daily target met, LP picks OFF at slot 0."""
+        cfg = _hw_continuous_cfg(min_on=6, min_off=4)
+        status = ManagedLoadStatus(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            power_kw=1.0,
+            energy_today_kwh=4.0,
+            relay_on=True,
+            cycle_state=None,
+            relay_state_since=NOW - timedelta(minutes=60),  # 12 slots — well past
+        )
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[status],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        assert sol.forward_trajectory[0].load_kw.get("hot_water", 0.0) <= 0.01, (
+            "with target met and carry-over expired, LP should pick OFF"
+        )
+
+    def test_no_carryover_when_relay_state_since_unset(self) -> None:
+        """Status with relay_state_since=None (e.g. fresh startup) → no
+        carry-over constraint; LP behaves as if no prior commitment."""
+        cfg = _hw_continuous_cfg(min_on=6, min_off=4)
+        status = ManagedLoadStatus(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            power_kw=0.0,
+            energy_today_kwh=4.0,
+            relay_on=True,  # currently on but timestamp unknown
+            cycle_state=None,
+            relay_state_since=None,
+        )
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[status],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        # Just verify it solves — without relay_state_since, no carry-over
+        # binding; LP free to pick whatever fits the daily target.
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+
+    def test_schedule_off_forces_all_slots_today_to_zero(self) -> None:
+        """schedule_overrides[today]='off' → relay forced to 0 every slot
+        of today's local-calendar window; daily target relaxed (not
+        rolled forward)."""
+        # NOW = 2026-04-02 22:00 UTC = 09:00 Canberra Apr 3
+        today_local = "2026-04-03"
+        cfg = ManagedLoadConfig(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            shelly_host="test",
+            has_relay=True,
+            daily_target_kwh=4.0,
+            draw_kw=1.0,
+            min_on_slots=6,
+            min_off_slots=4,
+            schedule_overrides={today_local: "off"},
+        )
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        # All slots whose local date is today must be zero.
+        from optimiser.time_utils import utc_to_local
+
+        today_slots = [
+            d
+            for d in sol.forward_trajectory
+            if utc_to_local(d.slot_start).date().isoformat() == today_local
+        ]
+        assert today_slots, "expected at least one slot in today's local window"
+        for d in today_slots:
+            assert d.load_kw.get("hot_water", 0.0) == 0.0, (
+                f"slot {d.slot_start.isoformat()} should be forced OFF, "
+                f"got {d.load_kw.get('hot_water', 0.0):.2f}"
+            )
+
+    def test_schedule_on_forces_all_slots_today_to_one(self) -> None:
+        """schedule_overrides[today]='on' → relay forced to 1 every slot
+        of today's local-calendar window."""
+        today_local = "2026-04-03"
+        cfg = ManagedLoadConfig(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            shelly_host="test",
+            has_relay=True,
+            daily_target_kwh=4.0,
+            draw_kw=1.0,
+            min_on_slots=6,
+            min_off_slots=4,
+            schedule_overrides={today_local: "on"},
+        )
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        from optimiser.time_utils import utc_to_local
+
+        today_slots = [
+            d
+            for d in sol.forward_trajectory
+            if utc_to_local(d.slot_start).date().isoformat() == today_local
+        ]
+        assert today_slots
+        for d in today_slots:
+            assert d.load_kw.get("hot_water", 0.0) >= 0.99, (
+                f"slot {d.slot_start.isoformat()} should be forced ON, "
+                f"got {d.load_kw.get('hot_water', 0.0):.2f}"
+            )
+
+    def test_schedule_off_overrides_carryover_on_block(self) -> None:
+        """A live min-on block (relay just turned on) must yield to a
+        same-day 'off' override — relay forced 0 immediately, not held."""
+        today_local = "2026-04-03"
+        cfg = ManagedLoadConfig(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            shelly_host="test",
+            has_relay=True,
+            daily_target_kwh=4.0,
+            draw_kw=1.0,
+            min_on_slots=6,
+            min_off_slots=4,
+            schedule_overrides={today_local: "off"},
+        )
+        # Carry-over says "still in min-on block" — should be overridden.
+        status = ManagedLoadStatus(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            power_kw=1.0,
+            energy_today_kwh=0.5,
+            relay_on=True,
+            cycle_state=None,
+            relay_state_since=NOW - timedelta(minutes=5),  # 1 slot into block
+        )
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[status],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        # Slot 0 must be OFF despite the in-progress block.
+        assert sol.forward_trajectory[0].load_kw.get("hot_water", 0.0) == 0.0
+
+    def test_schedule_overrides_invalid_state_rejected_at_parse(self) -> None:
+        """An unknown state string fails fast at config parse time."""
+        from optimiser.config import _parse_schedule_overrides
+
+        with pytest.raises(ValueError, match="expected one of"):
+            _parse_schedule_overrides({"2026-05-02": "paused"}, "hot_water")
+
+    def test_schedule_overrides_invalid_date_rejected_at_parse(self) -> None:
+        from optimiser.config import _parse_schedule_overrides
+
+        with pytest.raises(ValueError, match="not a YYYY-MM-DD date"):
+            _parse_schedule_overrides({"tomorrow": "off"}, "hot_water")
+
+    def test_continuous_meets_daily_target(self) -> None:
+        """Block constraints don't break the inherited daily-target sum."""
+        cfg = _hw_continuous_cfg(min_on=6, min_off=4, target=4.0)
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_status()],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        slot_hours = SLOT_MINUTES / 60.0
+        hw_total = sum(
+            d.load_kw.get("hot_water", 0.0) * slot_hours
+            for d in sol.forward_trajectory
+            if d.slot_start < NOW + timedelta(hours=13)  # before 22:00 deadline
+        )
+        assert hw_total >= 4.0 - 0.01, f"HW only delivered {hw_total:.2f} kWh"
 
 
 # ── Horizon truncation + terminal SOC ────────────────────────────
@@ -621,10 +1092,14 @@ class TestHorizonTruncationAndTerminalSOC:
         prices = _flat_prices(import_c=30.0)
         # Override slot 0: perKwh stays 30, but predicted is 2 (very cheap)
         prices[0] = PriceInterval(
-            start=prices[0].start, end=prices[0].end,
-            import_per_kwh=30.0, export_per_kwh=5.0,
-            spot_per_kwh=9.0, renewables_pct=40.0,
-            spike_status="none", descriptor="neutral",
+            start=prices[0].start,
+            end=prices[0].end,
+            import_per_kwh=30.0,
+            export_per_kwh=5.0,
+            spot_per_kwh=9.0,
+            renewables_pct=40.0,
+            spike_status="none",
+            descriptor="neutral",
             forecast_predicted=2.0,
         )
         sol = solve(
@@ -632,7 +1107,8 @@ class TestHorizonTruncationAndTerminalSOC:
             prices_planning=prices,
             pv_forecast=None,
             load_profile=_flat_profile(),
-            managed_loads=[], lp_loads=[],
+            managed_loads=[],
+            lp_loads=[],
             battery_config=BatteryConfig(),
             timeout_s=30.0,
         )
@@ -656,10 +1132,14 @@ class TestHorizonTruncationAndTerminalSOC:
         """
         prices = _flat_prices(import_c=30.0, export_c=0.0)
         prices[0] = PriceInterval(
-            start=prices[0].start, end=prices[0].end,
-            import_per_kwh=30.0, export_per_kwh=0.0,
-            spot_per_kwh=9.0, renewables_pct=40.0,
-            spike_status="none", descriptor="neutral",
+            start=prices[0].start,
+            end=prices[0].end,
+            import_per_kwh=30.0,
+            export_per_kwh=0.0,
+            spot_per_kwh=9.0,
+            renewables_pct=40.0,
+            spike_status="none",
+            descriptor="neutral",
             export_forecast_predicted=30.0,
         )
         sol = solve(
@@ -667,7 +1147,8 @@ class TestHorizonTruncationAndTerminalSOC:
             prices_planning=prices,
             pv_forecast=None,
             load_profile=_flat_profile(),
-            managed_loads=[], lp_loads=[],
+            managed_loads=[],
+            lp_loads=[],
             battery_config=BatteryConfig(),
             timeout_s=30.0,
         )
@@ -698,7 +1179,8 @@ class TestHorizonTruncationAndTerminalSOC:
             prices_planning=prices,
             pv_forecast=None,
             load_profile=_flat_profile(),
-            managed_loads=[], lp_loads=[],
+            managed_loads=[],
+            lp_loads=[],
             battery_config=BatteryConfig(),
             timeout_s=30.0,
         )
@@ -724,10 +1206,14 @@ class TestHorizonTruncationAndTerminalSOC:
         """
         prices = _flat_prices(import_c=30.0, export_c=1.0)
         prices[0] = PriceInterval(
-            start=prices[0].start, end=prices[0].end,
-            import_per_kwh=30.0, export_per_kwh=1.0,
-            spot_per_kwh=9.0, renewables_pct=40.0,
-            spike_status="none", descriptor="neutral",
+            start=prices[0].start,
+            end=prices[0].end,
+            import_per_kwh=30.0,
+            export_per_kwh=1.0,
+            spot_per_kwh=9.0,
+            renewables_pct=40.0,
+            spike_status="none",
+            descriptor="neutral",
             export_forecast_predicted=-1.0,
         )
         sol = solve(
@@ -735,7 +1221,8 @@ class TestHorizonTruncationAndTerminalSOC:
             prices_planning=prices,
             pv_forecast=None,
             load_profile=_flat_profile(),
-            managed_loads=[], lp_loads=[],
+            managed_loads=[],
+            lp_loads=[],
             battery_config=BatteryConfig(),
             timeout_s=30.0,
         )

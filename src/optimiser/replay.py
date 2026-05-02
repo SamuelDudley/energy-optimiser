@@ -141,6 +141,10 @@ def _reconstruct_load_profile(d: dict) -> LoadProfile:
 
 
 def _reconstruct_managed_load(d: dict) -> ManagedLoadStatus:
+    relay_state_since_raw = d.get("relay_state_since")
+    relay_state_since = (
+        datetime.fromisoformat(relay_state_since_raw) if relay_state_since_raw else None
+    )
     return ManagedLoadStatus(
         load_id=d["load_id"],
         category=LoadCategory(d["category"]),
@@ -148,6 +152,7 @@ def _reconstruct_managed_load(d: dict) -> ManagedLoadStatus:
         energy_today_kwh=d["energy_today_kwh"],
         relay_on=d.get("relay_on"),
         cycle_state=LoadCycleState(d["cycle_state"]) if d.get("cycle_state") else None,
+        relay_state_since=relay_state_since,
     )
 
 
@@ -184,6 +189,7 @@ def _reconstruct_snapshot(raw: dict) -> TickSnapshot:
     pv_probe_raw = raw.get("pv_probe")
     if pv_probe_raw is not None:
         from .types import PVProbeResult  # local import to avoid cycle
+
         pv_probe = PVProbeResult(
             pv_kw=pv_probe_raw.get("pv_kw"),
             saturated=pv_probe_raw.get("saturated", False),

@@ -78,9 +78,14 @@ async def trigger_fallback(
     except Exception:
         logger.exception("Fallback: set_fallback raised")
 
-    # Step 2: open all managed-load relays.
+    # Step 2: open all managed-load relays. Skip controllers without a
+    # relay (e.g. the grid CT entry on a shared Shelly device) — calling
+    # set_relay(False) on them just trips the controller's "no relay"
+    # error log and adds noise to the fallback event.
     relay_load_ids: list[str] = []
     for ctl in shelly_controllers:
+        if not ctl.has_relay:
+            continue
         try:
             await ctl.set_relay(False)
             relay_load_ids.append(ctl.load_id)

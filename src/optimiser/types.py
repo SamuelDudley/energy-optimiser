@@ -50,7 +50,10 @@ BATTERY_ACTION_TO_EMS_MODE: dict[BatteryAction, RemoteEMSControlMode] = {
 class LoadCategory(StrEnum):
     SHIFTABLE = auto()  # Run a complete cycle once (legacy HW model).
     SIGNAL_DRIVEN = auto()  # Continuous assert/de-assert; appliance manages own cycles
-    # (HP in PV mode, future: EV charging).
+    # (future EV charging where rapid relay flapping is acceptable).
+    SIGNAL_DRIVEN_CONTINUOUS = auto()  # Same as SIGNAL_DRIVEN, plus min-on/min-off
+    # constraints so the LP commits to contiguous run-blocks. Required for
+    # appliances that don't tolerate stop-start (HW heat pump compressors).
     PRECONDITIONABLE = auto()
     OBSERVABLE = auto()
     DEADLINE_BIDIR = auto()
@@ -313,6 +316,13 @@ class ManagedLoadStatus:
     energy_today_kwh: float
     relay_on: bool | None = None
     cycle_state: LoadCycleState | None = None
+    # UTC timestamp when the relay's current state began. Updated by the
+    # controller on observed transitions; None until the first observation.
+    # Read by BinarySignalDrivenContinuousLoad to enforce min-on / min-off
+    # carry-over across LP rebuilds — without this field, the in-horizon
+    # min-on/min-off constraints don't bind slot 0 (no slot -1 to subtract
+    # from), so a fresh tick could turn off mid-block.
+    relay_state_since: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +392,7 @@ class PVProbeResult:
     (Modbus blip during the 5-second window). Caller falls back to
     Solcast in that case.
     """
+
     pv_kw: float | None
     saturated: bool
     bat_kw: float | None

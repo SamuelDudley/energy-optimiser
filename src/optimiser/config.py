@@ -139,6 +139,31 @@ class ManagedLoadConfig:
         2.5  # Above this, suspect resistive element (LC misconfigured).
     )
 
+    # ── SIGNAL_DRIVEN_CONTINUOUS (block-running variant) ─────────
+    # Once the relay turns on, must remain on for ≥ min_on_slots
+    # consecutive slots; once off, must remain off for ≥ min_off_slots
+    # before re-asserting. Both required for SIGNAL_DRIVEN_CONTINUOUS;
+    # ignored otherwise. Slot length is lp.constants.SLOT_MINUTES.
+    min_on_slots: int | None = None
+    min_off_slots: int | None = None
+
+    # ── Per-day schedule overrides (off / auto / on) ─────────────
+    # Map of local-calendar date (YYYY-MM-DD) → state: "off" or "on".
+    # Days not present default to "auto" (LP decides). Semantics:
+    #   off  — relay forced OFF for every slot in that local day; the
+    #          day's daily-target constraint is dropped (no roll-forward
+    #          into or out of a skipped day).
+    #   on   — relay forced ON for every slot in that local day; the
+    #          appliance's own internal control decides whether to draw
+    #          power (HP HW only runs when it needs to). Daily-target
+    #          constraint also dropped: we're committed regardless.
+    #   auto — existing LP behaviour: daily-target constraint plus any
+    #          min-on / min-off carry-over applies.
+    # Any in-flight min-on block carry-over is overridden by a non-auto
+    # state at slot 0 — user intent wins over safety. Edit config.toml
+    # and /deploy to apply.
+    schedule_overrides: dict[str, str] = field(default_factory=dict)
+
     # ── Common ───────────────────────────────────────────────────
     # draw_kw default 0.9: Haier HP330M1-U1 inverter compressor average. Guess
     # until measured — tune from Shelly CT data once running.
@@ -273,6 +298,39 @@ class Config:
     api: APIConfig
 
 
+_VALID_SCHEDULE_STATES = frozenset({"off", "on"})
+
+
+def _parse_schedule_overrides(raw: dict, load_id: str) -> dict[str, str]:
+    """Validate and normalise per-day schedule overrides.
+
+    Keys must be ISO-format dates (YYYY-MM-DD); values must be 'off'
+    or 'on' (lowercase). 'auto' is the default and shouldn't appear as
+    an explicit override — flagged with a clear error so the operator
+    notices typos rather than silently ignoring them.
+    """
+    from datetime import date as _date
+
+    result: dict[str, str] = {}
+    for k, v in raw.items():
+        try:
+            _date.fromisoformat(k)
+        except ValueError as exc:
+            raise ValueError(
+                f"managed_load {load_id!r}: schedule_overrides key {k!r} "
+                f"is not a YYYY-MM-DD date: {exc}"
+            ) from exc
+        v_norm = str(v).lower()
+        if v_norm not in _VALID_SCHEDULE_STATES:
+            raise ValueError(
+                f"managed_load {load_id!r}: schedule_overrides[{k!r}] is "
+                f"{v!r}, expected one of {sorted(_VALID_SCHEDULE_STATES)} "
+                f"(omit the entry for 'auto')"
+            )
+        result[k] = v_norm
+    return result
+
+
 def _parse_load(raw: dict) -> ManagedLoadConfig:
     return ManagedLoadConfig(
         load_id=raw["load_id"],
@@ -290,6 +348,14 @@ def _parse_load(raw: dict) -> ManagedLoadConfig:
         hysteresis_extra=raw.get("hysteresis_extra", 4),
         pv_surplus_threshold_kw=raw.get("pv_surplus_threshold_kw", 0.5),
         element_warning_threshold_kw=raw.get("element_warning_threshold_kw", 2.5),
+        # SIGNAL_DRIVEN_CONTINUOUS
+        min_on_slots=raw.get("min_on_slots"),
+        min_off_slots=raw.get("min_off_slots"),
+        # Schedule overrides — validated at parse time so bad values
+        # surface at startup, not mid-tick.
+        schedule_overrides=_parse_schedule_overrides(
+            raw.get("schedule_overrides", {}), raw.get("load_id", "?")
+        ),
         # Common
         draw_kw=raw.get("draw_kw", 0.9),
         power_zero_threshold_kw=raw.get("power_zero_threshold_kw", 0.3),

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
@@ -17,7 +18,7 @@ from freezegun import freeze_time
 from optimiser.clients.shelly import ShellyLoadController
 from optimiser.config import ManagedLoadConfig, StorageConfig
 from optimiser.store import CURRENT_SCHEMA_VERSION, TelemetryStore
-from optimiser.types import LoadCategory, TelemetryRow
+from optimiser.types import LoadCategory, LoadCycleState, TelemetryRow
 
 UTC = UTC
 
@@ -353,3 +354,96 @@ class TestShellyCounterReset:
 
             ctrl._track_daily_energy(104.0)
             assert ctrl._energy_today_kwh == pytest.approx(0.5)
+
+
+# ── Relay state-change tracking (SIGNAL_DRIVEN_CONTINUOUS carry-over) ──
+
+
+class TestRelayStateTracking:
+    def test_first_observation_anchors_timestamp(self) -> None:
+        ctrl = ShellyLoadController(_shelly_cfg())
+        assert ctrl._relay_state_since is None
+        with freeze_time("2026-01-01 06:00:00"):
+            ctrl._track_relay_state(True)
+        assert ctrl._last_relay_state is True
+        assert ctrl._relay_state_since == datetime(2026, 1, 1, 6, 0, 0, tzinfo=UTC)
+
+    def test_steady_state_does_not_advance_timestamp(self) -> None:
+        ctrl = ShellyLoadController(_shelly_cfg())
+        with freeze_time("2026-01-01 06:00:00"):
+            ctrl._track_relay_state(True)
+            anchor = ctrl._relay_state_since
+        with freeze_time("2026-01-01 06:05:00"):
+            ctrl._track_relay_state(True)  # still on, no transition
+        assert ctrl._relay_state_since == anchor
+
+    def test_transition_advances_timestamp(self) -> None:
+        ctrl = ShellyLoadController(_shelly_cfg())
+        with freeze_time("2026-01-01 06:00:00"):
+            ctrl._track_relay_state(True)
+        with freeze_time("2026-01-01 06:30:00"):
+            ctrl._track_relay_state(False)  # transition
+        assert ctrl._last_relay_state is False
+        assert ctrl._relay_state_since == datetime(2026, 1, 1, 6, 30, 0, tzinfo=UTC)
+
+
+# ── Cycle state for SIGNAL_DRIVEN_CONTINUOUS ──────────────────────
+
+
+def _continuous_cfg(daily_target_kwh: float = 4.0) -> ManagedLoadConfig:
+    return ManagedLoadConfig(
+        load_id="hot_water",
+        category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+        shelly_host="test",
+        has_relay=True,
+        daily_target_kwh=daily_target_kwh,
+        min_on_slots=12,
+        min_off_slots=4,
+    )
+
+
+class TestCycleStateContinuous:
+    def test_relay_off_below_target_is_idle(self) -> None:
+        ctrl = ShellyLoadController(_continuous_cfg())
+        ctrl._energy_today_kwh = 1.5
+        ctrl._update_cycle_state_continuous(relay_on=False)
+        assert ctrl._cycle_state == LoadCycleState.IDLE
+
+    def test_relay_on_below_target_is_running(self) -> None:
+        ctrl = ShellyLoadController(_continuous_cfg())
+        ctrl._energy_today_kwh = 1.5
+        ctrl._update_cycle_state_continuous(relay_on=True)
+        assert ctrl._cycle_state == LoadCycleState.RUNNING
+
+    def test_target_met_latches_complete_today(self) -> None:
+        ctrl = ShellyLoadController(_continuous_cfg(daily_target_kwh=4.0))
+        ctrl._energy_today_kwh = 4.0
+        ctrl._update_cycle_state_continuous(relay_on=True)
+        assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
+
+    def test_target_met_overrides_relay_off(self) -> None:
+        ctrl = ShellyLoadController(_continuous_cfg(daily_target_kwh=4.0))
+        ctrl._energy_today_kwh = 4.2  # past target
+        ctrl._update_cycle_state_continuous(relay_on=False)
+        assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
+
+    def test_no_target_never_completes(self) -> None:
+        # daily_target_kwh=None means no target — only IDLE/RUNNING.
+        ctrl = ShellyLoadController(_continuous_cfg())
+        ctrl._config = replace(ctrl._config, daily_target_kwh=None)
+        ctrl._energy_today_kwh = 999.0
+        ctrl._update_cycle_state_continuous(relay_on=True)
+        assert ctrl._cycle_state == LoadCycleState.RUNNING
+
+    def test_midnight_reset_clears_complete(self) -> None:
+        # COMPLETE_TODAY is latched while energy_today_kwh ≥ target. After
+        # `_track_daily_energy` rolls the counter at midnight (back to 0),
+        # the next status() call should drop us back to IDLE/RUNNING based
+        # on relay state alone.
+        ctrl = ShellyLoadController(_continuous_cfg(daily_target_kwh=4.0))
+        ctrl._energy_today_kwh = 4.5
+        ctrl._update_cycle_state_continuous(relay_on=False)
+        assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
+        ctrl._energy_today_kwh = 0.0  # midnight reset (handled elsewhere)
+        ctrl._update_cycle_state_continuous(relay_on=False)
+        assert ctrl._cycle_state == LoadCycleState.IDLE
