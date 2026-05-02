@@ -68,7 +68,12 @@
     <span id="range-mode" class="mode-indicator live">live · last 24h + 48h forecast</span>
   </nav>
 
-  <main>
+  <nav id="tab-bar" class="tab-bar" aria-label="View">
+    <button type="button" class="tab-btn active" data-tab="energy" aria-pressed="true">Energy</button>
+    <button type="button" class="tab-btn" data-tab="ops" aria-pressed="false">Ops</button>
+  </nav>
+
+  <main id="energy-view" class="tab-view">
     <section class="panel panel-charts">
       <div id="ts-figure"></div>
     </section>
@@ -116,8 +121,63 @@
     </section>
   </main>
 
+  <main id="ops-view" class="tab-view" hidden>
+    <nav class="ops-window-bar" aria-label="Ops window">
+      <span class="range-label">Window</span>
+      <div class="preset-row">
+        <button type="button" class="ops-window-btn primary" data-window-h="1" aria-pressed="true">1 h</button>
+        <button type="button" class="ops-window-btn" data-window-h="6" aria-pressed="false">6 h</button>
+        <button type="button" class="ops-window-btn" data-window-h="24" aria-pressed="false">24 h</button>
+        <button type="button" class="ops-window-btn" data-window-h="168" aria-pressed="false">7 d</button>
+      </div>
+      <span id="ops-status" class="muted">—</span>
+    </nav>
+
+    <section class="panel panel-ops-solve">
+      <div class="panel-header">
+        <h2>LP solve performance</h2>
+        <span class="muted">solve_time_ms per tick</span>
+      </div>
+      <div id="ops-solve-series" class="ops-chart"></div>
+      <div class="ops-row-2">
+        <div id="ops-solve-histogram" class="ops-chart"></div>
+        <div id="ops-solve-status" class="ops-chart"></div>
+      </div>
+    </section>
+
+    <section class="panel panel-ops-modbus">
+      <div class="panel-header">
+        <h2>Modbus health</h2>
+        <span class="muted">read batch latency, writes, reconnects</span>
+      </div>
+      <div id="ops-modbus-summary" class="ops-summary-grid">
+        <div class="muted">—</div>
+      </div>
+      <div id="ops-modbus-writes" class="ops-chart"></div>
+    </section>
+
+    <section class="panel panel-ops-api">
+      <div class="panel-header">
+        <h2>API client health</h2>
+        <span class="muted">request rate, error rate, p95 latency</span>
+      </div>
+      <div id="ops-api-table" class="ops-table-wrap"></div>
+    </section>
+
+    <section class="panel panel-ops-state">
+      <div class="panel-header">
+        <h2>State machine + incidents</h2>
+        <span class="muted">transitions, fallback, breaker</span>
+      </div>
+      <ol id="ops-state-list" class="events-list ops-events">
+        <li class="muted">—</li>
+      </ol>
+    </section>
+  </main>
+
   <footer id="error-bar" class="error-bar hidden"></footer>
 
   <script src="/dashboard/static/dashboard.js"></script>
+  <script src="/dashboard/static/ops.js"></script>
 </body>
 </html>

@@ -344,3 +344,194 @@ main {
   .status-value { font-size: 15px; }
   .tile-value { font-size: 14px; }
 }
+
+/* ── Tab bar (Energy / Ops) ──────────────────────────────────── */
+.tab-bar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active {
+  background: var(--bg-soft);
+  color: var(--text);
+  border-color: var(--accent);
+}
+.tab-view[hidden] { display: none; }
+
+/* ── Ops view ───────────────────────────────────────────────── */
+:root {
+  --ops-series-h: 280px;
+  --ops-hist-h: 240px;
+  --ops-status-h: 240px;
+  --ops-writes-h: 260px;
+}
+
+/* Window selector — looks/behaves like the range-bar preset row but
+   lives inside the ops grid, spanning the full row. */
+.ops-window-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 4px;
+  font-size: 13px;
+}
+.ops-window-bar .preset-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.ops-window-btn {
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.ops-window-btn:hover { border-color: var(--accent); }
+.ops-window-btn.primary {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+.ops-window-btn.primary:hover { filter: brightness(1.1); }
+#ops-status {
+  margin-left: auto;
+  font-size: 12px;
+}
+
+/* Grid placement — share the energy `main` 2-col grid. Full-width
+   panels stack at the top; bottom row splits API table + state events
+   side by side, matching the loads/events row in the energy view. */
+.panel-ops-solve  { grid-column: 1 / span 2; }
+.panel-ops-modbus { grid-column: 1 / span 2; }
+.panel-ops-api    { grid-column: 1 / span 1; }
+.panel-ops-state  { grid-column: 2 / span 1; }
+
+/* Side-by-side row inside the solve panel for histogram + status mix */
+.ops-row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+/* Plotly fills its container — we drive height via CSS. */
+.ops-chart { width: 100%; }
+#ops-solve-series   { height: var(--ops-series-h); }
+#ops-solve-histogram{ height: var(--ops-hist-h); }
+#ops-solve-status   { height: var(--ops-status-h); }
+#ops-modbus-writes  { height: var(--ops-writes-h); margin-top: 8px; }
+
+.ops-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+.ops-cell {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.ops-cell-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.ops-cell-value {
+  font-size: 16px;
+  font-weight: 600;
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.ops-cell-value.warn { color: var(--warn); }
+
+/* API table — full-width inside its panel; horizontal scroll on
+   narrow screens so column counts don't force layout overflow. */
+.ops-table-wrap { width: 100%; overflow-x: auto; }
+.ops-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.ops-table th,
+.ops-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.ops-table th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ops-table tbody tr:last-child td { border-bottom: none; }
+.ops-table td.warn { color: var(--warn); }
+
+/* State/event list — same monospace look as the energy events list,
+   plus per-row ev-* spans. */
+.ops-events { max-height: 360px; }
+.ev-ts { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+.ev-name { color: var(--accent); font-weight: 600; margin-right: 6px; }
+.ev-data {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Tablet (≤ 1100px) — tighten chart heights */
+@media (max-width: 1100px) {
+  :root {
+    --ops-series-h: 240px;
+    --ops-hist-h: 220px;
+    --ops-status-h: 220px;
+    --ops-writes-h: 240px;
+  }
+}
+
+/* Mobile (≤ 760px) — single column, narrower charts, side-by-side
+   histogram/status drops to stacked. */
+@media (max-width: 760px) {
+  :root {
+    --ops-series-h: 220px;
+    --ops-hist-h: 200px;
+    --ops-status-h: 200px;
+    --ops-writes-h: 220px;
+  }
+  .panel-ops-solve,
+  .panel-ops-modbus,
+  .panel-ops-api,
+  .panel-ops-state {
+    grid-column: 1 / -1;
+  }
+  .ops-row-2 {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .ops-window-bar {
+    padding: 6px 2px;
+    gap: 6px 8px;
+  }
+  .ops-window-bar .preset-row { width: 100%; justify-content: space-between; }
+  .ops-window-bar .preset-row .ops-window-btn { flex: 1 1 0; }
+  #ops-status { margin-left: 0; width: 100%; }
+}

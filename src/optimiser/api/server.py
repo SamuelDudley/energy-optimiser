@@ -26,6 +26,12 @@ from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
 from .handlers.logs import logs as logs_handler
 from .handlers.metrics import metrics as metrics_handler
+from .handlers.ops import (
+    ops_api_health,
+    ops_modbus,
+    ops_solve,
+    ops_state,
+)
 from .handlers.plan import plan_current
 from .handlers.snapshots import snapshots
 from .handlers.tables import table_rows
@@ -46,6 +52,7 @@ _PUBLIC_PATHS = (
     "/dashboard",
     "/dashboard/static/dashboard.css",
     "/dashboard/static/dashboard.js",
+    "/dashboard/static/ops.js",
 )
 
 
@@ -72,9 +79,7 @@ class APIServer:
         # at startup rather than quietly shipping an open API.
         token = load_token(self._config.bearer_token_env)
 
-        app = web.Application(
-            middlewares=[make_auth_middleware(token, _PUBLIC_PATHS)]
-        )
+        app = web.Application(middlewares=[make_auth_middleware(token, _PUBLIC_PATHS)])
         app[SERVICE_PROBE_KEY] = self._probe
         app[API_CONFIG_KEY] = self._config
 
@@ -90,6 +95,13 @@ class APIServer:
         app.router.add_get("/plan/current", plan_current)
         app.router.add_get("/snapshots", snapshots)
         app.router.add_get("/daily_spend", daily_spend)
+        # Ops dashboard endpoints (concrete paths — registered before
+        # the /{table} catch-all). All cache 30 s in-memory and read
+        # NDJSON event-log + tick-snapshot globs.
+        app.router.add_get("/ops/solve", ops_solve)
+        app.router.add_get("/ops/api_health", ops_api_health)
+        app.router.add_get("/ops/modbus", ops_modbus)
+        app.router.add_get("/ops/state", ops_state)
         # Dashboard: HTML page + whitelisted static assets (public) +
         # config bundle (authed). All registered before the /{table}
         # catch-all so the path matcher routes them correctly.
@@ -101,13 +113,9 @@ class APIServer:
 
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
-        self._site = web.TCPSite(
-            self._runner, host=self._config.host, port=self._config.port
-        )
+        self._site = web.TCPSite(self._runner, host=self._config.host, port=self._config.port)
         await self._site.start()
-        logger.info(
-            "API server listening on %s:%d", self._config.host, self._config.port
-        )
+        logger.info("API server listening on %s:%d", self._config.host, self._config.port)
 
     async def stop(self) -> None:
         if self._site is not None:

@@ -41,6 +41,7 @@ _STATIC_DIR = _resolve_static_dir()
 _STATIC_FILES: dict[str, str] = {
     "dashboard.css": "text/css",
     "dashboard.js": "application/javascript",
+    "ops.js": "application/javascript",
 }
 
 
