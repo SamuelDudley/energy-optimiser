@@ -9,3 +9,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
+
+# Local agent state — Claude Code per-host artefacts that aren't
+# part of the project source.
+.claude/.examples/
+.claude/scheduled_tasks.lock
+.claude/settings.json
+.claude/settings.local.json
+.mcp.json
