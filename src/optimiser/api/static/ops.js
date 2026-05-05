@@ -48,7 +48,9 @@
   // so the two tabs feel like one product. Anything that diverges here
   // will read as "this is a different page" on the user's eye.
   const PANEL_BG = "#161b22";
-  const PLOT_BG = "#0e1116";
+  // Plot area shares the panel background — the chart sits flush with
+  // the card rather than appearing as a darker rectangle inside it.
+  const PLOT_BG = PANEL_BG;
   const GRID_COLOR = "#21262d";
   const TICK_COLOR = "#444c56";
   const TICK_FONT_COLOR = "#c9d1d9";

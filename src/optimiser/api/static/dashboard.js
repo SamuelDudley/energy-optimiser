@@ -474,18 +474,24 @@ function decisionFor(slot) {
 // Realised category from a telemetry row's planner_action. The string
 // values come straight from BatteryAction enum names, so we match those.
 function modeFromTelemetry(row) {
-  // Disambiguate mode 2 self-consume vs PV-charge using planner_action.
-  const m = row && row.ems_mode;
-  if (m == null) return MODE.UNKNOWN;
-  if (m === 2) {
-    const a = (row.planner_action || "").toLowerCase();
-    if (a === "charge_pv") return MODE.M2_CHARGE;
-    return MODE.M2_IDLE;
-  }
+  // Source of truth is `planner_action` — that's the commanded dispatch
+  // mode the LP picked for this tick. `ems_mode` in telemetry is the
+  // inverter's run-state register (e.g. 7 = "discharging"), not the work
+  // mode we wrote, so it can't be decoded with the same table as the LP
+  // dispatch. Fall back to ems_mode only when planner_action is absent.
+  if (!row) return MODE.UNKNOWN;
+  const a = (row.planner_action || "").toLowerCase();
+  if (a === "charge_grid")   return MODE.M3_CHARGE;
+  if (a === "charge_pv")     return MODE.M2_CHARGE;
+  if (a === "discharge_ess") return MODE.M6_DIS_ESS;
+  if (a === "discharge_pv")  return MODE.M5_DIS_PV;
+  if (a === "self_consume" || a === "standby") return MODE.M2_IDLE;
+  const m = row.ems_mode;
+  if (m === 0) return MODE.M0_STANDBY;
+  if (m === 2) return MODE.M2_IDLE;
   if (m === 3) return MODE.M3_CHARGE;
   if (m === 5) return MODE.M5_DIS_PV;
   if (m === 6) return MODE.M6_DIS_ESS;
-  if (m === 0) return MODE.M0_STANDBY;
   return MODE.UNKNOWN;
 }
 
@@ -593,6 +599,32 @@ function flowsFromSlot(slot) {
 function nowFromSnapshot() {
   if (!state.snapshot) return null;
   return new Date(state.snapshot.timestamp);
+}
+
+// Live import/export price covering "now". Pulls from the same merged
+// 5-min/30-min array the price chart uses, so the panel-label readout
+// always agrees with the leftmost forecast point. Returns c/kWh; null
+// when there's no snapshot or no row covers now.
+function currentLivePrices() {
+  const now = nowFromSnapshot();
+  if (!now) return null;
+  const past = state.history?.priceForecast || [];
+  const fut = state.snapshot?.price_forecast || [];
+  const merged = mergePriceForecasts(past, fut);
+  if (!merged.length) return null;
+  const tNow = +now;
+  let row = null;
+  for (const p of merged) {
+    const t = +new Date(p.start);
+    if (!Number.isFinite(t)) continue;
+    if (t <= tNow) row = p;
+    else break;
+  }
+  if (!row) return null;
+  return {
+    importCpkwh: coalesce(row.forecast_predicted, row.import_per_kwh),
+    exportCpkwh: coalesce(row.export_forecast_predicted, row.export_per_kwh),
+  };
 }
 
 function effectiveCursor() {
@@ -1566,13 +1598,21 @@ function buildLayout() {
   // Per-panel labels rendered horizontally at the top-left of each
   // domain (above the y-axis tick numbers). Replaces the rotated
   // y-axis titles that were small and hard to scan.
+  const livePrices = currentLivePrices();
   const annotations = [];
   for (const p of PANEL_LAYOUT) {
     const label = p.label;
     if (!label) continue;
-    const text = p.units
+    let text = p.units
       ? `<b>${label}</b>  <span style="color:#7d8590">${p.units}</span>`
       : `<b>${label}</b>`;
+    if (p.id === "prices" && livePrices) {
+      const fmt = (v) => (v == null ? "—" : v.toFixed(1));
+      text +=
+        `  <span style="color:#7d8590">·</span>  ` +
+        `<span style="color:#f0883e">imp ${fmt(livePrices.importCpkwh)}</span>` +
+        `  <span style="color:#56d364">exp ${fmt(livePrices.exportCpkwh)}</span>`;
+    }
     annotations.push({
       xref: "paper",
       yref: `${p.axis} domain`,
@@ -1591,10 +1631,10 @@ function buildLayout() {
   const narrow = isNarrowViewport();
   return {
     margin: narrow
-      ? { l: 28, r: 6,  t: 14, b: 36 }
-      : { l: 44, r: 20, t: 18, b: 44 },
+      ? { l: 28, r: 6,  t: 22, b: 36 }
+      : { l: 44, r: 20, t: 26, b: 44 },
     paper_bgcolor: "#161b22",
-    plot_bgcolor: "#0e1116",
+    plot_bgcolor: "#161b22",
     font: { color: "#e8edf2", family: FONT_FAMILY, size: 12 },
     showlegend: false,
     hovermode: "x unified",
@@ -2005,10 +2045,10 @@ async function redrawDailySpend() {
   const narrow = isNarrowViewport();
   const layout = {
     margin: narrow
-      ? { l: 32, r: 4,  t: 14, b: 32 }
-      : { l: 50, r: 16, t: 18, b: 40 },
+      ? { l: 32, r: 4,  t: 22, b: 32 }
+      : { l: 50, r: 16, t: 26, b: 40 },
     paper_bgcolor: "#161b22",
-    plot_bgcolor: "#0e1116",
+    plot_bgcolor: "#161b22",
     font: { color: "#e8edf2", family: FONT_FAMILY, size: 12 },
     // Categorical x-axis — "zoom" is the desktop default; on narrow we
     // disable drag so vertical touch-scroll keeps the page moving.
