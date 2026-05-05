@@ -298,8 +298,8 @@ main {
     align-items: center;
     padding: 6px 10px;
   }
-  header.strip > :has(> #status-state) { grid-column: 1; grid-row: 1; }
-  header.strip > :has(> #status-soc)   { grid-column: 2; grid-row: 1; }
+  header.strip > :has(> #status-state) { grid-column: 1; grid-row: 1; padding-left: 10px; }
+  header.strip > :has(> #status-soc)   { grid-column: 2; grid-row: 1; padding-left: 10px; }
   header.strip > #tile-mode            { grid-column: 3 / span 2; grid-row: 1; }
   header.strip > .tile-row             { grid-column: 1 / -1;     grid-row: 2; }
   header.strip > .status-block.right.pinned { grid-column: 1 / -1; grid-row: 3; }
