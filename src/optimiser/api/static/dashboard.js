@@ -57,6 +57,40 @@ const DECISION_LABELS = {
   [DECISION.UNKNOWN]:     "—",
 };
 
+// Inverter EMS mode → ribbon category. Past from telemetry.ems_mode,
+// future inferred from the slot's signed battery_kw + grid-share. Modes
+// 2 (self-consume) and 2-charge (PV-dominant charge with adaptive trim
+// on 40032) write the same register but represent different intents —
+// disambiguated using planner_action (past) or grid_to_battery (future).
+// Indices kept dense (0..N-1) for the heatmap colorscale.
+const MODE = {
+  M2_IDLE:    0,  // 2 + self-consume
+  M2_CHARGE:  1,  // 2 + PV-dominant charge (adaptive trim)
+  M3_CHARGE:  2,  // 3 — grid-first charge
+  M5_DIS_PV:  3,  // 5 — discharge with PV producing
+  M6_DIS_ESS: 4,  // 6 — pure ESS discharge
+  M0_STANDBY: 5,  // 0 — standby / fallback target
+  UNKNOWN:    6,
+};
+const MODE_COLORS = {
+  [MODE.M2_IDLE]:    "#3a3f47", // muted slate — passive
+  [MODE.M2_CHARGE]:  "#3fb950", // green — soak free PV
+  [MODE.M3_CHARGE]:  "#d29922", // amber — pay to fill
+  [MODE.M5_DIS_PV]:  "#bc8cff", // purple — earn (PV present)
+  [MODE.M6_DIS_ESS]: "#8957e5", // deeper purple — earn (no PV)
+  [MODE.M0_STANDBY]: "#6e7681", // gray — held
+  [MODE.UNKNOWN]:    "#21262d", // near-bg
+};
+const MODE_LABELS = {
+  [MODE.M2_IDLE]:    "mode 2 · self-consume",
+  [MODE.M2_CHARGE]:  "mode 2 · PV charge",
+  [MODE.M3_CHARGE]:  "mode 3 · grid charge",
+  [MODE.M5_DIS_PV]:  "mode 5 · discharge (PV)",
+  [MODE.M6_DIS_ESS]: "mode 6 · discharge (ESS)",
+  [MODE.M0_STANDBY]: "mode 0 · standby",
+  [MODE.UNKNOWN]:    "—",
+};
+
 // Sankey nodes. Index order matters — referenced by source/target.
 // Labels are made distinct (Plotly groups same-labelled nodes oddly in
 // some layouts, and "Battery" appears as both a source and a sink).
@@ -123,7 +157,8 @@ const NOTABLE_EVENT_PREFIXES = [
 // shown next to the label.
 const PANEL_LAYOUT = [
   { id: "prices",   axis: "y",  height: 0.22, label: "PRICE",   units: "c/kWh" },
-  { id: "ribbon",   axis: "y2", height: 0.04, label: "DECISION" },
+  { id: "ribbon",   axis: "y2", height: 0.035, label: "DECISION" },
+  { id: "mode",     axis: "y9", height: 0.035, label: "MODE" },
   { id: "solar",    axis: "y3", height: 0.18, label: "PV",      units: "kW" },
   { id: "soc",      axis: "y4", height: 0.16, label: "SOC",     units: "%" },
   { id: "load",     axis: "y7", height: 0.14, label: "LOAD",    units: "kW" },
@@ -256,6 +291,17 @@ function toPlotlyTime(d) {
 }
 function toPlotlyTimeArr(arr) {
   return arr.map(toPlotlyTime);
+}
+
+// NEM date (UTC+10, never DST) for a given instant. Used to align the
+// daily-spend cursor: spend bars are bucketed by nem_date in the API, so
+// the time-series cursor maps to a spend bar by adding 10h and taking
+// the YYYY-MM-DD prefix of the resulting UTC clock time.
+function toNemDate(d) {
+  if (d == null) return null;
+  const t = d instanceof Date ? +d : +new Date(d);
+  if (!Number.isFinite(t)) return null;
+  return new Date(t + 10 * 3_600_000).toISOString().slice(0, 10);
 }
 function showError(msg) {
   const bar = document.getElementById("error-bar");
@@ -421,6 +467,41 @@ function decisionFor(slot) {
 
 // Realised category from a telemetry row's planner_action. The string
 // values come straight from BatteryAction enum names, so we match those.
+function modeFromTelemetry(row) {
+  // Disambiguate mode 2 self-consume vs PV-charge using planner_action.
+  const m = row && row.ems_mode;
+  if (m == null) return MODE.UNKNOWN;
+  if (m === 2) {
+    const a = (row.planner_action || "").toLowerCase();
+    if (a === "charge_pv") return MODE.M2_CHARGE;
+    return MODE.M2_IDLE;
+  }
+  if (m === 3) return MODE.M3_CHARGE;
+  if (m === 5) return MODE.M5_DIS_PV;
+  if (m === 6) return MODE.M6_DIS_ESS;
+  if (m === 0) return MODE.M0_STANDBY;
+  return MODE.UNKNOWN;
+}
+
+function modeFromSlot(slot) {
+  // Mirror dispatch_from_slot's mode pick (lp/dispatch.py). Future PV is
+  // unknown — for discharge, assume mode 6 if planned PV is below the
+  // threshold the dispatcher uses (~0.2 kW), else mode 5.
+  if (!slot) return MODE.UNKNOWN;
+  const b = slot.battery_kw;
+  if (b == null || !Number.isFinite(b)) return MODE.UNKNOWN;
+  if (Math.abs(b) < DEADBAND_KW) return MODE.M2_IDLE;
+  if (b > 0) {
+    const g = slot.grid_to_battery_kw ?? 0;
+    const p = slot.pv_to_battery_kw ?? Math.max(0, b - g);
+    if (g > p + MODE_SWITCH_HYSTERESIS_KW) return MODE.M3_CHARGE;
+    return MODE.M2_CHARGE;
+  }
+  // Discharge — mode 5 if PV producing, else mode 6.
+  const pv = slot.pv_kw ?? slot.pv_to_house_kw ?? 0;
+  return pv > 0.2 ? MODE.M5_DIS_PV : MODE.M6_DIS_ESS;
+}
+
 function decisionFromTelemetry(row) {
   const a = row.planner_action;
   if (!a) return DECISION.UNKNOWN;
@@ -526,6 +607,7 @@ function setCursor(time, { pinned } = {}) {
   renderCursorReadout();
   redrawSankey();
   redrawCursorLine();
+  redrawSpendCursor();
 }
 
 function snapToNow() {
@@ -536,6 +618,7 @@ function snapToNow() {
   renderCursorReadout();
   redrawSankey();
   redrawCursorLine();
+  redrawSpendCursor();
 }
 
 function nearestSlotAt(time) {
@@ -839,6 +922,14 @@ function buildTraces() {
   const ribbonX = [...pastTs, ...slotTs];
   const ribbonZRow = [...ribbonZPast, ...ribbonZ];
 
+  // ── Mode ribbon (heatmap) ──
+  // Same x as the decision ribbon but a finer-grained categorisation
+  // along the physical-mode axis: distinguishes mode 2 idle from mode 2
+  // PV-charge, and mode 5 (PV-present) from mode 6 (no PV).
+  const modeZPast = hist.map((r) => modeFromTelemetry(r));
+  const modeZFut  = fwd.map((s) => modeFromSlot(s));
+  const modeZRow  = [...modeZPast, ...modeZFut];
+
   const traces = [];
 
   // Prices (yaxis y) — bands drawn first (behind), then the predicted /
@@ -927,21 +1018,63 @@ function buildTraces() {
     zmin: dMin, zmax: dMax,
   });
 
+  // Mode ribbon (yaxis y9) — same heatmap technique with the mode-code
+  // categories. Independent colorscale so the colour vocabulary doesn't
+  // leak from one ribbon to the other.
+  const modeVals = Object.values(MODE);
+  const mMin = 0, mMax = modeVals.length - 1;
+  const modeColorscale = [];
+  for (let i = 0; i < modeVals.length; i++) {
+    const lo = i / modeVals.length;
+    const hi = (i + 1) / modeVals.length;
+    const c = MODE_COLORS[modeVals[i]];
+    modeColorscale.push([lo, c]);
+    modeColorscale.push([hi, c]);
+  }
+  traces.push({
+    x: ribbonX,
+    y: [0, 1],
+    z: [modeZRow],
+    type: "heatmap",
+    colorscale: modeColorscale,
+    showscale: false,
+    hoverinfo: "text",
+    text: [modeZRow.map((v, i) => `${fmtTime(ribbonX[i])} — ${MODE_LABELS[v] ?? "—"}`)],
+    yaxis: "y9",
+    name: "mode",
+    zmin: mMin, zmax: mMax,
+  });
+
   // Solar (yaxis y3).
-  if (pvP10.some((v) => v != null) && pvP90.some((v) => v != null)) {
+  // P10–P90 confidence band: rendered as `fill: "toself"` polygons so a
+  // partial-null run on either bound (e.g. P10 missing, P90 present)
+  // doesn't kill the whole band — same technique as the price bands.
+  // Each contiguous run becomes one closed polygon: forward along P10,
+  // back along P90.
+  for (const poly of bandPolygons(pvFCMerged, "pv_estimate10_kw", "pv_estimate90_kw")) {
     traces.push({
-      x: pvTsFut, y: pvP10, type: "scatter", mode: "lines",
-      line: { width: 0 }, hoverinfo: "skip",
-      showlegend: false, yaxis: "y3", name: "pv-p10",
-    });
-    traces.push({
-      x: pvTsFut, y: pvP90, type: "scatter", mode: "lines",
-      line: { width: 0 }, fill: "tonexty",
-      fillcolor: "rgba(242,204,96,0.18)",
+      x: poly.x, y: poly.y,
+      type: "scatter", mode: "lines",
+      line: { width: 0, color: "rgba(0,0,0,0)" }, fill: "toself",
+      fillcolor: "rgba(242,204,96,0.22)",
       hoverinfo: "skip", showlegend: false,
       yaxis: "y3", name: "PV P10–P90",
     });
   }
+  // Faint dashed bound lines so the band edges are visible even on a
+  // light fill. Half-width of the P50 line.
+  traces.push({
+    x: pvTsFut, y: pvP10, type: "scatter", mode: "lines",
+    line: { color: "rgba(242,204,96,0.45)", width: 0.8, dash: "dot" },
+    hoverinfo: "skip", showlegend: false,
+    yaxis: "y3", name: "PV P10", connectgaps: false,
+  });
+  traces.push({
+    x: pvTsFut, y: pvP90, type: "scatter", mode: "lines",
+    line: { color: "rgba(242,204,96,0.45)", width: 0.8, dash: "dot" },
+    hoverinfo: "skip", showlegend: false,
+    yaxis: "y3", name: "PV P90", connectgaps: false,
+  });
   traces.push({
     x: pvTsFut, y: pvP50, type: "scatter", mode: "lines",
     line: { color: "#f2cc60", width: 1.6, dash: "dot" },
@@ -1392,6 +1525,7 @@ function buildLayout() {
     yaxis6: axis(domains.cost),
     yaxis7: axis(domains.load),
     yaxis8: axis(domains.managed),
+    yaxis9: axis(domains.mode, { showticklabels: false, showgrid: false, fixedrange: true, range: [0, 1] }),
   };
 }
 
@@ -1788,6 +1922,7 @@ async function redrawDailySpend() {
     },
     hovermode: "x unified",
     hoverlabel: HOVER_LABEL,
+    shapes: spendCursorShapes(dates),
     xaxis: {
       type: "category",
       gridcolor: "#21262d",
@@ -1815,6 +1950,37 @@ async function redrawDailySpend() {
   } else {
     await Plotly.react(div, traces, layout);
   }
+}
+
+// Translucent overlay highlighting the spend bar that matches the
+// time-series cursor's NEM date. `dates` is the list of category
+// labels (YYYY-MM-DD) currently on the x-axis; the shape is anchored
+// at the matching category, padded ±0.45 either side so it covers the
+// bar group without bleeding into neighbours.
+function spendCursorShapes(dates) {
+  const cursorT = effectiveCursor();
+  if (!cursorT || !dates || !dates.length) return [];
+  const target = toNemDate(cursorT);
+  const idx = dates.indexOf(target);
+  if (idx < 0) return [];
+  return [{
+    type: "rect", xref: "x", yref: "paper",
+    x0: idx - 0.45, x1: idx + 0.45, y0: 0, y1: 1,
+    fillcolor: "rgba(88,166,255,0.12)",
+    line: { color: "#58a6ff", width: 1 },
+    layer: "above",
+  }];
+}
+
+// Cheap cursor-only relayout — called from setCursor. Avoids rebuilding
+// traces (a full redraw of dailySpend is dozens of bars + a line).
+function redrawSpendCursor() {
+  if (!state.built.spend) return;
+  const div = document.getElementById("spend-figure");
+  const rows = state.history.dailySpend || [];
+  const asc = [...rows].sort((a, b) => a.nem_date.localeCompare(b.nem_date));
+  const dates = asc.map((r) => r.nem_date);
+  Plotly.relayout(div, { shapes: spendCursorShapes(dates) });
 }
 
 // ── Polling + auto-refresh ─────────────────────────────────────────
