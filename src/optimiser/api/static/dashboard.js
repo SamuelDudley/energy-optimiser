@@ -584,7 +584,11 @@ function renderStatusStrip() {
   stateEl.className = `status-value ${STATE_CLASS[badgeKey] || "status-state-unknown"}`;
 
   const tickAgeS = (Date.now() - new Date(snap.timestamp).getTime()) / 1000;
-  tickAgeEl.textContent = `tick ${tickAgeS.toFixed(0)}s ago · v${snap.version}`;
+  // Two spans so mobile CSS can hide "· v0.2.0" without dropping the
+  // freshness indicator. Desktop keeps the full text.
+  tickAgeEl.innerHTML =
+    `<span class="tick-age">${tickAgeS.toFixed(0)}s</span>` +
+    `<span class="tick-version"> · v${escapeHtml(snap.version)}</span>`;
 
   // SOC + SOH from system_state (post-dispatch preferred).
   const ss = snap.system_state_post_dispatch || snap.system_state;
@@ -629,7 +633,13 @@ function setTile(id, value) {
   const tile = document.getElementById(`tile-${id}`);
   if (!tile) return;
   const v = tile.querySelector(".tile-value");
-  v.textContent = fmtKW(value);
+  // Wrap the unit in a span so mobile CSS can hide " kW" without
+  // touching the number — keeps tabular alignment under tight tiles.
+  if (value == null || !Number.isFinite(value)) {
+    v.textContent = "—";
+  } else {
+    v.innerHTML = `${value.toFixed(2)}<span class="tile-unit"> kW</span>`;
+  }
 }
 
 function renderCursorReadout() {
@@ -637,6 +647,10 @@ function renderCursorReadout() {
   document.getElementById("cursor-time").textContent = fmtTime(t);
   document.getElementById("cursor-mode").textContent = state.cursor.pinned ? "pinned" : "live";
   document.getElementById("cursor-now-btn").disabled = !state.cursor.pinned;
+  // Toggle .pinned on the cursor block so mobile CSS can show it only
+  // when scrubbing — in live mode it's redundant with the tab-bar chip.
+  const block = document.getElementById("cursor-now-btn").closest(".status-block");
+  if (block) block.classList.toggle("pinned", !!state.cursor.pinned);
 }
 
 // ── Loads + events ────────────────────────────────────────────────
@@ -2040,11 +2054,17 @@ function syncRangeInputs() {
 function updateRangeIndicator() {
   const ind = document.getElementById("range-mode");
   if (!ind) return;
+  // Two spans so mobile CSS can hide the verbose tail and keep just the
+  // short tag inline next to Apply.
   if (state.range) {
-    ind.textContent = `historical · ${fmtRangeShort(state.range)}`;
+    ind.innerHTML =
+      `<span class="mode-tag">historical</span>` +
+      `<span class="mode-detail"> · ${escapeHtml(fmtRangeShort(state.range))}</span>`;
     ind.className = "mode-indicator historical";
   } else {
-    ind.textContent = "live · last 24h + 48h forecast";
+    ind.innerHTML =
+      `<span class="mode-tag">live</span>` +
+      `<span class="mode-detail"> · last 24h + 48h forecast</span>`;
     ind.className = "mode-indicator live";
   }
   // Reflect the active preset on the buttons. `state.activePreset` is

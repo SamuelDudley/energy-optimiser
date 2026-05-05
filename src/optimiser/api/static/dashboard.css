@@ -138,13 +138,14 @@ header.strip {
 }
 .range-bar button.primary:hover { filter: brightness(1.1); }
 .range-bar .preset-row { display: flex; gap: 6px; flex-wrap: wrap; }
-.range-bar .mode-indicator {
-  margin-left: auto;
+/* Mode chip lives in the tab bar (consolidating the bottom strips into one);
+   selector is container-agnostic so it works in either bar. */
+.mode-indicator {
   color: var(--muted);
   font-size: 12px;
 }
-.range-bar .mode-indicator.live { color: var(--good); }
-.range-bar .mode-indicator.historical { color: var(--accent); }
+.mode-indicator.live { color: var(--good); }
+.mode-indicator.historical { color: var(--accent); }
 
 main {
   display: grid;
@@ -272,55 +273,161 @@ main {
 
   html, body { font-size: 13px; }
 
+  /* Compact 2-line status strip — typographic, no card chrome.
+       Row 1: SVC · SOC · DISP · cursor (right-aligned)
+       Row 2: PV · BAT · GRID · HOUSE  (each labelled, colour stripe)
+     ~270px → ~64px at 390px viewport. */
   header.strip {
-    padding: 10px 12px;
-    gap: 10px 16px;
+    padding: 6px 10px;
+    gap: 4px 12px;
   }
-  .status-value { font-size: 16px; }
-  .status-block.right {
-    margin-left: 0;
-    text-align: left;
-    width: 100%;
+  /* Each block lays out as: tiny uppercase label · bold value · sub.
+     Dropping vertical stacking returns ~30px per block. */
+  .status-block {
     display: flex;
-    align-items: center;
-    gap: 12px;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 5px;
+    line-height: 1.2;
   }
-  .status-block.right .status-label,
-  .status-block.right .status-value,
-  .status-block.right .status-sub { margin: 0; }
-  .status-block.right #cursor-now-btn { margin-top: 0; }
+  .status-label {
+    font-size: 10px;
+    color: var(--muted);
+    /* keep the existing tracking from the desktop rule */
+  }
+  /* Drop SERVICE + DISPATCH labels — green ACTIVE pill is self-evident,
+     "self_consume · m2" is unique enough not to need a "DISPATCH" prefix.
+     SOC label kept (a bare 98.5% could be SOC or SOH at a glance). */
+  #status-strip > .status-block:first-child .status-label,
+  #status-strip > .status-block:nth-child(3) .status-label { display: none; }
+  .status-value {
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+  }
+  .status-sub { font-size: 11px; margin-top: 0; color: var(--muted); }
+  /* SOH and dispatch-detail are diagnostic-only; drop on mobile to
+     keep row 1 single-line. The values are still in the snapshot for
+     anyone who needs them. */
+  #status-soh,
+  #status-dispatch-detail { display: none; }
+  /* Drop the "· v0.2.0" suffix on mobile — version isn't scannable info
+     on a phone, and "24s" alone tells you the service is alive. */
+  #status-tick-age .tick-version { display: none; }
 
+  /* Cursor block hidden on mobile by default — in live mode it shows
+     the current wall-clock time (which the OS already shows in the
+     status bar) plus a "LIVE" chip duplicated by the tab-bar mode
+     indicator. JS adds `.pinned` when the user scrubs to a historical
+     timestamp, at which point we surface it inline at the end of row 1. */
+  .status-block.right { display: none; }
+  .status-block.right.pinned {
+    display: flex;
+    margin-left: auto;
+    width: auto;
+    text-align: left;
+    align-items: center;
+    order: 1;
+    flex-direction: row;
+    gap: 5px;
+  }
+  .tile-row { order: 2; }
+  .status-block.right .status-label { display: none; }
+  .status-block.right .status-value { font-size: 13px; }
+  .status-block.right .status-sub {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  /* Snap-to-now becomes an icon-only button on mobile — only visible
+     in pinned mode (its parent block is hidden in live mode). */
+  .status-block.right #cursor-now-btn {
+    margin-top: 0;
+    padding: 1px 5px;
+    font-size: 0;
+    line-height: 1.4;
+  }
+  .status-block.right #cursor-now-btn::before {
+    content: "↺";
+    font-size: 12px;
+  }
+
+  /* Tile row drops the card chrome on mobile and renders as an inline
+     list. Colour stripe (3px left border) replaces the uppercase label
+     as the source cue, but the label is back too — colour + text. */
   .tile-row {
     width: 100%;
+    flex-wrap: nowrap;
     justify-content: space-between;
-    gap: 6px;
+    gap: 0;
+    align-items: baseline;
   }
   .tile {
-    flex: 1 1 calc(50% - 6px);
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    flex: 1 1 0;
     min-width: 0;
-    padding: 6px 8px;
+    padding: 2px 0 2px 7px;
+    background: transparent;
+    border: none;
+    border-left: 3px solid var(--border);
+    border-radius: 0;
   }
-  .tile-value { font-size: 15px; }
+  .tile-label {
+    font-size: 10px;
+    color: var(--muted);
+    /* tracking inherited from the desktop rule */
+  }
+  .tile-value {
+    font-size: 13px;
+    margin-top: 0;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Hide " kW" suffix on mobile — tile labels (PV/BAT/GRID/HOUSE)
+     already imply the unit and dropping it lets values fit at 13px. */
+  .tile-unit { display: none; }
+  #tile-pv   { border-left-color: var(--pv); }
+  #tile-batt { border-left-color: var(--batt); }
+  #tile-grid { border-left-color: var(--import); }
+  #tile-load { border-left-color: var(--load); }
 
+  /* Range bar: presets row + dates row. Mode chip moved to the tab bar
+     so this stays at exactly two rows. */
+  /* Drop sticky on the range bar — both .range-bar and header.strip
+     have `top: 0`, so as you scrolled the range-bar's lower edge
+     (taller than the strip) bled out below the sticky strip. On mobile
+     only the compact 58px strip stays pinned; the range bar scrolls
+     away with the page. */
   .range-bar {
-    padding: 8px 12px;
+    padding: 6px 10px;
     gap: 6px 8px;
+    position: static;
   }
-  /* Drop the uppercase "View"/"From"/"To" labels — position implies
-     them and saves the row each label was forcing onto its own line. */
   .range-bar .range-label { display: none; }
-  /* Date inputs share a single row: each flex-1 with a sensible min so
-     the native picker stays tappable. Apply flows on the same row. */
   .range-bar input[type="date"] {
     flex: 1 1 0;
     min-width: 110px;
   }
   .range-bar .preset-row { width: 100%; justify-content: space-between; }
   .range-bar .preset-row button { flex: 1 1 0; }
-  .range-bar .mode-indicator {
-    margin-left: 0;
-    width: 100%;
+
+  /* Tab bar carries the mode chip on its right end — consolidates the
+     two thin strips that used to live below the range bar into one. */
+  .tab-bar {
+    padding: 4px 10px;
+    gap: 6px;
+    align-items: center;
   }
+  .tab-bar .tab-btn { padding: 4px 12px; font-size: 12px; }
+  .tab-bar .mode-indicator {
+    margin-left: auto;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .tab-bar .mode-indicator .mode-detail { display: none; }
 
   main {
     grid-template-columns: 1fr;
@@ -357,14 +464,16 @@ main {
   .tile-value { font-size: 14px; }
 }
 
-/* ── Tab bar (Energy / Ops) ──────────────────────────────────── */
+/* ── Tab bar (Energy / Ops + mode chip) ───────────────────────── */
 .tab-bar {
   display: flex;
+  align-items: center;
   gap: 8px;
   padding: 8px 12px;
   background: var(--bg-elev);
   border-bottom: 1px solid var(--border);
 }
+.tab-bar .mode-indicator { margin-left: auto; }
 .tab-btn {
   background: transparent;
   color: var(--muted);
