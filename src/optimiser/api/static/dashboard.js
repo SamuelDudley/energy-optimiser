@@ -161,8 +161,7 @@ const PANEL_LAYOUT = [
   { id: "mode",     axis: "y9", height: 0.035, label: "MODE" },
   { id: "solar",    axis: "y3", height: 0.18, label: "PV",      units: "kW" },
   { id: "soc",      axis: "y4", height: 0.16, label: "SOC",     units: "%" },
-  { id: "load",     axis: "y7", height: 0.14, label: "LOAD",    units: "kW" },
-  { id: "managed",  axis: "y8", height: 0.12, label: "MANAGED", units: "kW" },
+  { id: "load",     axis: "y7", height: 0.22, label: "LOAD",    units: "kW" },
   { id: "grid",     axis: "y5", height: 0.14, label: "GRID",    units: "kW" },
   { id: "cost",     axis: "y6", height: 0.16, label: "COST",    units: "c/h" },
 ];
@@ -176,6 +175,13 @@ function colorForLoadId(loadId) {
   let h = 0;
   for (let i = 0; i < loadId.length; i++) h = (h * 31 + loadId.charCodeAt(i)) | 0;
   return LOAD_PALETTE[Math.abs(h) % LOAD_PALETTE.length];
+}
+function hexToRgba(hex, alpha) {
+  const h = hex.replace(/^#/, "");
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 const PANEL_GAP = 0.02;
 
@@ -1110,52 +1116,84 @@ function buildTraces() {
     yaxis: "y4", name: "SOC planned",
   });
 
-  // House load (yaxis y7). Measured = telemetry house_load_kw (total
-  // metered consumption, includes managed loads). Planned = reconstructed
-  // from slot-decision energy balance — see loadFut above.
-  traces.push({
-    x: pastTs, y: loadPast,
-    type: "scatter", mode: "lines",
-    line: { color: "#ff9e64", width: 1.6 },
-    yaxis: "y7", name: "load measured", connectgaps: false,
-  });
-  traces.push({
-    x: slotTs, y: loadFut,
-    type: "scatter", mode: "lines",
-    line: { color: "#ff9e64", width: 1.4, dash: "dot" },
-    yaxis: "y7", name: "load planned",
-  });
-
-  // Managed loads (yaxis y8). One measured trace per load_id from
-  // load_telemetry, plus a planned trace per load_id from the LP's
-  // forward_trajectory[*].load_kw[loadId]. Filters out OBSERVABLE-category
-  // entries (e.g. the grid CT) which are measurement-only and belong on
-  // the GRID panel, not here.
+  // Load panel (yaxis y7). Single panel that stacks per-managed-load
+  // contribution beneath the total-load envelope:
+  //
+  //   past   — measured per-load (load_telemetry.power_kw) stacked, with
+  //            the realised total (telemetry.house_load_kw) drawn on top
+  //            as a solid envelope. Implicit gap above the stack reads
+  //            as unmanaged baseload.
+  //   future — LP-committed per-load (fwd[].load_kw[id]) stacked solid,
+  //            against a dotted total = LP's expected load. Solid stack
+  //            beneath dotted ceiling reads as "committed vs forecast"
+  //            without a legend.
+  //
+  // OBSERVABLE-category load_ids (e.g. the grid CT) are measurement-only
+  // and belong on the GRID panel, not here — filtered out.
+  //
+  // Total envelope is clamped up to sum-managed at each point: the inverter
+  // and Shelly instrumentation occasionally drift, and we never want the
+  // stack to poke through the line.
   const loadRows = state.history.loadTelemetry || [];
-  const byLoad = new Map();
   const observableIds = new Set();
   for (const r of loadRows) {
     if ((r.category || "").toLowerCase() === "observable") {
       observableIds.add(r.load_id);
-      continue;
     }
-    if (!byLoad.has(r.load_id)) byLoad.set(r.load_id, []);
-    byLoad.get(r.load_id).push(r);
   }
-  for (const [loadId, rows] of byLoad) {
-    rows.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+
+  // Past pivot keyed by ms-since-epoch (robust to ISO formatting drift
+  // across the two source tables).
+  const pastByTs = new Map();
+  const pastLoadIds = new Set();
+  for (const r of loadRows) {
+    if (observableIds.has(r.load_id)) continue;
+    pastLoadIds.add(r.load_id);
+    const k = +new Date(r.ts);
+    if (!pastByTs.has(k)) pastByTs.set(k, {});
+    pastByTs.get(k)[r.load_id] = r.power_kw;
+  }
+  const sortedPastIds = [...pastLoadIds].sort();
+  const pastKeyAt = hist.map((r) => +new Date(r.ts));
+
+  // Past stacked managed traces. shape: "hv" so each managed renders as
+  // step blocks consistent with relay on/off semantics.
+  for (const loadId of sortedPastIds) {
+    const y = pastKeyAt.map((k) => {
+      const row = pastByTs.get(k);
+      const v = row ? row[loadId] : undefined;
+      return v != null && Number.isFinite(v) ? v : 0;
+    });
+    const c = colorForLoadId(loadId);
     traces.push({
-      x: rows.map((r) => toPlotlyTime(r.ts)),
-      y: rows.map((r) => r.power_kw),
+      x: pastTs, y,
       type: "scatter", mode: "lines",
-      line: { color: colorForLoadId(loadId), width: 1.4, shape: "hv" },
-      yaxis: "y8", name: `${loadId} measured`, connectgaps: false,
+      stackgroup: "load-past",
+      line: { color: c, width: 1, shape: "hv" },
+      fillcolor: hexToRgba(c, 0.5),
+      yaxis: "y7", name: `${loadId} measured`,
     });
   }
-  // Planned: union of load_ids the LP wrote across all forward slots. The
-  // shape is hv (step) so a sequence of zeros / draw_kw renders as a
-  // visible "ON during these slots" rectangle aligned with the LP's
-  // commitment. Skip OBSERVABLE ids (the LP doesn't drive them).
+  // Past total envelope, clamped to ≥ sum-managed.
+  const loadPastClamped = loadPast.map((m, i) => {
+    const k = pastKeyAt[i];
+    const row = pastByTs.get(k) || {};
+    let sumManaged = 0;
+    for (const id of sortedPastIds) {
+      const v = row[id];
+      if (v != null && Number.isFinite(v)) sumManaged += v;
+    }
+    if (m == null || !Number.isFinite(m)) return null;
+    return Math.max(m, sumManaged);
+  });
+  traces.push({
+    x: pastTs, y: loadPastClamped,
+    type: "scatter", mode: "lines",
+    line: { color: "#ff9e64", width: 1.6 },
+    yaxis: "y7", name: "load measured", connectgaps: false,
+  });
+
+  // Future planned-load union. Sort same way for deterministic stacking.
   const plannedLoadIds = new Set();
   for (const s of fwd) {
     if (!s.load_kw) continue;
@@ -1164,15 +1202,42 @@ function buildTraces() {
       plannedLoadIds.add(k);
     }
   }
-  for (const loadId of plannedLoadIds) {
+  const sortedFutIds = [...plannedLoadIds].sort();
+
+  for (const loadId of sortedFutIds) {
+    const y = fwd.map((s) => {
+      const v = s.load_kw && s.load_kw[loadId];
+      return v != null && Number.isFinite(v) ? v : 0;
+    });
+    const c = colorForLoadId(loadId);
     traces.push({
-      x: slotTs,
-      y: fwd.map((s) => (s.load_kw && s.load_kw[loadId] != null ? s.load_kw[loadId] : null)),
+      x: slotTs, y,
       type: "scatter", mode: "lines",
-      line: { color: colorForLoadId(loadId), width: 1.2, dash: "dot", shape: "hv" },
-      yaxis: "y8", name: `${loadId} planned`, connectgaps: false,
+      stackgroup: "load-future",
+      line: { color: c, width: 1, dash: "dot", shape: "hv" },
+      fillcolor: hexToRgba(c, 0.32),
+      yaxis: "y7", name: `${loadId} planned`,
     });
   }
+  // Future total envelope (dotted), clamped to ≥ sum-managed-planned.
+  const loadFutClamped = fwd.map((s, i) => {
+    let sumManaged = 0;
+    for (const id of sortedFutIds) {
+      const v = s.load_kw && s.load_kw[id];
+      if (v != null && Number.isFinite(v)) sumManaged += v;
+    }
+    const f = loadFut[i];
+    if (f == null || !Number.isFinite(f)) {
+      return sumManaged > 0 ? sumManaged : null;
+    }
+    return Math.max(f, sumManaged);
+  });
+  traces.push({
+    x: slotTs, y: loadFutClamped,
+    type: "scatter", mode: "lines",
+    line: { color: "#ff9e64", width: 1.4, dash: "dot" },
+    yaxis: "y7", name: "load planned", connectgaps: false,
+  });
 
   // Grid (yaxis y5) — import positive, export negative.
   // Two measured sources: the inverter's house-meter register (Modbus
@@ -1524,7 +1589,6 @@ function buildLayout() {
     yaxis5: axis(domains.grid),
     yaxis6: axis(domains.cost),
     yaxis7: axis(domains.load),
-    yaxis8: axis(domains.managed),
     yaxis9: axis(domains.mode, { showticklabels: false, showgrid: false, fixedrange: true, range: [0, 1] }),
   };
 }
