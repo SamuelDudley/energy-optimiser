@@ -993,6 +993,146 @@ class TestSignalDrivenContinuous:
         assert hw_total >= 4.0 - 0.01, f"HW only delivered {hw_total:.2f} kWh"
 
 
+# ── Time-mode (daily_run_minutes) ────────────────────────────────
+
+
+def _hw_time_cfg(
+    minutes: int = 240,
+    min_on: int = 48,
+    min_off: int = 4,
+) -> ManagedLoadConfig:
+    """SIGNAL_DRIVEN_CONTINUOUS in time mode: daily_run_minutes (not kWh).
+    Defaults match the deployed HW config: 4 h window, 48-slot block."""
+    return ManagedLoadConfig(
+        load_id="hot_water",
+        category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+        shelly_host="test",
+        has_relay=True,
+        daily_target_kwh=None,
+        daily_run_minutes=minutes,
+        draw_kw=1.0,
+        deadline_hour_local=22,
+        min_on_slots=min_on,
+        min_off_slots=min_off,
+    )
+
+
+def _hw_time_status(
+    relay_on_minutes_today: float = 0.0,
+    relay_on: bool = False,
+) -> ManagedLoadStatus:
+    return ManagedLoadStatus(
+        load_id="hot_water",
+        category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+        power_kw=0.0,
+        energy_today_kwh=0.0,
+        relay_on=relay_on,
+        cycle_state=None,
+        relay_on_minutes_today=relay_on_minutes_today,
+    )
+
+
+class TestSignalDrivenContinuousTimeMode:
+    def test_solves_with_daily_run_minutes(self) -> None:
+        """LP solves and runs the relay long enough to satisfy the time
+        target. With min_on=48 and target=240 min the LP must build at
+        least one 48-slot (= 240 min) block before deadline."""
+        cfg = _hw_time_cfg(minutes=240, min_on=48, min_off=4)
+        sol = solve(
+            state=_state(),
+            prices_planning=_flat_prices(),
+            pv_forecast=None,
+            load_profile=_flat_profile(),
+            managed_loads=[_hw_time_status()],
+            lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+            battery_config=BatteryConfig(),
+            timeout_s=30.0,
+        )
+        assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+        slot_hours = SLOT_MINUTES / 60.0
+        # Sum minutes-on inside today's pre-deadline window (NOW=09:00
+        # local, deadline=22:00 local → 13 h ahead).
+        deadline = NOW + timedelta(hours=13)
+        on_minutes = sum(
+            (1.0 if d.load_kw.get("hot_water", 0.0) >= 0.5 else 0.0) * slot_hours * 60.0
+            for d in sol.forward_trajectory
+            if d.slot_start < deadline
+        )
+        assert on_minutes >= 240 - 0.01, (
+            f"time-mode LP only ran for {on_minutes:.0f} min, target=240"
+        )
+
+    def test_already_today_credit_reduces_remaining_minutes(self) -> None:
+        """already-today minutes credit toward the daily target. Asserts
+        the LP plans *less* on-time when the relay's already accumulated
+        most of the target than when it starts from zero — proves the
+        credit is being subtracted from `day_target`. Doesn't assert on
+        block geometry: when the residual target is small, slot-0
+        turn-ons can fit a sub-min_on block (a known limitation of
+        BinarySignalDrivenContinuousLoad for slot-0 starts; min-off
+        carry-over covers the in-production case)."""
+        cfg = _hw_time_cfg(minutes=240, min_on=12, min_off=4)
+
+        def _on_minutes(already: float) -> float:
+            status = _hw_time_status(relay_on_minutes_today=already)
+            sol = solve(
+                state=_state(),
+                prices_planning=_flat_prices(),
+                pv_forecast=None,
+                load_profile=_flat_profile(),
+                managed_loads=[status],
+                lp_loads=[BinarySignalDrivenContinuousLoad(cfg)],
+                battery_config=BatteryConfig(),
+                timeout_s=30.0,
+            )
+            assert sol.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE), sol.reason
+            slot_hours = SLOT_MINUTES / 60.0
+            deadline = NOW + timedelta(hours=13)
+            return sum(
+                (1.0 if d.load_kw.get("hot_water", 0.0) >= 0.5 else 0.0) * slot_hours * 60.0
+                for d in sol.forward_trajectory
+                if d.slot_start < deadline
+            )
+
+        zero_credit = _on_minutes(0.0)
+        partial_credit = _on_minutes(200.0)
+        full_credit = _on_minutes(240.0)
+
+        assert zero_credit >= 240 - 0.01, (
+            f"baseline (no credit) under target: {zero_credit:.0f} min"
+        )
+        assert partial_credit < zero_credit, (
+            f"200 min credit didn't reduce planned on-time: "
+            f"baseline={zero_credit:.0f}, with-credit={partial_credit:.0f}"
+        )
+        # Once the target is fully met, no more on-time is required.
+        # (LP may still pick up a block beyond deadline for tomorrow's
+        # target — we filter to the pre-deadline window.)
+        assert full_credit <= 0.01, (
+            f"target already met; LP shouldn't plan more on-time today, got {full_credit:.0f} min"
+        )
+
+    def test_constructor_accepts_time_target(self) -> None:
+        cfg = _hw_time_cfg()
+        load = BinarySignalDrivenContinuousLoad(cfg)
+        assert load.load_id == "hot_water"
+
+    def test_constructor_rejects_neither_target_set(self) -> None:
+        cfg = ManagedLoadConfig(
+            load_id="hot_water",
+            category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+            shelly_host="test",
+            has_relay=True,
+            daily_target_kwh=None,
+            daily_run_minutes=None,
+            draw_kw=1.0,
+            min_on_slots=12,
+            min_off_slots=4,
+        )
+        with pytest.raises(ValueError, match="daily_target_kwh or daily_run_minutes"):
+            BinarySignalDrivenContinuousLoad(cfg)
+
+
 # ── Horizon truncation + terminal SOC ────────────────────────────
 
 

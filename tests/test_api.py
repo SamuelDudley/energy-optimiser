@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -62,6 +62,7 @@ class _Probe:
     last_snapshot: object = None  # Actual type: TickSnapshot | None
     snapshot_dir: Path | None = None
     battery_config: BatteryConfig | None = None
+    managed_load_configs: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.metrics is None:
@@ -91,9 +92,7 @@ def _stale_heartbeat(tmp_path: Path) -> Path:
     return p
 
 
-def _build_app(
-    probe: _Probe, api_config: APIConfig | None = None
-) -> web.Application:
+def _build_app(probe: _Probe, api_config: APIConfig | None = None) -> web.Application:
     app = web.Application(middlewares=[make_auth_middleware(TOKEN, _PUBLIC)])
     app[SERVICE_PROBE_KEY] = probe
     app[API_CONFIG_KEY] = api_config or APIConfig(
@@ -143,37 +142,23 @@ class TestAuth:
             r = await c.get("/favicon.ico")
             assert r.status == 204
 
-    async def test_protected_path_rejects_missing_bearer(
-        self, tmp_path: Path
-    ) -> None:
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=duckdb.connect()
-        )
+    async def test_protected_path_rejects_missing_bearer(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=duckdb.connect())
         async with await _client(probe) as c:
             r = await c.get("/telemetry/schema")
             assert r.status == 401
             assert r.headers["WWW-Authenticate"].startswith("Bearer ")
 
-    async def test_protected_path_rejects_wrong_bearer(
-        self, tmp_path: Path
-    ) -> None:
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=duckdb.connect()
-        )
+    async def test_protected_path_rejects_wrong_bearer(self, tmp_path: Path) -> None:
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=duckdb.connect())
         async with await _client(probe) as c:
-            r = await c.get(
-                "/telemetry/schema", headers={"Authorization": "Bearer nope"}
-            )
+            r = await c.get("/telemetry/schema", headers={"Authorization": "Bearer nope"})
             assert r.status == 401
 
-    async def test_protected_path_accepts_correct_bearer(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_protected_path_accepts_correct_bearer(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         conn.execute("CREATE TABLE telemetry (ts TIMESTAMPTZ, soc_pct REAL)")
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/telemetry/schema", headers=_auth())
             assert r.status == 200
@@ -262,9 +247,7 @@ class TestIndex:
             for table in TABLE_DESCRIPTIONS:
                 assert f"/{table}" in paths
 
-    async def test_root_entries_have_description_and_auth_flag(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_root_entries_have_description_and_auth_flag(self, tmp_path: Path) -> None:
         probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
         async with await _client(probe) as c:
             r = await c.get("/")
@@ -277,20 +260,12 @@ class TestIndex:
 
 
 class TestTableSchema:
-    async def test_returns_columns_for_real_table(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_returns_columns_for_real_table(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         conn.execute(
-            "CREATE TABLE telemetry ("
-            "  ts TIMESTAMPTZ NOT NULL,"
-            "  soc_pct REAL,"
-            "  battery_kw REAL"
-            ")"
+            "CREATE TABLE telemetry (  ts TIMESTAMPTZ NOT NULL,  soc_pct REAL,  battery_kw REAL)"
         )
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/telemetry/schema", headers=_auth())
             assert r.status == 200
@@ -303,22 +278,16 @@ class TestTableSchema:
             assert body["description"]  # non-empty
 
     async def test_unknown_table_404s(self, tmp_path: Path) -> None:
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=duckdb.connect()
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=duckdb.connect())
         async with await _client(probe) as c:
             r = await c.get("/not_a_table/schema", headers=_auth())
             assert r.status == 404
 
-    async def test_whitelist_blocks_sql_injection_attempt(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_whitelist_blocks_sql_injection_attempt(self, tmp_path: Path) -> None:
         """The path ends up in a DESCRIBE literal; whitelist is the only
         defence. An unknown name must 404 before the query runs."""
         conn = duckdb.connect()
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             # URL-encoded semicolon + DROP would be a real attack shape.
             r = await c.get("/telemetry;%20DROP%20TABLE/schema", headers=_auth())
@@ -332,9 +301,7 @@ class TestMetrics:
             r = await c.get("/metrics")
             assert r.status == 401
 
-    async def test_empty_metrics_expose_zero_valued_families(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_empty_metrics_expose_zero_valued_families(self, tmp_path: Path) -> None:
         """A brand-new registry renders zero-valued counters and HELP/TYPE
         lines for everything we declared. Proves the handler wires up."""
         probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
@@ -368,9 +335,7 @@ class TestMetrics:
         metrics.record_dispatch_write(False)
         metrics.record_circuit_breaker_trip("lp_timeout")
 
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), metrics=metrics
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), metrics=metrics)
         async with await _client(probe) as c:
             r = await c.get("/metrics", headers=_auth())
             body = await r.text()
@@ -383,9 +348,7 @@ class TestMetrics:
             assert "eo_lp_solve_duration_ms_bucket" in body
             assert "eo_lp_solve_duration_ms_count 2.0" in body
 
-    async def test_heartbeat_age_is_derived_at_scrape_time(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_heartbeat_age_is_derived_at_scrape_time(self, tmp_path: Path) -> None:
         """The handler computes heartbeat_age from file mtime each scrape
         — no need for the tick loop to update it inline."""
         probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
@@ -395,9 +358,7 @@ class TestMetrics:
             # Freshly-touched file → small value.
             assert "eo_heartbeat_age_seconds" in body
 
-    async def test_state_machine_multiseries_reflects_current_state(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_state_machine_multiseries_reflects_current_state(self, tmp_path: Path) -> None:
         metrics = Metrics()
         # Mock a SystemState with the fields record_live_state reads.
         from unittest.mock import MagicMock
@@ -417,9 +378,7 @@ class TestMetrics:
             circuit_breaker_open=False,
             heartbeat_age_s=None,
         )
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), metrics=metrics
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), metrics=metrics)
         async with await _client(probe) as c:
             r = await c.get("/metrics", headers=_auth())
             body = await r.text()
@@ -452,16 +411,12 @@ class TestRingBuffer:
         lg.propagate = False
         for i in range(10):
             lg.info("line %d", i)
-        snap = buf.snapshot(
-            since=None, until=None, min_level=logging.DEBUG, limit=100
-        )
+        snap = buf.snapshot(since=None, until=None, min_level=logging.DEBUG, limit=100)
         assert len(snap) == 3
 
     def test_newest_first_order(self) -> None:
         buf = _seeded_buffer()
-        snap = buf.snapshot(
-            since=None, until=None, min_level=logging.DEBUG, limit=100
-        )
+        snap = buf.snapshot(since=None, until=None, min_level=logging.DEBUG, limit=100)
         # Four lines; newest (error) first
         messages = [r["message"] for r in snap]
         assert messages[0] == "an error line"
@@ -469,17 +424,13 @@ class TestRingBuffer:
 
     def test_level_filter_min_inclusive(self) -> None:
         buf = _seeded_buffer()
-        snap = buf.snapshot(
-            since=None, until=None, min_level=logging.WARNING, limit=100
-        )
+        snap = buf.snapshot(since=None, until=None, min_level=logging.WARNING, limit=100)
         levels = {r["level"] for r in snap}
         assert levels == {"WARNING", "ERROR"}
 
     def test_limit_clamps_output(self) -> None:
         buf = _seeded_buffer()
-        snap = buf.snapshot(
-            since=None, until=None, min_level=logging.DEBUG, limit=2
-        )
+        snap = buf.snapshot(since=None, until=None, min_level=logging.DEBUG, limit=2)
         assert len(snap) == 2
 
     def test_captures_exc_info(self) -> None:
@@ -492,9 +443,7 @@ class TestRingBuffer:
             raise RuntimeError("boom")
         except RuntimeError:
             lg.exception("something exploded")
-        snap = buf.snapshot(
-            since=None, until=None, min_level=logging.DEBUG, limit=5
-        )
+        snap = buf.snapshot(since=None, until=None, min_level=logging.DEBUG, limit=5)
         assert len(snap) == 1
         # The LogRecord machinery should have captured exc_info into the
         # formatted string.
@@ -511,9 +460,7 @@ class TestLogs:
             r = await c.get("/logs")
             assert r.status == 401
 
-    async def test_logs_returns_ring_buffer_newest_first(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_logs_returns_ring_buffer_newest_first(self, tmp_path: Path) -> None:
         probe = _Probe(
             heartbeat_path=_fresh_heartbeat(tmp_path),
             log_buffer=_seeded_buffer(),
@@ -575,9 +522,7 @@ class TestLogs:
             assert r.status == 400
 
     async def test_missing_buffer_returns_503(self, tmp_path: Path) -> None:
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), log_buffer=None
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), log_buffer=None)
         async with await _client(probe) as c:
             r = await c.get("/logs", headers=_auth())
             assert r.status == 503
@@ -586,38 +531,26 @@ class TestLogs:
 def _seed_telemetry(conn: duckdb.DuckDBPyConnection, n: int = 5) -> None:
     """Insert n hourly telemetry rows starting at 2026-01-01T00:00 UTC."""
     conn.execute(
-        "CREATE TABLE telemetry ("
-        "  ts TIMESTAMPTZ NOT NULL,"
-        "  soc_pct REAL,"
-        "  battery_kw REAL"
-        ")"
+        "CREATE TABLE telemetry (  ts TIMESTAMPTZ NOT NULL,  soc_pct REAL,  battery_kw REAL)"
     )
     for i in range(n):
         ts = f"2026-01-01 0{i}:00:00+00:00"
-        conn.execute(
-            "INSERT INTO telemetry VALUES (?, ?, ?)", [ts, 50.0 + i, float(i)]
-        )
+        conn.execute("INSERT INTO telemetry VALUES (?, ?, ?)", [ts, 50.0 + i, float(i)])
 
 
 class TestTableQuery:
     async def test_requires_auth(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 3)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/telemetry")
             assert r.status == 401
 
-    async def test_returns_all_rows_when_no_filter(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_returns_all_rows_when_no_filter(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 5)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/telemetry", headers=_auth())
             body = await r.json()
@@ -627,14 +560,10 @@ class TestTableQuery:
             assert body["rows"][0]["soc_pct"] == 50.0
             assert body["rows"][-1]["soc_pct"] == 54.0
 
-    async def test_datetime_serialised_as_iso(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_datetime_serialised_as_iso(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 1)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/telemetry", headers=_auth())
             body = await r.json()
@@ -642,14 +571,10 @@ class TestTableQuery:
             # Should round-trip through datetime.fromisoformat without raising
             datetime.fromisoformat(ts)
 
-    async def test_since_filter_excludes_earlier_rows(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_since_filter_excludes_earlier_rows(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 5)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             # `+` in query strings is a space — encode as %2B.
             r = await c.get(
@@ -663,9 +588,7 @@ class TestTableQuery:
     async def test_until_is_exclusive(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 5)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get(
                 "/telemetry?until=2026-01-01T03:00:00%2B00:00",
@@ -675,14 +598,10 @@ class TestTableQuery:
             assert body["count"] == 3  # hours 0, 1, 2 — not 3
             assert body["rows"][-1]["soc_pct"] == 52.0
 
-    async def test_limit_clamped_to_query_max_limit(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_limit_clamped_to_query_max_limit(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 10)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         # APIConfig in _build_app has query_max_limit=100, so a request
         # for limit=99999 should clamp.
         async with await _client(probe) as c:
@@ -694,9 +613,7 @@ class TestTableQuery:
     async def test_limit_three_returns_three(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 10)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/telemetry?limit=3", headers=_auth())
             body = await r.json()
@@ -704,9 +621,7 @@ class TestTableQuery:
 
     async def test_unknown_table_404(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/not_a_real_table", headers=_auth())
             assert r.status == 404
@@ -714,9 +629,7 @@ class TestTableQuery:
     async def test_bad_since_400(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         _seed_telemetry(conn, 1)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/telemetry?since=garbage", headers=_auth())
             assert r.status == 400
@@ -726,9 +639,7 @@ class TestTableQuery:
         `since` past the last row, ask again, etc."""
         conn = duckdb.connect()
         _seed_telemetry(conn, 5)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             seen = []
             since = "2026-01-01T00:00:00+00:00"
@@ -814,9 +725,7 @@ class TestForecastLogTableQuery:
     async def test_pv_forecast_log_range_query(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         self._seed_pv(conn)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/pv_forecast_log", headers=_auth())
             assert r.status == 200
@@ -835,9 +744,7 @@ class TestForecastLogTableQuery:
     async def test_price_forecast_log_range_query(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         self._seed_price(conn)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get(
                 "/price_forecast_log?until=2026-01-01T02:00:00%2B00:00",
@@ -851,9 +758,7 @@ class TestForecastLogTableQuery:
     async def test_weather_forecast_log_range_query(self, tmp_path: Path) -> None:
         conn = duckdb.connect()
         self._seed_weather(conn)
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
         async with await _client(probe) as c:
             r = await c.get("/weather_forecast_log?limit=2", headers=_auth())
             assert r.status == 200
@@ -950,9 +855,7 @@ class TestPlanCurrent:
     async def test_returns_snapshot_after_tick(self, tmp_path: Path) -> None:
         ts = datetime.fromisoformat("2026-04-24T10:00:00+00:00")
         snapshot = _make_snapshot(ts, soc_pct=72.5, action="discharge_ess")
-        probe = _Probe(
-            heartbeat_path=_fresh_heartbeat(tmp_path), last_snapshot=snapshot
-        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), last_snapshot=snapshot)
         async with await _client(probe) as c:
             r = await c.get("/plan/current", headers=_auth())
             assert r.status == 200
@@ -989,9 +892,7 @@ class TestSnapshots:
             assert body["count"] == 0
             assert body["rows"] == []
 
-    async def test_empty_when_dir_exists_but_has_no_files(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_empty_when_dir_exists_but_has_no_files(self, tmp_path: Path) -> None:
         snap_dir = tmp_path / "snapshots"
         snap_dir.mkdir()
         probe = _Probe(
@@ -1121,9 +1022,7 @@ class TestSnapshots:
         snap_dir = tmp_path / "snapshots"
         snap_dir.mkdir()
         base = datetime.fromisoformat("2026-04-24T00:00:00+00:00")
-        snaps = [
-            _make_snapshot(base + timedelta(seconds=i)) for i in range(5)
-        ]
+        snaps = [_make_snapshot(base + timedelta(seconds=i)) for i in range(5)]
         with gzip.open(snap_dir / "2026-04-24.ndjson.gz", "wt", encoding="utf-8") as f:
             for s in snaps:
                 f.write(json.dumps(asdict(s), default=_serialise) + "\n")
@@ -1181,9 +1080,7 @@ class TestDashboard:
             assert r.status == 200
             assert r.content_type == "text/css"
 
-    async def test_dashboard_static_blocks_unknown_filename(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_dashboard_static_blocks_unknown_filename(self, tmp_path: Path) -> None:
         # Layered defence: only the explicit dashboard.css / .js entries
         # are in the public-paths whitelist, so the auth middleware
         # rejects any other path *before* the handler runs (401). The
@@ -1197,34 +1094,26 @@ class TestDashboard:
             r = await c.get("/dashboard/static/secret.txt", headers=_auth())
             assert r.status == 404, r.status
 
-    async def test_dashboard_static_blocks_path_traversal(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_dashboard_static_blocks_path_traversal(self, tmp_path: Path) -> None:
         # An attempted ../etc/passwd must not return passwd contents,
         # whether blocked by auth (401), the handler whitelist (404), or
         # request normalisation (400). With a valid token the handler's
         # whitelist is what enforces this.
         probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
         async with await _client(probe) as c:
-            r = await c.get(
-                "/dashboard/static/..%2F..%2Fetc%2Fpasswd", headers=_auth()
-            )
+            r = await c.get("/dashboard/static/..%2F..%2Fetc%2Fpasswd", headers=_auth())
             assert r.status in (400, 404), r.status
             if r.status != 400:
                 body = await r.text()
                 assert "root:" not in body  # /etc/passwd content sentinel
 
-    async def test_dashboard_config_requires_token(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_dashboard_config_requires_token(self, tmp_path: Path) -> None:
         probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
         async with await _client(probe) as c:
             r = await c.get("/dashboard/config")
             assert r.status == 401
 
-    async def test_dashboard_config_returns_battery_fields(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_dashboard_config_returns_battery_fields(self, tmp_path: Path) -> None:
         probe = _Probe(
             heartbeat_path=_fresh_heartbeat(tmp_path),
             battery_config=BatteryConfig(soc_floor_pct=22.5, capacity_kwh=40.0),
@@ -1239,9 +1128,7 @@ class TestDashboard:
             for k in ("max_ac_charge_kw", "max_dc_charge_kw", "max_discharge_kw"):
                 assert k in body["battery"]
 
-    async def test_static_dir_env_override(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    async def test_static_dir_env_override(self, tmp_path: Path, monkeypatch) -> None:
         """Setting EO_DASHBOARD_STATIC_DIR makes the handler read from a
         different directory — used by docker-compose so dev edits to
         HTML/CSS/JS don't require rebuilding the image."""
@@ -1270,9 +1157,7 @@ class TestDashboard:
             bearer_token_env="EO_API_TOKEN", query_max_limit=100, query_timeout_s=5.0
         )
         app.router.add_get("/dashboard", dashboard_mod.dashboard_index)
-        app.router.add_get(
-            "/dashboard/static/{filename}", dashboard_mod.dashboard_static
-        )
+        app.router.add_get("/dashboard/static/{filename}", dashboard_mod.dashboard_static)
         async with TestClient(TestServer(app)) as c:
             r = await c.get("/dashboard")
             body = await r.text()

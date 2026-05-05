@@ -28,8 +28,6 @@ _EXTENDED_BOUNDS: tuple[tuple[str, float, float], ...] = (
     ("pcs_temp_c", -40.0, 120.0),
     # Cell voltages (wide — supports LFP ~3.2V, NMC ~3.7V nominals with headroom)
     ("cell_volt_avg_v", 1.5, 5.0),
-    ("cell_volt_max_v", 1.5, 5.0),
-    ("cell_volt_min_v", 1.5, 5.0),
     # Battery state-of-health
     ("soh_pct", 0.0, 100.0),
     # Dynamic power limits. The BMS reports pack-side maxima, which can

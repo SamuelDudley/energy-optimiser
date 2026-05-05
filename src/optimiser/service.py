@@ -645,8 +645,6 @@ class Service:
             cell_temp_max_c=state.cell_temp_max_c,
             cell_temp_min_c=state.cell_temp_min_c,
             cell_volt_avg_v=state.cell_volt_avg_v,
-            cell_volt_max_v=state.cell_volt_max_v,
-            cell_volt_min_v=state.cell_volt_min_v,
             pcs_temp_c=state.pcs_temp_c,
             available_charge_kw=state.available_charge_kw,
             available_discharge_kw=state.available_discharge_kw,
@@ -886,6 +884,13 @@ class Service:
         Exposed for /dashboard/config so the SOC panel draws the floor
         line at the actually-configured value."""
         return self._config.battery
+
+    @property
+    def managed_load_configs(self):
+        """Managed-load configs. Exposed for /dashboard/config so the
+        load cards know the daily-target unit (kWh vs minutes) and
+        cap value to render fractions against."""
+        return list(self._config.managed_loads)
 
     def _attach_log_handlers(self) -> None:
         """Attach the ring buffer and (if configured) a rotating file

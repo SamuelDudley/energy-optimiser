@@ -137,10 +137,6 @@ header.strip {
   border-color: var(--accent);
 }
 .range-bar button.primary:hover { filter: brightness(1.1); }
-.range-bar button[aria-pressed="true"] {
-  border-color: var(--accent);
-  color: var(--accent);
-}
 .range-bar .preset-row { display: flex; gap: 6px; flex-wrap: wrap; }
 .range-bar .mode-indicator {
   margin-left: auto;
@@ -165,6 +161,14 @@ main {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px;
+  /* Grid cells default to min-content sizing — without `min-width: 0`,
+     a Plotly chart with a stale inline `width: NNNNpx` (set when the
+     chart was wider, e.g. before a window resize while another tab was
+     active) forces the cell wider than its 1fr share and overflows the
+     viewport. min-width:0 lets the cell shrink below content size; the
+     chart is then either visually clipped or, after Plotly.Plots.resize
+     fires (see chart-utils.js), refits to the parent. */
+  min-width: 0;
 }
 .panel-header {
   display: flex;
@@ -302,7 +306,15 @@ main {
     padding: 8px 12px;
     gap: 6px 8px;
   }
-  .range-bar input[type="date"] { flex: 1 1 calc(50% - 4px); }
+  /* Drop the uppercase "View"/"From"/"To" labels — position implies
+     them and saves the row each label was forcing onto its own line. */
+  .range-bar .range-label { display: none; }
+  /* Date inputs share a single row: each flex-1 with a sensible min so
+     the native picker stays tappable. Apply flows on the same row. */
+  .range-bar input[type="date"] {
+    flex: 1 1 0;
+    min-width: 110px;
+  }
   .range-bar .preset-row { width: 100%; justify-content: space-between; }
   .range-bar .preset-row button { flex: 1 1 0; }
   .range-bar .mode-indicator {

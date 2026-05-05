@@ -13,7 +13,7 @@ import httpx
 
 from ..config import ManagedLoadConfig
 from ..logging_utils import api_call, emit
-from ..time_utils import now_utc
+from ..time_utils import now_utc, utc_to_local
 from ..types import (
     EventType,
     LoadCategory,
@@ -45,12 +45,22 @@ class ShellyLoadController:
         self._cycle_state = LoadCycleState.IDLE
         self._cycle_started: datetime | None = None
         self._energy_at_cycle_start: float = 0.0
-        self._energy_today_kwh: float = 0.0
+        self._energy_today_imp_kwh: float = 0.0
         self._today_date: datetime | None = None
 
-        # Last seen monotonic counter — used to detect Shelly reboots
-        # (counter resets to 0). None until first successful read.
+        # Returned-energy (export) accumulator — parallel to the imported
+        # one above. EM1Data exposes `total_act_energy` (forward) and
+        # `total_act_ret_energy` (reverse) separately because the meter
+        # is bidirectional. Loads like the HW heat pump only ever import
+        # so the export accumulator stays at 0; the bidirectional grid
+        # CT (mains) needs both to report meaningful net daily energy.
+        self._energy_at_cycle_start_ret: float = 0.0
+        self._energy_today_ret_kwh: float = 0.0
+
+        # Last seen monotonic counters — used to detect Shelly reboots
+        # (counters reset to 0). None until first successful read.
         self._last_total_energy_kwh: float | None = None
+        self._last_total_energy_ret_kwh: float | None = None
 
         # Issue #2 fix: queue async relay stop from sync transition
         self._pending_relay_stop: bool = False
@@ -61,6 +71,19 @@ class ShellyLoadController:
         # Both stay None until the first successful relay read.
         self._last_relay_state: bool | None = None
         self._relay_state_since: datetime | None = None
+
+        # Time-mode daily accumulator: minutes the relay has been observed
+        # ON since *local* midnight. Parallel to _energy_today_kwh but
+        # anchored on local date (matches deadline_hour_local — the LP's
+        # daily-target windows are local-midnight to local-deadline).
+        # Integrated by left-Riemann across status() polls: at each tick
+        # we add (now - last_status_at) minutes if the relay was observed
+        # ON at the previous poll. Local-date rollover zeros the counter
+        # and reseats the anchor — discards the small pre-midnight tail
+        # of the in-flight interval (≤1 poll period of error).
+        self._relay_on_minutes_today: float = 0.0
+        self._relay_today_local_date: datetime | None = None
+        self._last_status_at: datetime | None = None
 
     @property
     def load_id(self) -> str:
@@ -87,6 +110,7 @@ class ShellyLoadController:
 
         power_kw = 0.0
         energy_kwh = 0.0
+        energy_ret_kwh = 0.0
         relay_on: bool | None = None
         read_ok = False
 
@@ -118,6 +142,7 @@ class ShellyLoadController:
                 resp.raise_for_status()
                 energy_data = resp.json()
                 energy_kwh = energy_data.get("total_act_energy", 0) / 1000.0
+                energy_ret_kwh = energy_data.get("total_act_ret_energy", 0) / 1000.0
                 read_ok = True
 
             # Read relay state if applicable
@@ -139,7 +164,7 @@ class ShellyLoadController:
         # Track daily energy ONLY on successful read — a failed read
         # would otherwise be misinterpreted as a counter reset to 0.
         if read_ok:
-            self._track_daily_energy(energy_kwh)
+            self._track_daily_energy(energy_kwh, energy_ret_kwh)
 
             # Update cycle state for shiftable loads
             if self._config.category == LoadCategory.SHIFTABLE:
@@ -153,6 +178,7 @@ class ShellyLoadController:
         # so a transient blip doesn't reset the elapsed-time window.
         if read_ok and relay_on is not None:
             self._track_relay_state(relay_on)
+            self._track_relay_on_minutes(relay_on)
 
         return ManagedLoadStatus(
             load_id=self._config.load_id,
@@ -165,6 +191,9 @@ class ShellyLoadController:
             in (LoadCategory.SHIFTABLE, LoadCategory.SIGNAL_DRIVEN_CONTINUOUS)
             else None,
             relay_state_since=self._relay_state_since,
+            relay_on_minutes_today=(
+                self._relay_on_minutes_today if self._config.has_relay else None
+            ),
         )
 
     async def start_cycle(self) -> bool:
@@ -255,6 +284,31 @@ class ShellyLoadController:
             )
             return False
 
+    def _track_relay_on_minutes(self, relay_on: bool) -> None:
+        """Integrate relay-on time across status() polls (right-Riemann).
+
+        If the relay is observed ON at this poll, the interval since the
+        previous poll counts toward today's accumulator. With 60s polls
+        the per-transition error is ≤1 poll period; over a 4 h block
+        across two transitions that's ≤0.5 % error. Resets at local
+        midnight to align with deadline_hour_local.
+        """
+        now = now_utc()
+        today_local = utc_to_local(now).date()
+
+        if self._relay_today_local_date != today_local:
+            # Local-day rollover — zero the counter, anchor to now.
+            self._relay_today_local_date = today_local
+            self._relay_on_minutes_today = 0.0
+            self._last_status_at = now
+            return
+
+        if relay_on and self._last_status_at is not None:
+            elapsed_min = (now - self._last_status_at).total_seconds() / 60.0
+            self._relay_on_minutes_today += max(0.0, elapsed_min)
+
+        self._last_status_at = now
+
     def _track_relay_state(self, relay_on: bool) -> None:
         """Record the timestamp when `relay_on` last transitioned.
 
@@ -267,47 +321,80 @@ class ShellyLoadController:
             self._relay_state_since = now_utc()
         self._last_relay_state = relay_on
 
-    def _track_daily_energy(self, total_energy_kwh: float) -> None:
+    @property
+    def _energy_today_kwh(self) -> float:
+        """Net energy today (imp − exp).
+
+        Sign convention matches `power_kw` and `grid_power_kw`: + = imported,
+        − = exported. Unidirectional loads (HW heat pump) export ≈ 0 so net
+        == imported, preserving prior behaviour for kWh daily-target loads.
+        """
+        return self._energy_today_imp_kwh - self._energy_today_ret_kwh
+
+    def _track_daily_energy(
+        self, total_energy_kwh: float, total_energy_ret_kwh: float = 0.0
+    ) -> None:
         """Track accumulated energy today, resetting at midnight.
 
-        Detects Shelly counter resets (device reboot → counter back to 0)
-        by watching for backward jumps in `total_energy_kwh`. On reset,
-        the baseline is shifted so `_energy_today_kwh` is preserved across
-        the reboot rather than going wildly negative.
+        Tracks imported and exported counters in parallel: unidirectional
+        loads (HW heat pump relay) leave the export side at 0, the mains
+        CT exercises both. The public read is the net (`_energy_today_kwh`
+        property) so a heavy-export site reads negative.
+
+        Detects Shelly counter resets (device reboot → counters back to 0)
+        per side by watching for backward jumps. Each side is monotonic on
+        its own; the net isn't, so we can't reset-detect on net.
         """
         now = now_utc()
         today = now.date()
 
-        # Counter reset detection (Shelly reboot)
-        reset_detected = (
+        # Counter reset detection (Shelly reboot) — per side.
+        reset_imp = (
             self._last_total_energy_kwh is not None
             and total_energy_kwh < self._last_total_energy_kwh - _COUNTER_RESET_THRESHOLD_KWH
         )
+        reset_ret = (
+            self._last_total_energy_ret_kwh is not None
+            and total_energy_ret_kwh
+            < self._last_total_energy_ret_kwh - _COUNTER_RESET_THRESHOLD_KWH
+        )
 
         if self._today_date != today:
-            # New day — reset tracker. This is the normal midnight rollover.
+            # New day — reset tracker. Normal midnight rollover.
             self._today_date = today
             self._energy_at_cycle_start = total_energy_kwh
-            self._energy_today_kwh = 0.0
-        elif reset_detected:
-            # Counter reboot mid-day. Preserve today's accumulator by
-            # shifting the baseline: new_baseline = total - current_today.
-            # That way the next computation gives back the same _energy_today_kwh.
-            emit(
-                EventType.VALIDATION_WARNING,
-                {
-                    "load_id": self._config.load_id,
-                    "message": "Shelly counter reset detected (likely reboot)",
-                    "previous_total_kwh": self._last_total_energy_kwh,
-                    "new_total_kwh": total_energy_kwh,
-                    "preserved_today_kwh": self._energy_today_kwh,
-                },
-            )
-            self._energy_at_cycle_start = total_energy_kwh - self._energy_today_kwh
+            self._energy_at_cycle_start_ret = total_energy_ret_kwh
+            self._energy_today_imp_kwh = 0.0
+            self._energy_today_ret_kwh = 0.0
         else:
-            self._energy_today_kwh = total_energy_kwh - self._energy_at_cycle_start
+            if reset_imp or reset_ret:
+                # Counter reboot mid-day. Preserve each side's accumulator by
+                # shifting its baseline: new_baseline = total − current_today.
+                emit(
+                    EventType.VALIDATION_WARNING,
+                    {
+                        "load_id": self._config.load_id,
+                        "message": "Shelly counter reset detected (likely reboot)",
+                        "previous_total_kwh": self._last_total_energy_kwh,
+                        "previous_total_ret_kwh": self._last_total_energy_ret_kwh,
+                        "new_total_kwh": total_energy_kwh,
+                        "new_total_ret_kwh": total_energy_ret_kwh,
+                        "preserved_today_kwh": self._energy_today_kwh,
+                        "preserved_today_imp_kwh": self._energy_today_imp_kwh,
+                        "preserved_today_ret_kwh": self._energy_today_ret_kwh,
+                    },
+                )
+                if reset_imp:
+                    self._energy_at_cycle_start = total_energy_kwh - self._energy_today_imp_kwh
+                if reset_ret:
+                    self._energy_at_cycle_start_ret = (
+                        total_energy_ret_kwh - self._energy_today_ret_kwh
+                    )
+            self._energy_today_imp_kwh = total_energy_kwh - self._energy_at_cycle_start
+            self._energy_today_ret_kwh = total_energy_ret_kwh - self._energy_at_cycle_start_ret
 
         self._last_total_energy_kwh = total_energy_kwh
+        self._last_total_energy_ret_kwh = total_energy_ret_kwh
 
     def _update_cycle_state(self, power_kw: float) -> None:
         """Update cycle state based on measured power for shiftable loads."""
@@ -374,8 +461,13 @@ class ShellyLoadController:
         COMPLETE_TODAY until midnight rolls energy_today_kwh back to 0
         (handled by `_track_daily_energy`).
         """
-        target = self._config.daily_target_kwh
-        if target is not None and self._energy_today_kwh >= target:
+        # Two daily-target modes — see ManagedLoadConfig docstring.
+        kwh_target = self._config.daily_target_kwh
+        min_target = self._config.daily_run_minutes
+        target_met = (kwh_target is not None and self._energy_today_kwh >= kwh_target) or (
+            min_target is not None and self._relay_on_minutes_today >= min_target
+        )
+        if target_met:
             self._cycle_state = LoadCycleState.COMPLETE_TODAY
         elif relay_on:
             self._cycle_state = LoadCycleState.RUNNING

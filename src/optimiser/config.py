@@ -130,7 +130,20 @@ class ManagedLoadConfig:
     cycle_duration_min: int | None = None
 
     # ── SIGNAL_DRIVEN (rolling daily scheduler — HP in PV mode, EV) ──
+    # The LP enforces a daily target by `deadline_hour_local`. Two flavours,
+    # exactly one of which must be set per load:
+    #   daily_target_kwh   — energy delivered (relay × draw_kw × hours).
+    #     Right model when the appliance draws its configured rate while the
+    #     relay is closed (EV charger contactor, resistive HW element).
+    #   daily_run_minutes  — minutes of relay-on time per day, regardless of
+    #     actual draw. Right model when the appliance self-regulates (HP HW
+    #     in PV mode: compressor cycles internally on tank temp; relay-on
+    #     time is "permission to run", not energy delivered). The LP picks
+    #     the cheapest contiguous window subject to min_on/min_off; the
+    #     appliance decides how hard to push within it.
+    # Validated at parse time — see _parse_load.
     daily_target_kwh: float | None = None
+    daily_run_minutes: int | None = None
     deadline_hour_local: int = 22  # Local hour by which target must be met.
     hysteresis_buffer: int = 2  # Extra slots beyond strict need before asserting.
     hysteresis_extra: int = 4  # Extra slots beyond k_assert to keep an asserted relay closed.
@@ -337,7 +350,40 @@ def _parse_schedule_overrides(raw: dict, load_id: str) -> dict[str, str]:
     return result
 
 
+def _validate_signal_driven_target(raw: dict) -> None:
+    """Enforce exactly one of (daily_target_kwh, daily_run_minutes) for
+    relay-driven categories, and reject negative / non-positive values.
+
+    Parser-time check so misconfiguration surfaces at startup rather than
+    on the first LP tick.
+    """
+    category = raw.get("category")
+    if category not in {"signal_driven", "signal_driven_continuous"}:
+        return  # observable / shiftable / etc. — neither field applies
+    load_id = raw.get("load_id", "?")
+    kwh = raw.get("daily_target_kwh")
+    minutes = raw.get("daily_run_minutes")
+    if kwh is None and minutes is None:
+        raise ValueError(
+            f"managed_load {load_id!r}: signal_driven loads require exactly "
+            f"one of daily_target_kwh or daily_run_minutes (neither set)"
+        )
+    if kwh is not None and minutes is not None:
+        raise ValueError(
+            f"managed_load {load_id!r}: set exactly one of daily_target_kwh "
+            f"or daily_run_minutes, not both"
+        )
+    if kwh is not None and kwh <= 0:
+        raise ValueError(f"managed_load {load_id!r}: daily_target_kwh must be > 0, got {kwh!r}")
+    if minutes is not None and (not isinstance(minutes, int) or minutes <= 0):
+        raise ValueError(
+            f"managed_load {load_id!r}: daily_run_minutes must be a positive "
+            f"integer, got {minutes!r}"
+        )
+
+
 def _parse_load(raw: dict) -> ManagedLoadConfig:
+    _validate_signal_driven_target(raw)
     return ManagedLoadConfig(
         load_id=raw["load_id"],
         category=LoadCategory(raw["category"]),
@@ -347,8 +393,9 @@ def _parse_load(raw: dict) -> ManagedLoadConfig:
         # Legacy SHIFTABLE
         daily_energy_kwh=raw.get("daily_energy_kwh"),
         cycle_duration_min=raw.get("cycle_duration_min"),
-        # SIGNAL_DRIVEN
+        # SIGNAL_DRIVEN — validated mutually exclusive below
         daily_target_kwh=raw.get("daily_target_kwh"),
+        daily_run_minutes=raw.get("daily_run_minutes"),
         deadline_hour_local=raw.get("deadline_hour_local", 22),
         hysteresis_buffer=raw.get("hysteresis_buffer", 2),
         hysteresis_extra=raw.get("hysteresis_extra", 4),

@@ -98,9 +98,12 @@ class BinarySignalDrivenLoad:
     """
 
     def __init__(self, config: ManagedLoadConfig) -> None:
-        if config.draw_kw is None or config.daily_target_kwh is None:
+        if config.draw_kw is None:
+            raise ValueError(f"BinarySignalDrivenLoad {config.load_id!r} requires draw_kw")
+        if config.daily_target_kwh is None and config.daily_run_minutes is None:
             raise ValueError(
-                f"BinarySignalDrivenLoad {config.load_id!r} requires draw_kw and daily_target_kwh"
+                f"BinarySignalDrivenLoad {config.load_id!r} requires exactly "
+                f"one of daily_target_kwh or daily_run_minutes"
             )
         self._cfg = config
         self.load_id = config.load_id
@@ -131,8 +134,20 @@ class BinarySignalDrivenLoad:
     ) -> LoadVars:
         n = len(slots)
         draw = self._cfg.draw_kw or 0.0
-        target = self._cfg.daily_target_kwh or 0.0
         deadline_hour = self._cfg.deadline_hour_local
+
+        # Daily-target mode: energy or time. Exactly one is set (config
+        # validator enforces). Both branches use the same per-day window
+        # iteration with `unit_per_slot × Σ relay[t] ≥ day_target`; the
+        # unit changes — kWh per slot vs minutes per slot.
+        if self._cfg.daily_run_minutes is not None:
+            target = float(self._cfg.daily_run_minutes)
+            unit_per_slot = slot_hours * 60.0  # minutes
+            already_today_unit = max(0.0, status.relay_on_minutes_today or 0.0)
+        else:
+            target = self._cfg.daily_target_kwh or 0.0
+            unit_per_slot = slot_hours * draw  # kWh
+            already_today_unit = max(0.0, status.energy_today_kwh)
 
         # Decision variables: relay state per slot.
         # Slot 0 is binary (we commit to it this tick). Future slots are
@@ -190,11 +205,10 @@ class BinarySignalDrivenLoad:
         #     forgiven (a tank that's been cold for 2+ days needs
         #     operator attention, not a frantic LP).
 
-        if slots and target > 0 and draw > 0:
+        if slots and target > 0 and unit_per_slot > 0:
             horizon_start = slots[0]
             horizon_end_excl = slots[-1] + timedelta(minutes=int(slot_hours * 60))
-            already_today = max(0.0, status.energy_today_kwh)
-            rolled_forward_kwh = 0.0
+            rolled_forward_unit = 0.0
 
             # Today's local midnight, as the anchor for day iteration.
             local_now = utc_to_local(horizon_start)
@@ -217,7 +231,7 @@ class BinarySignalDrivenLoad:
                 # (a skipped day forgives, doesn't defer).
                 day_date_iso = day_midnight_local.date().isoformat()
                 if self._cfg.schedule_overrides.get(day_date_iso, "auto") != "auto":
-                    rolled_forward_kwh = 0.0
+                    rolled_forward_unit = 0.0
                     continue
 
                 # This day's pre-deadline window, intersected with horizon.
@@ -230,16 +244,18 @@ class BinarySignalDrivenLoad:
 
                 # Figure out the target for THIS day's constraint.
                 if day_offset == 0:
-                    # Today. Already-delivered comes from Shelly.
-                    day_target = max(0.0, target - already_today)
+                    # Today. Already-delivered comes from Shelly (kWh
+                    # accumulator for energy mode, minutes accumulator
+                    # for time mode).
+                    day_target = max(0.0, target - already_today_unit)
                 else:
                     # Future day. Already-delivered at that day's start
-                    # is zero (the Shelly counter resets at midnight).
-                    # Apply any rolled-forward shortfall from earlier
-                    # iterations, and cap the combined target so we
-                    # never demand an impossible amount in one day.
-                    day_target = target + rolled_forward_kwh
-                    rolled_forward_kwh = 0.0  # claimed (or forgiven below)
+                    # is zero (counters reset at midnight). Apply any
+                    # rolled-forward shortfall from earlier iterations,
+                    # and cap the combined target so we never demand an
+                    # impossible amount in one day.
+                    day_target = target + rolled_forward_unit
+                    rolled_forward_unit = 0.0  # claimed (or forgiven below)
                     cap = ROLL_FORWARD_CAP_MULTIPLIER * target
                     if day_target > cap:
                         # Excess beyond the cap is forgiven — logging
@@ -251,32 +267,30 @@ class BinarySignalDrivenLoad:
                 if day_target <= 0:
                     continue
 
-                # Feasibility check (uniform across days). The day's
-                # in-horizon window has a hard kWh ceiling: every slot
-                # ON × slot_hours × draw. If day_target exceeds that
-                # ceiling — because the window is empty (deadline past,
-                # or window beyond horizon end) or because Amber's
-                # price coverage truncates the LP horizon partway
-                # through this day — demanding it produces an
-                # infeasible LP. Roll the unmet target into the next
-                # iteration; the cap on day_offset >= 1 prevents
-                # cascading days from piling up impossible amounts.
-                # When day 2 (the last iteration) hits this branch the
-                # roll-forward simply drops on the floor, which is the
-                # right outcome — what falls beyond the horizon will
-                # be re-decided on the next tick when the horizon
-                # advances. (Min-on / min-off block constraints make
-                # the *true* ceiling lower than this naive bound;
-                # partial-fitting against blocks is fragile so we
-                # don't try.)
-                max_kwh = len(in_horizon_slots) * slot_hours * draw
-                if not in_horizon_slots or day_target > max_kwh:
-                    rolled_forward_kwh = day_target
+                # Feasibility check (uniform across days and modes). The
+                # day's in-horizon window has a hard ceiling: every slot
+                # ON × unit_per_slot. If day_target exceeds that ceiling
+                # — because the window is empty (deadline past, or
+                # window beyond horizon end) or because Amber's price
+                # coverage truncates the LP horizon partway through this
+                # day — demanding it produces an infeasible LP. Roll the
+                # unmet target into the next iteration; the cap on
+                # day_offset >= 1 prevents cascading days from piling up
+                # impossible amounts. When day 2 (the last iteration)
+                # hits this branch the roll-forward simply drops on the
+                # floor, which is the right outcome — what falls beyond
+                # the horizon will be re-decided on the next tick when
+                # the horizon advances. (Min-on / min-off block
+                # constraints make the *true* ceiling lower than this
+                # naive bound; partial-fitting against blocks is fragile
+                # so we don't try.)
+                max_unit = len(in_horizon_slots) * unit_per_slot
+                if not in_horizon_slots or day_target > max_unit:
+                    rolled_forward_unit = day_target
                     continue
 
                 prob += (
-                    pulp.lpSum(relay[t] * draw * slot_hours for t in in_horizon_slots)
-                    >= day_target,
+                    pulp.lpSum(relay[t] * unit_per_slot for t in in_horizon_slots) >= day_target,
                     f"{var_prefix}{self.load_id}_daily_target_d{day_offset}",
                 )
 
@@ -293,16 +307,17 @@ class BinarySignalDrivenLoad:
         relay_0 = vars.extras["relay"][0]
         val = relay_0.varValue if relay_0.varValue is not None else 0.0
         on = val > 0.5  # binary, but be defensive against solver noise
-        target = self._cfg.daily_target_kwh or 0.0
+        if self._cfg.daily_run_minutes is not None:
+            mins_today = status.relay_on_minutes_today or 0.0
+            progress = f"on_minutes_today={mins_today:.0f}/{self._cfg.daily_run_minutes} min"
+        else:
+            target = self._cfg.daily_target_kwh or 0.0
+            progress = f"energy_today={status.energy_today_kwh:.2f}/{target:.2f} kWh"
         return LoadCommand(
             load_id=self.load_id,
             start_cycle=False,  # legacy field; LP doesn't use it
             desired_relay_on=on,
-            reason=(
-                f"LP slot-0: relay={'on' if on else 'off'} "
-                f"(energy_today={status.energy_today_kwh:.2f}/"
-                f"{target:.2f} kWh)"
-            ),
+            reason=(f"LP slot-0: relay={'on' if on else 'off'} ({progress})"),
         )
 
 

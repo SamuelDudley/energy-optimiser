@@ -40,6 +40,7 @@ _STATIC_DIR = _resolve_static_dir()
 
 _STATIC_FILES: dict[str, str] = {
     "dashboard.css": "text/css",
+    "chart-utils.js": "application/javascript",
     "dashboard.js": "application/javascript",
     "ops.js": "application/javascript",
 }
@@ -74,13 +75,27 @@ async def dashboard_config(request: web.Request) -> web.Response:
 
     The LP's hard SOC floor (``battery.soc_floor_pct``) drives the floor
     line on the SOC panel; rate limits constrain a few axis ranges.
-    Threading these through TickSnapshot for every tick would be
-    wasteful — they change at config-reload time, not per tick.
+    Managed-load knobs let the load cards render the right target unit
+    (kWh vs minutes) and progress fraction. Threading these through
+    TickSnapshot for every tick would be wasteful — they change at
+    config-reload time, not per tick.
     """
     probe = request.app[SERVICE_PROBE_KEY]
+    managed_loads = [
+        {
+            "load_id": cfg.load_id,
+            "category": cfg.category.value,
+            "draw_kw": cfg.draw_kw,
+            "daily_target_kwh": cfg.daily_target_kwh,
+            "daily_run_minutes": cfg.daily_run_minutes,
+            "deadline_hour_local": cfg.deadline_hour_local,
+        }
+        for cfg in probe.managed_load_configs
+    ]
     return web.json_response(
         {
             "battery": asdict(probe.battery_config),
+            "managed_loads": managed_loads,
             "version": probe.version,
         }
     )

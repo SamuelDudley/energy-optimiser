@@ -63,8 +63,6 @@ CREATE TABLE IF NOT EXISTS telemetry (
     cell_temp_max_c        REAL,
     cell_temp_min_c        REAL,
     cell_volt_avg_v        REAL,
-    cell_volt_max_v        REAL,
-    cell_volt_min_v        REAL,
     pcs_temp_c             REAL,
     available_charge_kw    REAL,
     available_discharge_kw REAL,
@@ -125,8 +123,6 @@ TELEMETRY_MIGRATIONS = [
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_temp_max_c        REAL",
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_temp_min_c        REAL",
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_volt_avg_v        REAL",
-    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_volt_max_v        REAL",
-    "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS cell_volt_min_v        REAL",
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS pcs_temp_c             REAL",
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_charge_kw    REAL",
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS available_discharge_kw REAL",
@@ -155,6 +151,12 @@ TELEMETRY_MIGRATIONS = [
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS phase_b_voltage_v      REAL",
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS phase_c_voltage_v      REAL",
     "ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS remote_ems_mode        INTEGER",
+    # 2026-05-03: cell volt min/max registers (30622/30623) returned isError
+    # on every read — firmware doesn't expose them. Two persistent failures
+    # per tick polluted the err_count signal floor. Drop the columns; the
+    # avg cell voltage is still captured.
+    "ALTER TABLE telemetry DROP COLUMN IF EXISTS cell_volt_max_v",
+    "ALTER TABLE telemetry DROP COLUMN IF EXISTS cell_volt_min_v",
 ]
 
 PV_FORECAST_LOG_DDL = """
@@ -383,7 +385,7 @@ class TelemetryStore:
                 occupied, ems_mode, planner_action, planner_reason,
                 schema_version,
                 soh_pct, cell_temp_avg_c, cell_temp_max_c, cell_temp_min_c,
-                cell_volt_avg_v, cell_volt_max_v, cell_volt_min_v, pcs_temp_c,
+                cell_volt_avg_v, pcs_temp_c,
                 available_charge_kw, available_discharge_kw,
                 running_state, alarm1, alarm2, alarm3, alarm4, alarm5,
                 lifetime_pv_kwh, lifetime_load_kwh,
@@ -398,7 +400,7 @@ class TelemetryStore:
                 remote_ems_mode
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?
@@ -428,8 +430,6 @@ class TelemetryStore:
                 row.cell_temp_max_c,
                 row.cell_temp_min_c,
                 row.cell_volt_avg_v,
-                row.cell_volt_max_v,
-                row.cell_volt_min_v,
                 row.pcs_temp_c,
                 row.available_charge_kw,
                 row.available_discharge_kw,
@@ -498,12 +498,11 @@ class TelemetryStore:
             )
         except Exception:
             logger.exception(
-                "pv_forecast_log write failed (%d rows dropped)", len(rows),
+                "pv_forecast_log write failed (%d rows dropped)",
+                len(rows),
             )
 
-    def write_weather_forecast_log(
-        self, rows: list[WeatherForecastLogRow]
-    ) -> None:
+    def write_weather_forecast_log(self, rows: list[WeatherForecastLogRow]) -> None:
         """Append BOM hourly forecast rows. Best-effort."""
         if not rows:
             return
@@ -526,7 +525,8 @@ class TelemetryStore:
             )
         except Exception:
             logger.exception(
-                "weather_forecast_log write failed (%d rows dropped)", len(rows),
+                "weather_forecast_log write failed (%d rows dropped)",
+                len(rows),
             )
 
     def update_pv_actuals(self, actuals: dict[datetime, float]) -> int:
@@ -562,7 +562,8 @@ class TelemetryStore:
             return int(touched[0]) if touched else 0
         except Exception:
             logger.exception(
-                "update_pv_actuals failed (%d entries dropped)", len(actuals),
+                "update_pv_actuals failed (%d entries dropped)",
+                len(actuals),
             )
             return 0
 
@@ -577,9 +578,7 @@ class TelemetryStore:
         skip the initial API call (Solcast has a hard 10/day quota).
         """
         try:
-            latest_fetch = self._db.sql(
-                "SELECT MAX(fetched_at) FROM pv_forecast_log"
-            ).fetchone()
+            latest_fetch = self._db.sql("SELECT MAX(fetched_at) FROM pv_forecast_log").fetchone()
         except Exception:
             logger.exception("read_latest_pv_forecast failed")
             return None
@@ -658,7 +657,8 @@ class TelemetryStore:
             )
         except Exception:
             logger.exception(
-                "amber_usage write failed (%d rows dropped)", len(rows),
+                "amber_usage write failed (%d rows dropped)",
+                len(rows),
             )
 
     def latest_amber_usage_date(self) -> str | None:
@@ -670,9 +670,7 @@ class TelemetryStore:
         configured number of recent days.
         """
         try:
-            row = self._db.sql(
-                "SELECT MAX(nem_date) FROM amber_usage"
-            ).fetchone()
+            row = self._db.sql("SELECT MAX(nem_date) FROM amber_usage").fetchone()
         except Exception:
             logger.exception("latest_amber_usage_date failed")
             return None
@@ -717,7 +715,8 @@ class TelemetryStore:
             )
         except Exception:
             logger.exception(
-                "price_forecast_log write failed (%d rows dropped)", len(rows),
+                "price_forecast_log write failed (%d rows dropped)",
+                len(rows),
             )
 
     # ── Reads (analytical) ───────────────────────────────────────

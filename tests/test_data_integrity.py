@@ -175,8 +175,6 @@ class TestExtendedInverterFields:
             cell_temp_max_c=23.1,
             cell_temp_min_c=21.7,
             cell_volt_avg_v=3.35,
-            cell_volt_max_v=3.40,
-            cell_volt_min_v=3.30,
             pcs_temp_c=35.5,
             available_charge_kw=8.2,
             available_discharge_kw=9.1,
@@ -355,6 +353,42 @@ class TestShellyCounterReset:
             ctrl._track_daily_energy(104.0)
             assert ctrl._energy_today_kwh == pytest.approx(0.5)
 
+    @freeze_time("2026-01-01 06:00:00", tz_offset=0)
+    def test_bidirectional_net_energy(self) -> None:
+        """Mains CT exercises both counters; today reads net (imp − exp)."""
+        ctrl = ShellyLoadController(_shelly_cfg())
+        # Baseline: 500 kWh imported lifetime, 27000 kWh exported lifetime.
+        ctrl._track_daily_energy(500.0, 27000.0)
+        assert ctrl._energy_today_kwh == 0.0
+
+        # Throughout the day: +1 kWh imp, +5 kWh exp → net −4 kWh.
+        ctrl._track_daily_energy(501.0, 27005.0)
+        assert ctrl._energy_today_kwh == pytest.approx(-4.0)
+
+        # More export: +0 imp, +3 more exp → net −7 kWh.
+        ctrl._track_daily_energy(501.0, 27008.0)
+        assert ctrl._energy_today_kwh == pytest.approx(-7.0)
+
+    @freeze_time("2026-01-01 06:00:00", tz_offset=0)
+    def test_export_counter_reset_preserves_today(self, capsys) -> None:
+        """A reboot that resets the export-side counter shouldn't poison net."""
+        ctrl = ShellyLoadController(_shelly_cfg())
+        ctrl._track_daily_energy(500.0, 27000.0)
+        ctrl._track_daily_energy(501.0, 27005.0)  # net −4
+
+        # Reboot: both counters reset to 0; new session starts.
+        ctrl._track_daily_energy(0.0, 0.0)
+        # Today preserved across the reboot (no double-counting):
+        assert ctrl._energy_today_kwh == pytest.approx(-4.0)
+
+        captured = capsys.readouterr()
+        assert "shelly counter reset" in captured.out.lower()
+
+        # Subsequent reads accumulate from the new baselines.
+        ctrl._track_daily_energy(0.5, 1.0)  # +0.5 imp, +1.0 exp = −0.5 since reboot
+        # Preserved −4 + (−0.5) = −4.5
+        assert ctrl._energy_today_kwh == pytest.approx(-4.5)
+
 
 # ── Relay state-change tracking (SIGNAL_DRIVEN_CONTINUOUS carry-over) ──
 
@@ -405,25 +439,25 @@ def _continuous_cfg(daily_target_kwh: float = 4.0) -> ManagedLoadConfig:
 class TestCycleStateContinuous:
     def test_relay_off_below_target_is_idle(self) -> None:
         ctrl = ShellyLoadController(_continuous_cfg())
-        ctrl._energy_today_kwh = 1.5
+        ctrl._energy_today_imp_kwh = 1.5
         ctrl._update_cycle_state_continuous(relay_on=False)
         assert ctrl._cycle_state == LoadCycleState.IDLE
 
     def test_relay_on_below_target_is_running(self) -> None:
         ctrl = ShellyLoadController(_continuous_cfg())
-        ctrl._energy_today_kwh = 1.5
+        ctrl._energy_today_imp_kwh = 1.5
         ctrl._update_cycle_state_continuous(relay_on=True)
         assert ctrl._cycle_state == LoadCycleState.RUNNING
 
     def test_target_met_latches_complete_today(self) -> None:
         ctrl = ShellyLoadController(_continuous_cfg(daily_target_kwh=4.0))
-        ctrl._energy_today_kwh = 4.0
+        ctrl._energy_today_imp_kwh = 4.0
         ctrl._update_cycle_state_continuous(relay_on=True)
         assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
 
     def test_target_met_overrides_relay_off(self) -> None:
         ctrl = ShellyLoadController(_continuous_cfg(daily_target_kwh=4.0))
-        ctrl._energy_today_kwh = 4.2  # past target
+        ctrl._energy_today_imp_kwh = 4.2  # past target
         ctrl._update_cycle_state_continuous(relay_on=False)
         assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
 
@@ -431,7 +465,7 @@ class TestCycleStateContinuous:
         # daily_target_kwh=None means no target — only IDLE/RUNNING.
         ctrl = ShellyLoadController(_continuous_cfg())
         ctrl._config = replace(ctrl._config, daily_target_kwh=None)
-        ctrl._energy_today_kwh = 999.0
+        ctrl._energy_today_imp_kwh = 999.0
         ctrl._update_cycle_state_continuous(relay_on=True)
         assert ctrl._cycle_state == LoadCycleState.RUNNING
 
@@ -441,9 +475,183 @@ class TestCycleStateContinuous:
         # the next status() call should drop us back to IDLE/RUNNING based
         # on relay state alone.
         ctrl = ShellyLoadController(_continuous_cfg(daily_target_kwh=4.0))
-        ctrl._energy_today_kwh = 4.5
+        ctrl._energy_today_imp_kwh = 4.5
         ctrl._update_cycle_state_continuous(relay_on=False)
         assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
-        ctrl._energy_today_kwh = 0.0  # midnight reset (handled elsewhere)
+        ctrl._energy_today_imp_kwh = 0.0  # midnight reset (handled elsewhere)
         ctrl._update_cycle_state_continuous(relay_on=False)
         assert ctrl._cycle_state == LoadCycleState.IDLE
+
+
+# ── Time-mode (daily_run_minutes) ─────────────────────────────────
+
+
+def _time_mode_cfg(daily_run_minutes: int = 240) -> ManagedLoadConfig:
+    return ManagedLoadConfig(
+        load_id="hot_water",
+        category=LoadCategory.SIGNAL_DRIVEN_CONTINUOUS,
+        shelly_host="test",
+        has_relay=True,
+        daily_target_kwh=None,
+        daily_run_minutes=daily_run_minutes,
+        min_on_slots=48,
+        min_off_slots=4,
+    )
+
+
+class TestRelayOnMinutesAccumulator:
+    """Right-Riemann integration of relay-on time across status() polls."""
+
+    def test_first_poll_anchors_no_accumulation(self) -> None:
+        ctrl = ShellyLoadController(_time_mode_cfg())
+        with freeze_time("2026-05-03 02:00:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=True)
+        # Local-day initialisation seeded the anchor; no minutes counted
+        # because no prior poll to integrate from.
+        assert ctrl._relay_on_minutes_today == 0.0
+        assert ctrl._last_status_at is not None
+
+    def test_relay_on_for_one_minute_accumulates_one(self) -> None:
+        ctrl = ShellyLoadController(_time_mode_cfg())
+        # Two polls 60 s apart, both observing relay-on. Right-Riemann
+        # uses the *current* observation, so the second poll's interval
+        # contributes 1.0 min to the accumulator.
+        with freeze_time("2026-05-03 02:00:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=True)
+        with freeze_time("2026-05-03 02:01:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=True)
+        assert ctrl._relay_on_minutes_today == pytest.approx(1.0, abs=1e-6)
+
+    def test_relay_off_intervals_not_counted(self) -> None:
+        ctrl = ShellyLoadController(_time_mode_cfg())
+        with freeze_time("2026-05-03 02:00:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=False)
+        with freeze_time("2026-05-03 02:01:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=False)
+        with freeze_time("2026-05-03 02:02:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=False)
+        assert ctrl._relay_on_minutes_today == 0.0
+
+    def test_local_midnight_resets_counter(self) -> None:
+        # Canberra is UTC+10/+11. Use a fixed UTC instant just past local
+        # midnight to exercise the local-date rollover path.
+        ctrl = ShellyLoadController(_time_mode_cfg())
+        # Day 1 (local 2026-05-03): accumulate some on-time.
+        # 12:00 UTC = 22:00 AEST local 2026-05-03.
+        with freeze_time("2026-05-03 12:00:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=True)
+        with freeze_time("2026-05-03 12:30:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=True)
+        assert ctrl._relay_on_minutes_today == pytest.approx(30.0, abs=1e-6)
+        # 14:30 UTC = 00:30 AEST local 2026-05-04 — local-date crossed.
+        with freeze_time("2026-05-03 14:30:00", tz_offset=0):
+            ctrl._track_relay_on_minutes(relay_on=True)
+        assert ctrl._relay_on_minutes_today == 0.0
+
+    def test_complete_today_latches_when_minutes_target_met(self) -> None:
+        ctrl = ShellyLoadController(_time_mode_cfg(daily_run_minutes=240))
+        ctrl._relay_on_minutes_today = 240.0
+        ctrl._update_cycle_state_continuous(relay_on=True)
+        assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
+
+    def test_complete_today_latches_overrides_relay_off(self) -> None:
+        ctrl = ShellyLoadController(_time_mode_cfg(daily_run_minutes=240))
+        ctrl._relay_on_minutes_today = 240.0
+        ctrl._update_cycle_state_continuous(relay_on=False)
+        assert ctrl._cycle_state == LoadCycleState.COMPLETE_TODAY
+
+    def test_below_minutes_target_runs_when_relay_on(self) -> None:
+        ctrl = ShellyLoadController(_time_mode_cfg(daily_run_minutes=240))
+        ctrl._relay_on_minutes_today = 100.0  # well below target
+        ctrl._update_cycle_state_continuous(relay_on=True)
+        assert ctrl._cycle_state == LoadCycleState.RUNNING
+
+
+# ── Config parser-time validation (mode-exclusivity) ──────────────
+
+
+class TestSignalDrivenConfigValidation:
+    """Parser-time enforcement: signal_driven loads need exactly one of
+    daily_target_kwh / daily_run_minutes."""
+
+    def test_neither_set_raises(self) -> None:
+        from optimiser.config import _validate_signal_driven_target
+
+        with pytest.raises(ValueError, match="exactly one"):
+            _validate_signal_driven_target(
+                {
+                    "load_id": "test_load",
+                    "category": "signal_driven",
+                }
+            )
+
+    def test_both_set_raises(self) -> None:
+        from optimiser.config import _validate_signal_driven_target
+
+        with pytest.raises(ValueError, match="not both"):
+            _validate_signal_driven_target(
+                {
+                    "load_id": "test_load",
+                    "category": "signal_driven",
+                    "daily_target_kwh": 4.0,
+                    "daily_run_minutes": 240,
+                }
+            )
+
+    def test_negative_kwh_raises(self) -> None:
+        from optimiser.config import _validate_signal_driven_target
+
+        with pytest.raises(ValueError, match="must be > 0"):
+            _validate_signal_driven_target(
+                {
+                    "load_id": "test_load",
+                    "category": "signal_driven",
+                    "daily_target_kwh": -1.0,
+                }
+            )
+
+    def test_zero_minutes_raises(self) -> None:
+        from optimiser.config import _validate_signal_driven_target
+
+        with pytest.raises(ValueError, match="positive integer"):
+            _validate_signal_driven_target(
+                {
+                    "load_id": "test_load",
+                    "category": "signal_driven",
+                    "daily_run_minutes": 0,
+                }
+            )
+
+    def test_observable_skipped(self) -> None:
+        # Observable / shiftable loads don't have either field; validator
+        # must early-return for unrelated categories.
+        from optimiser.config import _validate_signal_driven_target
+
+        _validate_signal_driven_target(
+            {
+                "load_id": "mains",
+                "category": "observable",
+            }
+        )  # no exception
+
+    def test_kwh_only_passes(self) -> None:
+        from optimiser.config import _validate_signal_driven_target
+
+        _validate_signal_driven_target(
+            {
+                "load_id": "test_load",
+                "category": "signal_driven_continuous",
+                "daily_target_kwh": 4.0,
+            }
+        )
+
+    def test_minutes_only_passes(self) -> None:
+        from optimiser.config import _validate_signal_driven_target
+
+        _validate_signal_driven_target(
+            {
+                "load_id": "test_load",
+                "category": "signal_driven_continuous",
+                "daily_run_minutes": 240,
+            }
+        )

@@ -49,17 +49,28 @@
   const TEXT_COLOR = "#e8edf2";
   const GRID_COLOR = "#2a313a";
   function baseLayout(extra) {
+    const narrow = window.eoChart.isNarrow();
     return Object.assign({
       paper_bgcolor: PLOT_BG,
       plot_bgcolor: PLOT_BG,
       font: { color: TEXT_COLOR, size: 11 },
-      margin: { t: 32, l: 48, r: 12, b: 36 },
+      margin: narrow
+        ? { t: 28, l: 36, r: 6,  b: 32 }
+        : { t: 32, l: 48, r: 12, b: 36 },
       xaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR },
       yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR },
       autosize: true,
+      // `dragmode: false` on narrow lets vertical touch-scroll over the
+      // chart scroll the page instead of panning the axis. Default desktop
+      // dragmode is "zoom" — fine on these mostly-categorical bar/scatter
+      // charts where there's nothing meaningful to pan to.
+      ...window.eoChart.mobileLayoutFragment({ desktopDrag: "zoom" }),
     }, extra || {});
   }
-  const PLOT_CONFIG = { responsive: true, displayModeBar: false };
+  // Ops charts hide the modebar entirely (mobileConfig only strips a few
+  // buttons by default); merge the shared mobile defaults so scroll-zoom
+  // and touch behaviour stay consistent with the energy charts.
+  const PLOT_CONFIG = window.eoChart.mobileConfig({ displayModeBar: false });
 
   async function refreshSolve() {
     let body;
@@ -93,6 +104,7 @@
       yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "ms", rangemode: "tozero" },
       legend: { orientation: "h", y: -0.2, font: { size: 11 } },
     }), PLOT_CONFIG);
+    window.eoChart.registerPlot("ops-solve-series");
 
     // Histogram — bucketed counts
     const labels = (body.histogram || []).map(b => b.bucket);
@@ -106,6 +118,7 @@
       title: { text: "Solve time distribution", font: { size: 13, color: TEXT_COLOR } },
       yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "ticks" },
     }), PLOT_CONFIG);
+    window.eoChart.registerPlot("ops-solve-histogram");
 
     // Status mix
     const sc = body.status_counts || {};
@@ -120,6 +133,7 @@
         title: { text: "Solve status mix", font: { size: 13, color: TEXT_COLOR } },
         yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "ticks" },
       }), PLOT_CONFIG);
+      window.eoChart.registerPlot("ops-solve-status");
     } else {
       $("ops-solve-status").innerHTML = '<div class="muted">no solves in window</div>';
     }
@@ -179,6 +193,7 @@
       yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "count" },
       legend: { orientation: "h", y: -0.25, font: { size: 11 } },
     }), PLOT_CONFIG);
+    window.eoChart.registerPlot("ops-modbus-writes");
   }
 
   // ── Panel: API client health ─────────────────────────────────────
@@ -329,6 +344,14 @@
     } else {
       stopPollers();
     }
+
+    // Force every Plotly chart in the now-visible tab to re-fit. Plotly's
+    // `responsive: true` only listens to window.resize, and a chart that
+    // was display:none during a resize keeps its stale inline width
+    // afterwards — pushing the page wider than the viewport. The 50ms
+    // delay lets the browser apply the `hidden` flip before resize sees
+    // the new layout box.
+    setTimeout(() => window.eoChart.resizeAll(), 50);
   }
 
   function installWindowButtons() {
@@ -350,6 +373,58 @@
     });
   }
 
+  // Mobile-only swipe-left tab cycle, scoped to the top status strip
+  // so it never competes with vertical scrolling through long tab
+  // content or with horizontal scroll inside the ops tables.
+  // Swipe-RIGHT is intentionally not handled — browsers use that as
+  // the "back" gesture and we don't want to steal it. Swipe-left wraps
+  // around (last → first), so every tab is reachable from any other
+  // in at most N-1 swipes. Tab order is read from the DOM so adding a
+  // tab needs no code change here. Listeners are passive — vertical
+  // page-scroll is never blocked.
+  function installSwipeNav() {
+    const strip = document.getElementById("status-strip");
+    if (!strip) return;
+    const tabs = Array.from(document.querySelectorAll(".tab-btn"))
+      .map(b => b.dataset.tab)
+      .filter(Boolean);
+    if (tabs.length < 2) return;
+
+    const MIN_DX = 50;     // px of horizontal travel to count
+    const MAX_DY = 40;     // px of vertical travel ceiling — above = scroll
+    const RATIO = 1.5;     // |dx| must beat |dy| by this factor
+    const MAX_MS = 600;    // gesture must complete inside this window
+
+    let startX = 0, startY = 0, startT = 0, active = false;
+
+    strip.addEventListener("touchstart", (e) => {
+      active = false;
+      if (!window.eoChart.isNarrow()) return;
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      startX = t.clientX;
+      startY = t.clientY;
+      startT = Date.now();
+      active = true;
+    }, { passive: true });
+
+    strip.addEventListener("touchend", (e) => {
+      if (!active) return;
+      active = false;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - startX;
+      const dy = t.clientY - startY;
+      if (Date.now() - startT > MAX_MS) return;
+      if (-dx < MIN_DX) return;                      // swipe-left only
+      if (Math.abs(dy) > MAX_DY) return;
+      if (-dx < Math.abs(dy) * RATIO) return;
+
+      const idx = tabs.indexOf(opsState.activeTab);
+      if (idx < 0) return;
+      showTab(tabs[(idx + 1) % tabs.length]);
+    }, { passive: true });
+  }
+
   function installVisibilityPause() {
     document.addEventListener("visibilitychange", () => {
       if (opsState.activeTab !== "ops") return;
@@ -367,8 +442,16 @@
     if (opsState.booted) return;
     opsState.booted = true;
     installTabBar();
+    installSwipeNav();
     installWindowButtons();
     installVisibilityPause();
+    // Re-render ops charts when the viewport crosses the mobile breakpoint
+    // so dragmode + tightened margins flip cleanly without waiting for the
+    // next 30/60s poll. Cheap — every refresh* function is a no-op when
+    // its panel isn't on screen (uses Plotly.react's idempotent path).
+    window.eoChart.onBreakpointChange(() => {
+      if (opsState.activeTab === "ops") refreshAll();
+    });
   }
 
   if (document.readyState === "loading") {

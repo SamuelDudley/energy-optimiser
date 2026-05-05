@@ -161,10 +161,11 @@ const HOVER_LABEL = {
 // in lockstep with panel padding. `automargin: true` on each y-axis
 // means these are minimums; Plotly will grow them if a long tick label
 // (e.g. "1234") would otherwise clip.
+// Thin alias around the shared helper in chart-utils.js — keeps existing
+// call sites untouched while the breakpoint and matchMedia plumbing live
+// in one place. New chart code should call `eoChart.isNarrow()` directly.
 function isNarrowViewport() {
-  return typeof window !== "undefined" &&
-    window.matchMedia &&
-    window.matchMedia("(max-width: 760px)").matches;
+  return window.eoChart ? window.eoChart.isNarrow() : false;
 }
 
 // ── State ──────────────────────────────────────────────────────────
@@ -614,7 +615,13 @@ function renderStatusStrip() {
 
   setTile("pv",   ss?.pv_power_kw);
   setTile("batt", ss?.battery_power_kw);
-  setTile("grid", ss?.grid_power_kw);
+  // Grid uses the pre-dispatch read: post-dispatch captures the inverter
+  // mid-adaptive-trim (5 s after the cap write, before the cascade settles)
+  // so it can read ~0 while the actual steady-state flow is still ±kW.
+  // Pre-dispatch is the previous slot's settled reading and matches the
+  // chart's "grid measured (inverter)" trace (which sources `grid_kw` from
+  // telemetry, also pre-dispatch).
+  setTile("grid", snap.system_state?.grid_power_kw);
   setTile("load", ss?.house_load_kw);
 }
 
@@ -641,10 +648,32 @@ function renderLoads() {
     grid.innerHTML = '<div class="muted">no managed loads</div>';
     return;
   }
+  // Index configured loads by id so we can pick the right target unit.
+  const cfgByLoad = {};
+  for (const c of (state.config?.managed_loads || [])) cfgByLoad[c.load_id] = c;
   grid.innerHTML = loads.map((l) => {
     const relayCls = l.relay_on === true ? "relay-on" : "relay-off";
     const relayTxt = l.relay_on === true ? "relay ON" : (l.relay_on === false ? "relay off" : "—");
     const cycle = l.cycle_state || "—";
+    const cfg = cfgByLoad[l.load_id] || {};
+    let progressText = "—";
+    if (cfg.daily_run_minutes != null) {
+      // Time mode — relay-on minutes today vs target.
+      const got = l.relay_on_minutes_today != null ? l.relay_on_minutes_today : 0;
+      progressText = `${got.toFixed(0)} / ${cfg.daily_run_minutes} min today`;
+    } else if (l.energy_today_kwh != null) {
+      // Energy mode — kWh delivered vs target (target may be unset for
+      // observable loads; show absolute kWh in that case). Energy is net
+      // (imp − exp) so a bidirectional CT (mains) can read negative —
+      // label sign explicitly so "import 0.5" vs "export 25" is unambiguous.
+      if (cfg.daily_target_kwh != null) {
+        progressText = `${l.energy_today_kwh.toFixed(2)} / ${cfg.daily_target_kwh.toFixed(2)} kWh today`;
+      } else {
+        const v = l.energy_today_kwh;
+        const dir = v >= 0 ? "imported" : "exported";
+        progressText = `${Math.abs(v).toFixed(2)} kWh ${dir} today`;
+      }
+    }
     return `
       <div class="load-card">
         <div class="load-card-header">
@@ -653,7 +682,7 @@ function renderLoads() {
         </div>
         <div class="load-card-power">${fmtKW(l.power_kw)}</div>
         <div class="load-card-energy">
-          ${l.energy_today_kwh != null ? l.energy_today_kwh.toFixed(2) + " kWh today" : "—"}
+          ${escapeHtml(progressText)}
           · <span class="${relayCls}">${escapeHtml(relayTxt)}</span>
         </div>
       </div>`;
@@ -1325,8 +1354,8 @@ function buildLayout() {
     hoverlabel: HOVER_LABEL,
     // Desktop: drag pans. Mobile: disable drag entirely so vertical
     // touch-scroll over the figure scrolls the page instead of moving
-    // the x-axis around.
-    dragmode: narrow ? false : "pan",
+    // the x-axis around. Shared helper — see chart-utils.js.
+    ...window.eoChart.mobileLayoutFragment({ desktopDrag: "pan" }),
     shapes,
     annotations,
     xaxis: {
@@ -1380,11 +1409,9 @@ async function redrawTSFigure() {
   const traces = buildTraces();
   const layout = buildLayout();
   if (!state.built.ts) {
-    await Plotly.newPlot(div, traces, layout, {
-      responsive: true, displaylogo: false, scrollZoom: false,
-      modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d", "zoom2d"],
-    });
+    await Plotly.newPlot(div, traces, layout, window.eoChart.mobileConfig());
     state.built.ts = true;
+    window.eoChart.registerPlot("ts-figure");
     div.on("plotly_hover", onPlotlyHover);
     div.on("plotly_click", onPlotlyClick);
   } else {
@@ -1564,6 +1591,7 @@ async function redrawSankey() {
     responsive: true, displaylogo: false,
   });
   state.built.sankey = true;
+  window.eoChart.registerPlot("sankey-figure");
 }
 
 function sankeyLayout() {
@@ -1662,6 +1690,7 @@ async function redrawDailySankey() {
     responsive: true, displaylogo: false,
   });
   state.built.sankeyToday = true;
+  window.eoChart.registerPlot("sankey-today-figure");
 }
 
 // ── Daily spend panel ──────────────────────────────────────────────
@@ -1734,6 +1763,9 @@ async function redrawDailySpend() {
     paper_bgcolor: "#161b22",
     plot_bgcolor: "#0e1116",
     font: { color: "#e8edf2", family: FONT_FAMILY, size: 12 },
+    // Categorical x-axis — "zoom" is the desktop default; on narrow we
+    // disable drag so vertical touch-scroll keeps the page moving.
+    ...window.eoChart.mobileLayoutFragment({ desktopDrag: "zoom" }),
     barmode: "relative",
     showlegend: true,
     legend: {
@@ -1763,11 +1795,9 @@ async function redrawDailySpend() {
   };
 
   if (!state.built.spend) {
-    await Plotly.newPlot(div, traces, layout, {
-      responsive: true, displaylogo: false,
-      modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d"],
-    });
+    await Plotly.newPlot(div, traces, layout, window.eoChart.mobileConfig());
     state.built.spend = true;
+    window.eoChart.registerPlot("spend-figure");
   } else {
     await Plotly.react(div, traces, layout);
   }
@@ -2104,20 +2134,15 @@ async function main() {
   installRangeBar();
 
   // When the viewport crosses the mobile breakpoint (rotation, resize),
-  // re-run the layout for each plot so the chart-margin overrides flip
-  // in/out cleanly. Plotly's `responsive: true` only resizes — it doesn't
-  // re-evaluate margins based on our isNarrowViewport check.
-  if (window.matchMedia) {
-    const mq = window.matchMedia("(max-width: 760px)");
-    const onChange = () => {
-      if (state.built.ts) redrawTSFigure();
-      if (state.built.spend) redrawDailySpend();
-      if (state.built.sankey) redrawSankey();
-      if (state.built.sankeyToday) redrawDailySankey();
-    };
-    if (mq.addEventListener) mq.addEventListener("change", onChange);
-    else if (mq.addListener) mq.addListener(onChange);
-  }
+  // re-run the layout for each plot so the chart-margin and dragmode
+  // overrides flip in/out cleanly. Plotly's `responsive: true` only
+  // resizes — it doesn't re-evaluate the narrow-viewport branch.
+  window.eoChart.onBreakpointChange(() => {
+    if (state.built.ts) redrawTSFigure();
+    if (state.built.spend) redrawDailySpend();
+    if (state.built.sankey) redrawSankey();
+    if (state.built.sankeyToday) redrawDailySankey();
+  });
 
   if (!ensureToken()) return;
 

@@ -12,7 +12,7 @@ from typing import Protocol, runtime_checkable
 import duckdb
 from aiohttp import web
 
-from ..config import APIConfig, BatteryConfig
+from ..config import APIConfig, BatteryConfig, ManagedLoadConfig
 from ..types import TickSnapshot
 from .log_buffer import RingBufferHandler
 from .metrics import Metrics
@@ -46,6 +46,10 @@ class ServiceProbe(Protocol):
     # Exposed for /dashboard/config so the SOC panel can draw the floor
     # line at the actual configured value rather than a hardcoded default.
     battery_config: BatteryConfig
+    # Managed-load configs. Exposed for /dashboard/config so the load
+    # cards can render the right target unit (kWh vs minutes) and
+    # progress fraction without rebuilding state per tick.
+    managed_load_configs: list[ManagedLoadConfig]
 
 
 # Typed app key — handlers retrieve the probe via

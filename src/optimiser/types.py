@@ -277,8 +277,6 @@ class SystemState:
     cell_temp_max_c: float | None = None
     cell_temp_min_c: float | None = None
     cell_volt_avg_v: float | None = None
-    cell_volt_max_v: float | None = None
-    cell_volt_min_v: float | None = None
     pcs_temp_c: float | None = None
 
     # BMS-reported real-time power limits. Drop below nameplate when the
@@ -340,6 +338,11 @@ class ManagedLoadStatus:
     # min-on/min-off constraints don't bind slot 0 (no slot -1 to subtract
     # from), so a fresh tick could turn off mid-block.
     relay_state_since: datetime | None = None
+    # Cumulative relay-on minutes since local midnight. Parallel accumulator
+    # to energy_today_kwh — feeds the time-mode daily-run constraint
+    # (BinarySignalDrivenLoad with daily_run_minutes set). None when the load
+    # has no relay or we haven't accumulated yet.
+    relay_on_minutes_today: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,8 +491,6 @@ class TelemetryRow:
     cell_temp_max_c: float | None = None
     cell_temp_min_c: float | None = None
     cell_volt_avg_v: float | None = None
-    cell_volt_max_v: float | None = None
-    cell_volt_min_v: float | None = None
     pcs_temp_c: float | None = None
     available_charge_kw: float | None = None
     available_discharge_kw: float | None = None

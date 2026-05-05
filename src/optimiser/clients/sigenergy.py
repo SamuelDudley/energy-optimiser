@@ -71,8 +71,6 @@ REG_INVERTER_ALARM4 = 30608  # U16 (Appendix 5)
 REG_INVERTER_ALARM5 = 30609  # U16 (Appendix 11)
 REG_INVERTER_ESS_CELL_TEMP_MAX = 30620  # S16 gain=10
 REG_INVERTER_ESS_CELL_TEMP_MIN = 30621  # S16 gain=10
-REG_INVERTER_ESS_CELL_VOLT_MAX = 30622  # U16 gain=1000
-REG_INVERTER_ESS_CELL_VOLT_MIN = 30623  # U16 gain=1000
 
 # PCS (power conversion system) internal temperature — relevant for
 # summer derating modelling.
@@ -658,12 +656,6 @@ class SigenergyController:
         cell_volt_avg_v = await self._read_input_u16_scaled(
             REG_INVERTER_ESS_CELL_VOLT_AVG, gain=1000, slave_id=inv
         )
-        cell_volt_max_v = await self._read_input_u16_scaled(
-            REG_INVERTER_ESS_CELL_VOLT_MAX, gain=1000, slave_id=inv
-        )
-        cell_volt_min_v = await self._read_input_u16_scaled(
-            REG_INVERTER_ESS_CELL_VOLT_MIN, gain=1000, slave_id=inv
-        )
         pcs_temp_c = await self._read_input_s16(REG_INVERTER_PCS_TEMP, gain=10, slave_id=inv)
 
         # Dynamic power constraints (plant slave)
@@ -747,8 +739,6 @@ class SigenergyController:
             "cell_temp_max_c": cell_temp_max_c,
             "cell_temp_min_c": cell_temp_min_c,
             "cell_volt_avg_v": cell_volt_avg_v,
-            "cell_volt_max_v": cell_volt_max_v,
-            "cell_volt_min_v": cell_volt_min_v,
             "pcs_temp_c": pcs_temp_c,
             "available_charge_kw": available_charge_kw,
             "available_discharge_kw": available_discharge_kw,
