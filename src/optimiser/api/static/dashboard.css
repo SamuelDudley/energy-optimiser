@@ -18,7 +18,7 @@
   --load: #c9d1d9;
   --planned: #8b949e;
 
-  --ts-figure-h: 980px;
+  --ts-figure-h: 1120px;
   --sankey-figure-h: 460px;
   --spend-figure-h: 320px;
 }
@@ -257,7 +257,7 @@ main {
 /* ── Tablet (≤ 1100px): two-column grid stays, but tighter ──────── */
 @media (max-width: 1100px) {
   :root {
-    --ts-figure-h: 820px;
+    --ts-figure-h: 940px;
     --sankey-figure-h: 360px;
     --spend-figure-h: 280px;
   }
@@ -266,7 +266,7 @@ main {
 /* ── Phone-sized (≤ 760px): single column everywhere ───────────── */
 @media (max-width: 760px) {
   :root {
-    --ts-figure-h: 720px;
+    --ts-figure-h: 820px;
     --sankey-figure-h: 320px;
     --spend-figure-h: 260px;
   }
@@ -458,7 +458,7 @@ main {
 /* ── Very narrow (≤ 420px): tighten further ────────────────────── */
 @media (max-width: 420px) {
   :root {
-    --ts-figure-h: 640px;
+    --ts-figure-h: 740px;
   }
   .status-value { font-size: 15px; }
   .tile-value { font-size: 14px; }

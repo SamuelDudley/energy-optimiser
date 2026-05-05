@@ -183,7 +183,7 @@ function hexToRgba(hex, alpha) {
   const b = parseInt(h.slice(4, 6), 16);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
-const PANEL_GAP = 0.02;
+const PANEL_GAP = 0.03;
 
 // Shared figure styling. One font stack used everywhere so the dashboard
 // reads consistently across panels.
