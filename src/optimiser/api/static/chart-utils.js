@@ -53,6 +53,12 @@
         responsive: true,
         displaylogo: false,
         scrollZoom: false,
+        // On touch devices a single tap on a trace can be interpreted
+        // as a double-click (300ms-window pattern), triggering Plotly's
+        // default `doubleClick: "reset+autosize"` which rewrites the
+        // axis ranges and re-ticks the x-axis. Disable it so a tap
+        // never reflows the chart.
+        doubleClick: false,
         modeBarButtonsToRemove: [
           "select2d",
           "lasso2d",

@@ -44,22 +44,64 @@
 
   // ── Panel: LP solve performance ──────────────────────────────────
 
-  // Shared Plotly base layout — dark theme that matches the energy charts.
-  const PLOT_BG = "rgba(0,0,0,0)";
+  // Theme constants — kept in sync with the energy charts in dashboard.js
+  // so the two tabs feel like one product. Anything that diverges here
+  // will read as "this is a different page" on the user's eye.
+  const PANEL_BG = "#161b22";
+  const PLOT_BG = "#0e1116";
+  const GRID_COLOR = "#21262d";
+  const TICK_COLOR = "#444c56";
+  const TICK_FONT_COLOR = "#c9d1d9";
   const TEXT_COLOR = "#e8edf2";
-  const GRID_COLOR = "#2a313a";
+  const LABEL_COLOR = "#7d8590";
+  const FONT_FAMILY =
+    'Inter, "Segoe UI Variable", "Segoe UI", ui-sans-serif, system-ui, ' +
+    '-apple-system, Roboto, "Helvetica Neue", Arial, sans-serif';
+  const HOVER_LABEL = {
+    bgcolor: PANEL_BG,
+    bordercolor: TICK_COLOR,
+    font: { family: FONT_FAMILY, size: 12, color: TEXT_COLOR },
+  };
+  // Panel-label annotation in the same style energy charts use: bold
+  // label + grey unit suffix, anchored top-left of the plot area.
+  function panelLabel(label, units) {
+    const text = units
+      ? `<b>${label}</b>  <span style="color:${LABEL_COLOR}">${units}</span>`
+      : `<b>${label}</b>`;
+    return [{
+      xref: "paper", yref: "paper",
+      x: 0, y: 1,
+      xanchor: "left", yanchor: "bottom",
+      yshift: 2,
+      text,
+      showarrow: false,
+      font: { family: FONT_FAMILY, size: 11, color: TICK_FONT_COLOR },
+      align: "left",
+    }];
+  }
+  function axis(extra) {
+    return Object.assign({
+      gridcolor: GRID_COLOR,
+      zerolinecolor: GRID_COLOR,
+      tickfont: { size: 12, color: TICK_FONT_COLOR },
+      tickcolor: TICK_COLOR,
+      ticklen: 3,
+      automargin: true,
+    }, extra || {});
+  }
   function baseLayout(extra) {
     const narrow = window.eoChart.isNarrow();
     return Object.assign({
-      paper_bgcolor: PLOT_BG,
+      paper_bgcolor: PANEL_BG,
       plot_bgcolor: PLOT_BG,
-      font: { color: TEXT_COLOR, size: 11 },
+      font: { color: TEXT_COLOR, family: FONT_FAMILY, size: 12 },
       margin: narrow
-        ? { t: 28, l: 36, r: 6,  b: 32 }
-        : { t: 32, l: 48, r: 12, b: 36 },
-      xaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR },
-      yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR },
+        ? { t: 22, l: 36, r: 6,  b: 32 }
+        : { t: 26, l: 48, r: 12, b: 36 },
+      xaxis: axis(),
+      yaxis: axis(),
       autosize: true,
+      hoverlabel: HOVER_LABEL,
       // `dragmode: false` on narrow lets vertical touch-scroll over the
       // chart scroll the page instead of panning the axis. Default desktop
       // dragmode is "zoom" — fine on these mostly-categorical bar/scatter
@@ -68,8 +110,9 @@
     }, extra || {});
   }
   // Ops charts hide the modebar entirely (mobileConfig only strips a few
-  // buttons by default); merge the shared mobile defaults so scroll-zoom
-  // and touch behaviour stay consistent with the energy charts.
+  // buttons by default); merge the shared mobile defaults so scroll-zoom,
+  // touch behaviour and doubleClick:false stay consistent with the energy
+  // charts.
   const PLOT_CONFIG = window.eoChart.mobileConfig({ displayModeBar: false });
 
   async function refreshSolve() {
@@ -100,9 +143,10 @@
       marker: { size: 5, color: STATUS_COLOR[status] || "#58a6ff" },
     }));
     Plotly.react("ops-solve-series", seriesTraces, baseLayout({
-      title: { text: "Solve time (ms) per tick", font: { size: 13, color: TEXT_COLOR } },
-      yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "ms", rangemode: "tozero" },
-      legend: { orientation: "h", y: -0.2, font: { size: 11 } },
+      annotations: panelLabel("SOLVE TIME", "ms per tick"),
+      yaxis: axis({ rangemode: "tozero" }),
+      hovermode: "x unified",
+      legend: { orientation: "h", y: -0.2, font: { size: 11, family: FONT_FAMILY } },
     }), PLOT_CONFIG);
     window.eoChart.registerPlot("ops-solve-series");
 
@@ -115,8 +159,7 @@
       y: counts,
       marker: { color: "#58a6ff" },
     }], baseLayout({
-      title: { text: "Solve time distribution", font: { size: 13, color: TEXT_COLOR } },
-      yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "ticks" },
+      annotations: panelLabel("DISTRIBUTION", "ticks"),
     }), PLOT_CONFIG);
     window.eoChart.registerPlot("ops-solve-histogram");
 
@@ -130,8 +173,7 @@
         y: sks.map(k => sc[k]),
         marker: { color: sks.map(k => STATUS_COLOR[k] || "#8b949e") },
       }], baseLayout({
-        title: { text: "Solve status mix", font: { size: 13, color: TEXT_COLOR } },
-        yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "ticks" },
+        annotations: panelLabel("STATUS MIX", "ticks"),
       }), PLOT_CONFIG);
       window.eoChart.registerPlot("ops-solve-status");
     } else {
@@ -187,11 +229,10 @@
       { type: "bar", name: "ok",  x: regs, y: regs.map(r => byReg[r].ok),  marker: { color: "#3fb950" } },
       { type: "bar", name: "err", x: regs, y: regs.map(r => byReg[r].err), marker: { color: "#f85149" } },
     ], baseLayout({
-      title: { text: "Writes per register", font: { size: 13, color: TEXT_COLOR } },
+      annotations: panelLabel("WRITES PER REGISTER", "count"),
       barmode: "stack",
-      xaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "register", type: "category" },
-      yaxis: { gridcolor: GRID_COLOR, zerolinecolor: GRID_COLOR, title: "count" },
-      legend: { orientation: "h", y: -0.25, font: { size: 11 } },
+      xaxis: axis({ type: "category" }),
+      legend: { orientation: "h", y: -0.25, font: { size: 11, family: FONT_FAMILY } },
     }), PLOT_CONFIG);
     window.eoChart.registerPlot("ops-modbus-writes");
   }
