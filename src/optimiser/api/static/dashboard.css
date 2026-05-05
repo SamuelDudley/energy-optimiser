@@ -90,6 +90,9 @@ header.strip {
 /* Dual-label spans: short variant is hidden by default; mobile flips it. */
 .tile-label .lbl-short { display: none; }
 .tile-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
+/* Mode tile reads in caps so it visually matches the chart's MODE
+   ribbon hover labels and the strip's SERVICE state pill (ACTIVE). */
+#tile-mode .tile-value { text-transform: uppercase; }
 
 #cursor-now-btn {
   margin-top: 4px;
