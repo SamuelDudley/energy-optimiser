@@ -641,15 +641,13 @@ function renderStatusStrip() {
   const tickAgeEl = document.getElementById("status-tick-age");
   const socEl = document.getElementById("status-soc");
   const sohEl = document.getElementById("status-soh");
-  const dispModeEl = document.getElementById("status-dispatch-mode");
-  const dispDetailEl = document.getElementById("status-dispatch-detail");
 
   if (!snap) {
     stateEl.textContent = "no plan";
     stateEl.className = "status-value status-state-unknown";
     tickAgeEl.textContent = "—";
     socEl.textContent = "—"; sohEl.textContent = "—";
-    dispModeEl.textContent = "—"; dispDetailEl.textContent = "—";
+    setModeTile(null);
     setTile("pv", null); setTile("batt", null); setTile("grid", null); setTile("load", null);
     return;
   }
@@ -684,27 +682,11 @@ function renderStatusStrip() {
   socEl.textContent = fmtPct(ss?.soc_pct);
   sohEl.textContent = ss?.soh_pct != null ? `SOH ${ss.soh_pct.toFixed(1)}%` : "SOH —";
 
-  // Dispatch (mode + cap + signed intent).
-  const disp = snap.lp_dispatch;
-  if (!disp) {
-    dispModeEl.textContent = "—"; dispDetailEl.textContent = "—";
-  } else {
-    const modeName = (function () {
-      switch (disp.mode) {
-        case 0: return "PCS_REMOTE_CONTROL";
-        case 1: return "STANDBY";
-        case 2: return "MAX_SELF_CONSUME";
-        case 3: return "CHARGE_GRID_FIRST";
-        case 4: return "CHARGE_PV_FIRST";
-        case 5: return "DISCHARGE_PV_FIRST";
-        case 6: return "DISCHARGE_ESS_FIRST";
-        default: return `mode ${disp.mode}`;
-      }
-    })();
-    dispModeEl.textContent = `${disp.kind} · m${disp.mode}`;
-    dispDetailEl.textContent =
-      `${modeName} · cap ${disp.cap_kw.toFixed(2)} kW · intent ${disp.signed_intent_kw.toFixed(2)} kW`;
-  }
+  // Mode lives inline with the live-flow tiles. setModeTile colours the
+  // value text in the matching MODE-ribbon hue and stashes the verbose
+  // detail (mode name + cap + intent) in the tile's `title` attribute
+  // so a hover surfaces the diagnostic line that used to live below.
+  setModeTile(snap.lp_dispatch);
 
   setTile("pv",   ss?.pv_power_kw);
   setTile("batt", ss?.battery_power_kw);
@@ -716,6 +698,59 @@ function renderStatusStrip() {
   // telemetry, also pre-dispatch).
   setTile("grid", snap.system_state?.grid_power_kw);
   setTile("load", ss?.house_load_kw);
+}
+
+// Render the MODE tile in the live-flow tile-row. Value text is coloured
+// to match the chart's MODE ribbon, so the strip and the chart share one
+// vocabulary. Verbose detail (mode name + cap + intent) goes on the tile
+// `title` for a hover-on tooltip; the tile shape itself is the same as
+// PV/BATTERY/GRID/HOUSE for visual consistency.
+function setModeTile(disp) {
+  const tile = document.getElementById("tile-mode");
+  if (!tile) return;
+  const v = tile.querySelector(".tile-value");
+  if (!disp) {
+    v.textContent = "—";
+    tile.style.borderLeftColor = "";
+    tile.title = "";
+    return;
+  }
+  const modeKey = modeFromDispatch(disp);
+  const c = MODE_COLORS[modeKey];
+  // Colour the tile's left edge in the MODE-ribbon hue — `.tile-mode`
+  // sets a thicker left border in CSS; this paints it.
+  tile.style.borderLeftColor = c;
+  v.textContent = `m${disp.mode} · ${disp.kind.toLowerCase()}`;
+  const modeName = (function () {
+    switch (disp.mode) {
+      case 0: return "PCS_REMOTE_CONTROL";
+      case 1: return "STANDBY";
+      case 2: return "MAX_SELF_CONSUME";
+      case 3: return "CHARGE_GRID_FIRST";
+      case 4: return "CHARGE_PV_FIRST";
+      case 5: return "DISCHARGE_PV_FIRST";
+      case 6: return "DISCHARGE_ESS_FIRST";
+      default: return `mode ${disp.mode}`;
+    }
+  })();
+  tile.title =
+    `${modeName} · cap ${disp.cap_kw.toFixed(2)} kW · intent ${disp.signed_intent_kw.toFixed(2)} kW`;
+}
+
+// Map an LPDispatch (mode + kind) to one of the MODE enum values so the
+// strip's mode tile picks the same colour as the chart's MODE ribbon.
+function modeFromDispatch(disp) {
+  if (!disp) return MODE.UNKNOWN;
+  const m = disp.mode;
+  const k = (disp.kind || "").toUpperCase();
+  if (m === 2) {
+    return k === "CHARGE" ? MODE.M2_CHARGE : MODE.M2_IDLE;
+  }
+  if (m === 3) return MODE.M3_CHARGE;
+  if (m === 5) return MODE.M5_DIS_PV;
+  if (m === 6) return MODE.M6_DIS_ESS;
+  if (m === 0 || m === 1) return MODE.M0_STANDBY;
+  return MODE.UNKNOWN;
 }
 
 function setTile(id, value) {

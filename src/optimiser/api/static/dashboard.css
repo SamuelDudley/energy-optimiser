@@ -58,6 +58,14 @@ header.strip {
 .status-state-fallback   { color: var(--bad);  }
 .status-state-unknown    { color: var(--muted); }
 
+/* The mode tile (#tile-mode) sits inline with the live-flow tiles.
+   Its left border picks up the MODE-ribbon hue (set inline by
+   renderStatusStrip) — same vocabulary as the chart's MODE ribbon. */
+#tile-mode {
+  border-left-width: 3px;
+  padding-left: 10px;  /* compensate so contents don't shift */
+}
+
 .tile-row {
   display: flex;
   flex-wrap: wrap;
@@ -295,21 +303,16 @@ main {
     color: var(--muted);
     /* keep the existing tracking from the desktop rule */
   }
-  /* Drop SERVICE + DISPATCH labels — green ACTIVE pill is self-evident,
-     "self_consume · m2" is unique enough not to need a "DISPATCH" prefix.
-     SOC label kept (a bare 98.5% could be SOC or SOH at a glance). */
-  #status-strip > .status-block:first-child .status-label,
-  #status-strip > .status-block:nth-child(3) .status-label { display: none; }
+  /* Drop SERVICE label — green ACTIVE pill is self-evident. SOC label
+     kept (a bare 98.5% could be SOC or SOH at a glance). */
+  #status-strip > .status-block:first-child .status-label { display: none; }
   .status-value {
     font-size: 14px;
     font-variant-numeric: tabular-nums;
   }
   .status-sub { font-size: 11px; margin-top: 0; color: var(--muted); }
-  /* SOH and dispatch-detail are diagnostic-only; drop on mobile to
-     keep row 1 single-line. The values are still in the snapshot for
-     anyone who needs them. */
-  #status-soh,
-  #status-dispatch-detail { display: none; }
+  /* SOH is diagnostic-only; drop on mobile to keep row 1 single-line. */
+  #status-soh { display: none; }
   /* Drop the "· v0.2.0" suffix on mobile — version isn't scannable info
      on a phone, and "24s" alone tells you the service is alive. */
   #status-tick-age .tick-version { display: none; }
