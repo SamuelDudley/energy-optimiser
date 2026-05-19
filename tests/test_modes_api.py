@@ -154,7 +154,7 @@ async def test_post_conserve_valid(client) -> None:
 
 
 async def test_suggest_buy_ceiling(client) -> None:
-    """Suggest median(in-window import) + 3c for a 2h window."""
+    """Suggest 75th percentile of in-window import prices."""
     from optimiser.types import PriceInterval
 
     base = datetime.now(UTC)
@@ -176,12 +176,13 @@ async def test_suggest_buy_ceiling(client) -> None:
     resp = await client.get("/modes/suggest?kind=buy&duration_minutes=40")
     assert resp.status == 200
     body = await resp.json()
-    # Median of [5, 6, 7, 8, 9, 10, 11, 12] = 8.5; +3 = 11.5
-    assert body["suggested_ceiling_c_per_kwh"] == pytest.approx(11.5, abs=0.01)
+    # 75th percentile of [5..12] via linear interpolation:
+    # idx = 0.75 * 7 = 5.25 → 10 * 0.75 + 11 * 0.25 = 10.25
+    assert body["suggested_ceiling_c_per_kwh"] == pytest.approx(10.25, abs=0.01)
 
 
 async def test_suggest_conserve_floor(client) -> None:
-    """Suggest p70(in-window export) for a 2h window."""
+    """Suggest 75th percentile of in-window export prices."""
     from optimiser.types import PriceInterval
 
     base = datetime.now(UTC)
@@ -203,5 +204,6 @@ async def test_suggest_conserve_floor(client) -> None:
     resp = await client.get("/modes/suggest?kind=conserve&duration_minutes=50")
     assert resp.status == 200
     body = await resp.json()
-    # 70th percentile of [5, 6, 7, 8, 9, 10, 15, 20, 25, 30] ≈ 18.0 (±0.5 tolerance)
-    assert 16.5 <= body["suggested_floor_c_per_kwh"] <= 22.0
+    # 75th percentile of [5, 6, 7, 8, 9, 10, 15, 20, 25, 30]:
+    # idx = 0.75 * 9 = 6.75 → 15 * 0.25 + 20 * 0.75 = 18.75
+    assert body["suggested_floor_c_per_kwh"] == pytest.approx(18.75, abs=0.01)

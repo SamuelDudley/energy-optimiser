@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import statistics
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -124,22 +123,38 @@ async def suggest(request: web.Request) -> web.Response:
         return _bad("no price data available for window")
 
     if kind == "buy":
-        imports = sorted(p.import_per_kwh for p in strip if p.import_per_kwh is not None)
-        if not imports:
+        values = sorted(p.import_per_kwh for p in strip if p.import_per_kwh is not None)
+        if not values:
             return _bad("no import prices available")
-        suggested = statistics.median(imports) + 3.0
-        return web.json_response({"suggested_ceiling_c_per_kwh": round(suggested, 2)})
+        return web.json_response(
+            {"suggested_ceiling_c_per_kwh": round(_percentile_linear(values, 0.75), 2)}
+        )
     else:
-        exports = sorted(p.export_per_kwh for p in strip if p.export_per_kwh is not None)
-        if not exports:
+        values = sorted(p.export_per_kwh for p in strip if p.export_per_kwh is not None)
+        if not values:
             return _bad("no export prices available")
-        # 70th percentile via linear interpolation.
-        idx_f = 0.7 * (len(exports) - 1)
-        lo = int(idx_f)
-        hi = min(lo + 1, len(exports) - 1)
-        frac = idx_f - lo
-        suggested = exports[lo] * (1 - frac) + exports[hi] * frac
-        return web.json_response({"suggested_floor_c_per_kwh": round(suggested, 2)})
+        return web.json_response(
+            {"suggested_floor_c_per_kwh": round(_percentile_linear(values, 0.75), 2)}
+        )
+
+
+def _percentile_linear(sorted_values: list[float], q: float) -> float:
+    """Linearly-interpolated percentile of a pre-sorted list.
+
+    `q` is a fraction in [0, 1]. Matches numpy's default ``linear`` mode
+    (sometimes called `q*(N-1)` interpolation). Used for both
+    suggestions so buy ceiling and conserve floor read off the same
+    statistic at the 75th percentile of in-window prices.
+    """
+    if not sorted_values:
+        raise ValueError("sorted_values must be non-empty")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    idx_f = q * (len(sorted_values) - 1)
+    lo = int(idx_f)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = idx_f - lo
+    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
 def register_modes_routes(app: web.Application) -> None:

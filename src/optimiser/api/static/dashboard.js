@@ -2577,7 +2577,7 @@ const ModesUI = (() => {
         thresholdInput.value = value;
         hint.textContent =
           `Suggested ${currentKind === "buy" ? "ceiling" : "floor"}: ${value} c/kWh ` +
-          `(${currentKind === "buy" ? "median + 3c" : "70th percentile"} of in-window ${currentKind === "buy" ? "import" : "export"} prices)`;
+          `(75th percentile of in-window ${currentKind === "buy" ? "import" : "export"} prices)`;
       } else {
         hint.textContent = "No suggestion available for this window.";
       }
