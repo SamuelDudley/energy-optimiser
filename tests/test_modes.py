@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from optimiser.modes import ActiveMode, ModeOverrides
+
+from optimiser.modes import ActiveMode, ModeManager, ModeOverrides
 
 # Synthetic "now" sits far in the future so wall-clock checks in _load()
 # (which uses datetime.now(UTC) to detect already-expired entries on
@@ -85,3 +86,36 @@ class TestModeOverrides:
         )
         assert with_buy.any_buy_active() is True
         assert with_buy.any_conserve_active() is False
+
+
+class TestModeManagerPersistence:
+    def test_load_when_file_absent(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        assert mgr.active(NOW) == []
+
+    def test_round_trip_through_disk(self, tmp_path) -> None:
+        path = tmp_path / "active_modes.json"
+        mgr = ModeManager(path)
+        m = ActiveMode(
+            kind="buy",
+            end_at=NOW + timedelta(hours=2),
+            params={"ceiling_c_per_kwh": 12.0},
+            activated_at=NOW,
+            source="dashboard",
+        )
+        mgr.activate(m)
+
+        # A fresh manager reads the same file.
+        mgr2 = ModeManager(path)
+        active = mgr2.active(NOW)
+        assert len(active) == 1
+        assert active[0].kind == "buy"
+        assert active[0].params["ceiling_c_per_kwh"] == 12.0
+
+    def test_corrupt_file_starts_empty_and_does_not_raise(self, tmp_path) -> None:
+        path = tmp_path / "active_modes.json"
+        path.write_text("this is not json")
+        mgr = ModeManager(path)
+        # Corrupt JSON is treated like a missing file: empty state, log a warning,
+        # don't crash the service.
+        assert mgr.active(NOW) == []

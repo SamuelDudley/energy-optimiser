@@ -12,9 +12,14 @@ for the implementation plan.
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 ModeKind = Literal["buy", "conserve"]
 _KINDS: tuple[ModeKind, ...] = ("buy", "conserve")
@@ -93,3 +98,66 @@ class ModeOverrides:
 
     def any_conserve_active(self) -> bool:
         return any(self.conserve_active_at)
+
+
+class ModeManager:
+    """In-memory + JSON-persisted set of active user-strategy modes.
+
+    At most one mode of each kind is active at a time. Re-activating a
+    kind replaces the existing entry. Expired entries are dropped lazily
+    on the next call to ``active()`` — that's also when MODE_EXPIRED is
+    emitted, so callers see a deterministic event stream.
+
+    The JSON file is rewritten on every state change. Corrupt files are
+    treated like a missing file (empty state + warning); we never crash
+    the service trying to parse junk.
+    """
+
+    def __init__(self, state_path: Path) -> None:
+        self._state_path = Path(state_path)
+        self._modes: dict[str, ActiveMode] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self._state_path.exists():
+            return
+        try:
+            raw = json.loads(self._state_path.read_text())
+        except (OSError, ValueError):
+            logger.warning(
+                "active_modes file corrupt or unreadable; starting empty (%s)",
+                self._state_path,
+            )
+            return
+        for kind, payload in (raw or {}).items():
+            if payload is None:
+                continue
+            try:
+                self._modes[kind] = ActiveMode.from_dict(payload)
+            except (KeyError, ValueError):
+                logger.warning("dropping malformed mode entry %r", kind)
+
+    def _persist(self) -> None:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {kind: m.to_dict() for kind, m in self._modes.items()}
+        # Atomic-ish write: tmp file + rename so a crash mid-write
+        # doesn't leave a truncated JSON the next start can't parse.
+        tmp = self._state_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(self._state_path)
+
+    def activate(self, mode: ActiveMode) -> ActiveMode:
+        """Insert (or replace) an active mode. Persists to disk."""
+        self._modes[mode.kind] = mode
+        self._persist()
+        return mode
+
+    def active(self, now: datetime) -> list[ActiveMode]:
+        """Return currently-active modes, dropping any past their end_at.
+
+        Lazy expiry: this is the only place expired modes are pruned.
+        Service should call this each tick so MODE_EXPIRED fires close
+        to actual expiry.
+        """
+        # Expiry handling added in Task 5.
+        return list(self._modes.values())
