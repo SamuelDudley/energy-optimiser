@@ -119,3 +119,74 @@ class TestModeManagerPersistence:
         # Corrupt JSON is treated like a missing file: empty state, log a warning,
         # don't crash the service.
         assert mgr.active(NOW) == []
+
+
+class TestModeManagerActivateCancel:
+    def test_activate_emits_event(self, tmp_path, monkeypatch) -> None:
+        events: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            "optimiser.modes.emit",
+            lambda et, payload: events.append((et.name, payload)),
+        )
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        m = ActiveMode(
+            kind="buy",
+            end_at=NOW + timedelta(hours=2),
+            params={"ceiling_c_per_kwh": 12.0},
+            activated_at=NOW,
+            source="dashboard",
+        )
+        mgr.activate(m)
+        assert any(et == "MODE_ACTIVATED" for et, _ in events)
+        # Payload carries the essentials for replay/audit.
+        activated = next(p for et, p in events if et == "MODE_ACTIVATED")
+        assert activated["kind"] == "buy"
+        assert activated["params"]["ceiling_c_per_kwh"] == 12.0
+
+    def test_activate_replaces_existing(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        m1 = ActiveMode(
+            kind="buy",
+            end_at=NOW + timedelta(hours=1),
+            params={"ceiling_c_per_kwh": 10.0},
+            activated_at=NOW,
+            source="dashboard",
+        )
+        m2 = ActiveMode(
+            kind="buy",
+            end_at=NOW + timedelta(hours=3),
+            params={"ceiling_c_per_kwh": 14.0},
+            activated_at=NOW + timedelta(minutes=5),
+            source="dashboard",
+        )
+        mgr.activate(m1)
+        mgr.activate(m2)
+        active = mgr.active(NOW)
+        assert len(active) == 1
+        assert active[0].params["ceiling_c_per_kwh"] == 14.0
+
+    def test_cancel_emits_event_and_removes(self, tmp_path, monkeypatch) -> None:
+        events: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            "optimiser.modes.emit",
+            lambda et, payload: events.append((et.name, payload)),
+        )
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="conserve",
+                end_at=NOW + timedelta(hours=2),
+                params={"floor_c_per_kwh": 18.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        events.clear()
+        result = mgr.cancel("conserve")
+        assert result is True
+        assert mgr.active(NOW) == []
+        assert any(et == "MODE_EXPIRED" and p["reason"] == "user_cancelled" for et, p in events)
+
+    def test_cancel_returns_false_when_not_active(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        assert mgr.cancel("buy") is False

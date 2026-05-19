@@ -19,6 +19,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from .logging_utils import emit
+from .types import EventType
+
 logger = logging.getLogger(__name__)
 
 ModeKind = Literal["buy", "conserve"]
@@ -147,10 +150,29 @@ class ModeManager:
         tmp.replace(self._state_path)
 
     def activate(self, mode: ActiveMode) -> ActiveMode:
-        """Insert (or replace) an active mode. Persists to disk."""
+        """Insert (or replace) an active mode. Persists to disk and emits MODE_ACTIVATED."""
         self._modes[mode.kind] = mode
         self._persist()
+        emit(
+            EventType.MODE_ACTIVATED,
+            {
+                "kind": mode.kind,
+                "params": dict(mode.params),
+                "source": mode.source,
+                "end_at": mode.end_at.isoformat(),
+                "activated_at": mode.activated_at.isoformat(),
+            },
+        )
         return mode
+
+    def cancel(self, kind: ModeKind) -> bool:
+        """Remove an active mode early. Returns True if a mode was removed."""
+        if kind not in self._modes:
+            return False
+        del self._modes[kind]
+        self._persist()
+        emit(EventType.MODE_EXPIRED, {"kind": kind, "reason": "user_cancelled"})
+        return True
 
     def active(self, now: datetime) -> list[ActiveMode]:
         """Return currently-active modes, dropping any past their end_at.
