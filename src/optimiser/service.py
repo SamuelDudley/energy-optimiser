@@ -148,6 +148,10 @@ class Service:
         # it without re-reading the NDJSON file. Set at the end of every
         # successful tick; stays None until the first snapshot is written.
         self._last_snapshot: TickSnapshot | None = None
+        # Cached merged planning prices (5-min + 30-min) from the most
+        # recent tick. Powers /modes/suggest so the suggestion endpoint
+        # sees exactly the same horizon the LP saw.
+        self._last_prices_planning: list[PriceInterval] | None = None
 
         # ── User-strategy modes ──────────────────────────────────
         # Live next to the heartbeat in the data volume so a service
@@ -451,6 +455,8 @@ class Service:
         # negative-export sub-window within a generally-expensive
         # evening interval.
         prices_planning = list(prices_5min) + list(prices_30min)
+        # Cache for /modes/suggest — see amber_price_window() below.
+        self._last_prices_planning = prices_planning
         breaker = self._lp_runtime.breaker
         is_probe = breaker.can_probe(now)
 
@@ -915,6 +921,13 @@ class Service:
         so dashboard/API handlers can activate, clear, or inspect modes
         against the same instance the tick consults."""
         return self._mode_manager
+
+    def amber_price_window(self, end_at):
+        """Return planning prices that overlap [now, end_at]. Used by /modes/suggest."""
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC)
+        return [p for p in (self._last_prices_planning or []) if p.start < end_at and p.end > now]
 
     @property
     def managed_load_configs(self):

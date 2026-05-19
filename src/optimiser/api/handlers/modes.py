@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import statistics
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -104,8 +105,45 @@ async def list_modes(request: web.Request) -> web.Response:
     return web.json_response({"modes": modes, "now": now.isoformat()})
 
 
+async def suggest(request: web.Request) -> web.Response:
+    kind = request.query.get("kind")
+    if kind not in ("buy", "conserve"):
+        return _bad("kind must be 'buy' or 'conserve'")
+    try:
+        duration_minutes = int(request.query.get("duration_minutes", "120"))
+    except ValueError:
+        return _bad("duration_minutes must be an integer")
+    if duration_minutes <= 0 or duration_minutes > 48 * 60:
+        return _bad("duration_minutes must be in (0, 2880]")
+
+    probe = request.app["service_probe"]
+    end_at = datetime.now(UTC) + timedelta(minutes=duration_minutes)
+    strip = probe.amber_price_window(end_at)
+    if not strip:
+        return _bad("no price data available for window")
+
+    if kind == "buy":
+        imports = sorted(p.import_per_kwh for p in strip if p.import_per_kwh is not None)
+        if not imports:
+            return _bad("no import prices available")
+        suggested = statistics.median(imports) + 3.0
+        return web.json_response({"suggested_ceiling_c_per_kwh": round(suggested, 2)})
+    else:
+        exports = sorted(p.export_per_kwh for p in strip if p.export_per_kwh is not None)
+        if not exports:
+            return _bad("no export prices available")
+        # 70th percentile via linear interpolation.
+        idx_f = 0.7 * (len(exports) - 1)
+        lo = int(idx_f)
+        hi = min(lo + 1, len(exports) - 1)
+        frac = idx_f - lo
+        suggested = exports[lo] * (1 - frac) + exports[hi] * frac
+        return web.json_response({"suggested_floor_c_per_kwh": round(suggested, 2)})
+
+
 def register_modes_routes(app: web.Application) -> None:
     app.router.add_get("/modes", list_modes)
+    app.router.add_get("/modes/suggest", suggest)
     app.router.add_post("/modes/buy", activate_buy)
     app.router.add_delete("/modes/buy", cancel_buy)
     app.router.add_post("/modes/conserve", activate_conserve)

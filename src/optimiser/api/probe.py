@@ -18,7 +18,10 @@ from .log_buffer import RingBufferHandler
 from .metrics import Metrics
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from ..modes import ModeManager
+    from ..types import PriceInterval
 
 
 @runtime_checkable
@@ -56,6 +59,8 @@ class ServiceProbe(Protocol):
 
     @property
     def mode_manager(self) -> ModeManager: ...
+
+    def amber_price_window(self, end_at: datetime) -> list[PriceInterval]: ...
 
 
 # Typed app key — handlers retrieve the probe via
