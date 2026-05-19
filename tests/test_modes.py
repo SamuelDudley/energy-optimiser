@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -190,3 +191,82 @@ class TestModeManagerActivateCancel:
     def test_cancel_returns_false_when_not_active(self, tmp_path) -> None:
         mgr = ModeManager(tmp_path / "active_modes.json")
         assert mgr.cancel("buy") is False
+
+
+class TestModeManagerExpiry:
+    def test_expired_modes_dropped_lazily(self, tmp_path, monkeypatch) -> None:
+        events: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            "optimiser.modes.emit",
+            lambda et, payload: events.append((et.name, payload)),
+        )
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(hours=1),
+                params={"ceiling_c_per_kwh": 12.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        events.clear()
+        # Two hours later, the mode has expired.
+        assert mgr.active(NOW + timedelta(hours=2)) == []
+        # MODE_EXPIRED is emitted exactly once at expiry.
+        expired = [p for et, p in events if et == "MODE_EXPIRED"]
+        assert len(expired) == 1
+        assert expired[0] == {"kind": "buy", "reason": "window_ended"}
+
+    def test_expired_mode_persisted_removal(self, tmp_path) -> None:
+        path = tmp_path / "active_modes.json"
+        mgr = ModeManager(path)
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(hours=1),
+                params={"ceiling_c_per_kwh": 12.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        # Trigger expiry, then construct a fresh manager — it should
+        # see an empty state (the prune was persisted).
+        mgr.active(NOW + timedelta(hours=2))
+        mgr2 = ModeManager(path)
+        assert mgr2.active(NOW + timedelta(hours=2)) == []
+
+    def test_started_after_end_at_emits_special_reason(self, tmp_path, monkeypatch) -> None:
+        """Service restart after a mode has already passed end_at —
+        the load path drops it with a distinct reason for audit clarity.
+
+        Use a fixed far-past date so the wall-clock check in ``_load()``
+        is deterministic regardless of when the test runs."""
+        events: list[tuple[str, dict]] = []
+        # Patch emit BEFORE constructing the manager — _load() emits during construction.
+        monkeypatch.setattr(
+            "optimiser.modes.emit",
+            lambda et, payload: events.append((et.name, payload)),
+        )
+        path = tmp_path / "active_modes.json"
+        far_past_end = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        path.write_text(
+            json.dumps(
+                {
+                    "buy": ActiveMode(
+                        kind="buy",
+                        end_at=far_past_end,
+                        params={"ceiling_c_per_kwh": 12.0},
+                        activated_at=far_past_end - timedelta(hours=2),
+                        source="dashboard",
+                    ).to_dict()
+                }
+            )
+        )
+        mgr = ModeManager(path)
+        # Emission happens during ModeManager(...) — events already populated.
+        expired = [p for et, p in events if et == "MODE_EXPIRED"]
+        assert len(expired) == 1
+        assert expired[0]["reason"] == "service_started_after_end_at"
+        # And the mode is not in live state.
+        assert mgr.active(datetime.now(UTC)) == []

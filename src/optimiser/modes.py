@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -132,13 +132,31 @@ class ModeManager:
                 self._state_path,
             )
             return
+        now = datetime.now(UTC)
+        dropped_any = False
         for kind, payload in (raw or {}).items():
             if payload is None:
                 continue
             try:
-                self._modes[kind] = ActiveMode.from_dict(payload)
+                m = ActiveMode.from_dict(payload)
             except (KeyError, ValueError):
                 logger.warning("dropping malformed mode entry %r", kind)
+                continue
+            if m.end_at <= now:
+                # Already expired at load — emit with the restart reason
+                # so audit can tell post-restart drops apart from normal
+                # window-end expiries. Don't add to live state.
+                emit(
+                    EventType.MODE_EXPIRED,
+                    {"kind": kind, "reason": "service_started_after_end_at"},
+                )
+                dropped_any = True
+                continue
+            self._modes[kind] = m
+        if dropped_any:
+            # Persist the cleaned state so a subsequent restart doesn't
+            # re-replay the same expired entries.
+            self._persist()
 
     def _persist(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -175,11 +193,18 @@ class ModeManager:
         return True
 
     def active(self, now: datetime) -> list[ActiveMode]:
-        """Return currently-active modes, dropping any past their end_at.
+        """Return currently-active modes, pruning runtime expiries.
 
-        Lazy expiry: this is the only place expired modes are pruned.
-        Service should call this each tick so MODE_EXPIRED fires close
-        to actual expiry.
+        Load-time expiries were already handled in ``_load()`` with the
+        ``service_started_after_end_at`` reason. Anything that expires
+        between construction and now is a runtime expiry tagged
+        ``window_ended``.
         """
-        # Expiry handling added in Task 5.
+        expired = [kind for kind, m in self._modes.items() if m.end_at <= now]
+        if not expired:
+            return list(self._modes.values())
+        for kind in expired:
+            del self._modes[kind]
+            emit(EventType.MODE_EXPIRED, {"kind": kind, "reason": "window_ended"})
+        self._persist()
         return list(self._modes.values())
