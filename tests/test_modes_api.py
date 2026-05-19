@@ -16,9 +16,19 @@ from optimiser.modes import ActiveMode, ModeManager
 NOW = datetime(2026, 5, 19, 4, 0, 0, tzinfo=UTC)
 
 
+class _StubSnapshot:
+    """Minimal TickSnapshot stand-in carrying just system_state.soc_pct.
+    Lets API validators that read current SOC be exercised in tests
+    without standing up a full snapshot."""
+
+    def __init__(self, soc_pct: float) -> None:
+        self.system_state = type("S", (), {"soc_pct": soc_pct})()
+
+
 class _Probe:
-    def __init__(self, mode_manager: ModeManager) -> None:
+    def __init__(self, mode_manager: ModeManager, last_snapshot=None) -> None:
         self._mm = mode_manager
+        self.last_snapshot = last_snapshot
 
     @property
     def mode_manager(self) -> ModeManager:
@@ -207,3 +217,92 @@ async def test_suggest_conserve_floor(client) -> None:
     # 75th percentile of [5, 6, 7, 8, 9, 10, 15, 20, 25, 30]:
     # idx = 0.75 * 9 = 6.75 → 15 * 0.25 + 20 * 0.75 = 18.75
     assert body["suggested_floor_c_per_kwh"] == pytest.approx(18.75, abs=0.01)
+
+
+# ── Buy mode optional SOC cutoff ───────────────────────────────────
+
+
+@pytest.fixture
+async def client_with_soc(tmp_path):
+    """Variant of `client` whose probe exposes a stub last_snapshot
+    with a known SOC, so soc_cutoff validation can be exercised."""
+    app = web.Application()
+    mgr = ModeManager(tmp_path / "active_modes.json")
+    app[SERVICE_PROBE_KEY] = _Probe(mgr, last_snapshot=_StubSnapshot(soc_pct=50.0))
+    register_modes_routes(app)
+    server = TestServer(app)
+    await server.start_server()
+    client = TestClient(server)
+    yield client
+    await client.close()
+
+
+async def test_post_buy_accepts_soc_cutoff(client_with_soc) -> None:
+    resp = await client_with_soc.post(
+        "/modes/buy",
+        json={
+            "end_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            "ceiling_c_per_kwh": 12.0,
+            "soc_cutoff_pct": 80.0,
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["params"]["soc_cutoff_pct"] == 80.0
+    assert body["params"]["ceiling_c_per_kwh"] == 12.0
+
+
+async def test_post_buy_rejects_cutoff_at_or_below_current_soc(client_with_soc) -> None:
+    # current SOC = 50 (from fixture); cutoff = 50 → would auto-cancel immediately
+    resp = await client_with_soc.post(
+        "/modes/buy",
+        json={
+            "end_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            "ceiling_c_per_kwh": 12.0,
+            "soc_cutoff_pct": 50.0,
+        },
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "soc_cutoff_pct" in body["error"]
+
+
+async def test_post_buy_rejects_cutoff_out_of_range(client_with_soc) -> None:
+    resp = await client_with_soc.post(
+        "/modes/buy",
+        json={
+            "end_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            "ceiling_c_per_kwh": 12.0,
+            "soc_cutoff_pct": 101.0,
+        },
+    )
+    assert resp.status == 400
+
+
+async def test_post_buy_without_cutoff_still_works(client_with_soc) -> None:
+    """SOC cutoff is purely optional — omitting it keeps existing behaviour."""
+    resp = await client_with_soc.post(
+        "/modes/buy",
+        json={
+            "end_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            "ceiling_c_per_kwh": 12.0,
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert "soc_cutoff_pct" not in body["params"]
+
+
+async def test_post_conserve_ignores_soc_cutoff(client_with_soc) -> None:
+    """soc_cutoff_pct is buy-mode-only; conserve must ignore the field."""
+    resp = await client_with_soc.post(
+        "/modes/conserve",
+        json={
+            "end_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            "floor_c_per_kwh": 22.0,
+            "soc_cutoff_pct": 80.0,  # silently ignored
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert "soc_cutoff_pct" not in body["params"]

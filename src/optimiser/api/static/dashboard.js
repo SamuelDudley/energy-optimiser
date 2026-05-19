@@ -2549,6 +2549,8 @@ const ModesUI = (() => {
   const durationSelect = document.getElementById("mode-duration");
   const hint = document.getElementById("mode-suggest-hint");
   const cancelBtn = document.getElementById("mode-panel-cancel");
+  const socCutoffField = document.getElementById("mode-soc-cutoff-field");
+  const socCutoffInput = document.getElementById("mode-soc-cutoff");
   let currentKind = null;
   let suggestSeq = 0;  // dropped-old-response guard
 
@@ -2592,6 +2594,9 @@ const ModesUI = (() => {
     title.textContent = `Activate ${kind} mode`;
     thresholdLabel.textContent = thresholdLabelText(kind);
     thresholdInput.value = "";
+    socCutoffInput.value = "";
+    // SOC cutoff is buy-mode only.
+    socCutoffField.hidden = kind !== "buy";
     hint.textContent = "Computing suggestion…";
     panel.showModal();
     refreshSuggestion();
@@ -2666,6 +2671,18 @@ const ModesUI = (() => {
     const minutes = parseInt(durationSelect.value, 10);
     const endAt = new Date(Date.now() + minutes * 60_000).toISOString();
     const body = { end_at: endAt, [paramKey(currentKind)]: threshold };
+    // Optional SOC cutoff for buy mode. Server-side validation handles
+    // the "cutoff not above current SOC" case; we just forward the raw
+    // value when the user supplied one.
+    if (currentKind === "buy" && socCutoffInput.value.trim() !== "") {
+      const cutoff = parseFloat(socCutoffInput.value);
+      if (!Number.isFinite(cutoff) || cutoff <= 0 || cutoff > 100) {
+        hint.textContent = "SOC cutoff must be a number in (0, 100]%.";
+        socCutoffInput.focus();
+        return;
+      }
+      body.soc_cutoff_pct = cutoff;
+    }
     let newMode;
     try {
       newMode = await apiFetch(`/modes/${currentKind}`, {
@@ -2723,6 +2740,18 @@ const ModesUI = (() => {
       const v = m.params[paramKey(kind)];
       activeBody.querySelector('[data-field="threshold"]').textContent =
         `${v} c/kWh`;
+      // Show the SOC cutoff row only when the mode has one set (buy only).
+      const cutoffRow = activeBody.querySelector('[data-field="soc-cutoff-row"]');
+      if (cutoffRow) {
+        const cutoff = m.params.soc_cutoff_pct;
+        if (typeof cutoff === "number") {
+          cutoffRow.hidden = false;
+          activeBody.querySelector('[data-field="soc-cutoff"]').textContent =
+            cutoff;
+        } else {
+          cutoffRow.hidden = true;
+        }
+      }
     }
   }
 

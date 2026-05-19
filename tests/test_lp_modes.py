@@ -249,3 +249,36 @@ def test_buy_mode_wear_discount_increases_grid_charge() -> None:
     buy_charge = sum(slot.grid_to_battery_kw for slot in with_buy.forward_trajectory[:6])
     # Discount should push charging strictly higher in the in-window slots.
     assert buy_charge > base_charge + 1e-3
+
+
+def test_buy_mode_soc_cutoff_caps_charging() -> None:
+    """With soc_cutoff_pct set, the LP must not plan SOC past the cutoff
+    at any in-window slot end."""
+    n_slots = 24
+    # Cheap import throughout — without the cutoff the LP would charge
+    # up toward the battery's physical ceiling.
+    imports = [5.0] * n_slots
+    exports = [3.0] * n_slots
+    state = _state(soc=40.0)  # well below the cutoff
+    overrides = ModeOverrides(
+        buy_active_at=tuple([True] * n_slots),
+        buy_ceiling_c_per_kwh=20.0,
+        buy_soc_cutoff_pct=60.0,
+        conserve_active_at=tuple([False] * n_slots),
+        conserve_floor_c_per_kwh=None,
+    )
+    result = solve_stochastic(
+        state=state,
+        prices_planning=_prices(imports, exports),
+        pv_forecast=None,
+        load_profile=_profile(2.0),
+        managed_loads=[],
+        lp_loads=build_lp_loads(configs=[]),
+        battery_config=_battery(),
+        mode_overrides=overrides,
+    )
+    assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+    for slot in result.forward_trajectory:
+        assert slot.soc_pct_end <= 60.0 + 1e-4, (
+            f"slot {slot.slot_start} ended at SOC {slot.soc_pct_end} > cutoff 60.0"
+        )

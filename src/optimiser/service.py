@@ -1113,6 +1113,10 @@ class Service:
         slot_start = state.timestamp.replace(second=0, microsecond=0)
         slot_minute_aligned = slot_start - timedelta(minutes=slot_start.minute % SLOT_MINUTES)
         slots = _slot_grid(slot_minute_aligned, HORIZON_HOURS, SLOT_MINUTES)
+        # Auto-cancel any buy mode whose SOC cutoff has been reached.
+        # Runs before to_overrides so the cancelled mode is gone by the
+        # time the LP sees its constraint mask.
+        self._mode_manager.prune_soc_reached(state.soc_pct)
         mode_overrides = self._mode_manager.to_overrides(state.timestamp, slots)
         try:
             solution = await asyncio.wait_for(

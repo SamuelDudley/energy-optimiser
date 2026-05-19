@@ -65,17 +65,50 @@ async def _activate_handler(request: web.Request, kind: str, param_name: str) ->
     if err:
         return _bad(err)
 
+    params: dict[str, float] = {param_name: threshold}
+
+    # Buy mode supports an optional SOC cutoff. When current SOC reaches
+    # this value the mode auto-cancels (see ModeManager.prune_soc_reached)
+    # and the LP plans to land at this SOC ceiling without overshoot.
+    if kind == "buy" and "soc_cutoff_pct" in body and body["soc_cutoff_pct"] is not None:
+        raw_cutoff = body["soc_cutoff_pct"]
+        if not isinstance(raw_cutoff, (int, float)):
+            return _bad("soc_cutoff_pct must be a number")
+        cutoff = float(raw_cutoff)
+        if not (0.0 < cutoff <= 100.0):
+            return _bad("soc_cutoff_pct must be in (0, 100]")
+        # Reject if SOC is already at/above the cutoff — the mode would
+        # auto-cancel on the first tick. Surface this at activation
+        # rather than letting it silently no-op.
+        probe = request.app[SERVICE_PROBE_KEY]
+        current_soc = _current_soc_pct(probe)
+        if current_soc is not None and current_soc >= cutoff:
+            return _bad(
+                f"soc_cutoff_pct ({cutoff}) must be above current SOC ({current_soc:.1f}); "
+                "buy mode would exit immediately"
+            )
+        params["soc_cutoff_pct"] = cutoff
+
     mm = request.app[SERVICE_PROBE_KEY].mode_manager
     mode = mm.activate(
         ActiveMode(
             kind=kind,  # type: ignore[arg-type]
             end_at=end_at,
-            params={param_name: threshold},
+            params=params,
             activated_at=datetime.now(UTC),
             source="dashboard",
         )
     )
     return web.json_response(mode.to_dict())
+
+
+def _current_soc_pct(probe) -> float | None:
+    """Best-effort current SOC from the latest TickSnapshot. None when
+    the service hasn't completed its first tick yet (e.g. just-restarted)."""
+    snap = probe.last_snapshot
+    if snap is None or snap.system_state is None:
+        return None
+    return snap.system_state.soc_pct
 
 
 async def activate_buy(request: web.Request) -> web.Response:

@@ -632,6 +632,7 @@ def _add_scenario_to_problem(
     # unaffected — that's controlled by export_cap.
     if mode_overrides is not None and mode_overrides.any_buy_active():
         ceiling = mode_overrides.buy_ceiling_c_per_kwh
+        soc_cutoff = mode_overrides.buy_soc_cutoff_pct
         for t in range(n):
             if not mode_overrides.buy_active_at[t]:
                 continue
@@ -646,6 +647,15 @@ def _add_scenario_to_problem(
                 grid_export[t] <= pv_to_export[t],
                 f"{prefix}buy_no_bat_export_{t}",
             )
+            # Optional SOC cutoff — LP plans to land at the cutoff
+            # without overshoot. The service-side prune_soc_reached
+            # auto-cancels the mode once SOC actually reaches the
+            # cutoff, so this constraint goes away on the next tick.
+            if soc_cutoff is not None:
+                prob += (
+                    soc_pct[t] <= soc_cutoff,
+                    f"{prefix}buy_soc_cutoff_{t}",
+                )
 
     # ── Mode overrides: conserve ─────────────────────────────────
     # No battery contribution to grid_export at slots where the

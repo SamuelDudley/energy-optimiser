@@ -85,6 +85,13 @@ class ModeOverrides:
     buy_ceiling_c_per_kwh: float | None
     conserve_active_at: tuple[bool, ...]
     conserve_floor_c_per_kwh: float | None
+    # Optional early-exit trigger for buy mode: once SOC reaches this
+    # threshold, the mode auto-cancels (see ModeManager.prune_soc_reached).
+    # While active, the LP also caps soc_pct[t] <= cutoff on in-window
+    # slots so it plans to land at the cutoff without overshoot.
+    # Defaulted (and placed last) to keep ModeOverrides backwards-
+    # compatible with call sites that predate the cutoff feature.
+    buy_soc_cutoff_pct: float | None = None
 
     @classmethod
     def empty(cls, n_slots: int) -> ModeOverrides:
@@ -225,6 +232,26 @@ class ModeManager:
         return ModeOverrides(
             buy_active_at=buy_mask,
             buy_ceiling_c_per_kwh=(buy.params["ceiling_c_per_kwh"] if buy else None),
+            buy_soc_cutoff_pct=(buy.params.get("soc_cutoff_pct") if buy else None),
             conserve_active_at=conserve_mask,
             conserve_floor_c_per_kwh=(conserve.params["floor_c_per_kwh"] if conserve else None),
         )
+
+    def prune_soc_reached(self, current_soc_pct: float) -> None:
+        """Auto-cancel any buy mode whose `soc_cutoff_pct` has been reached.
+
+        Service calls this each tick after reading the live SOC and
+        before computing the LP overrides. Emits ``MODE_EXPIRED`` with
+        ``reason="soc_reached"`` and persists. No-op if buy mode is not
+        active or has no cutoff configured.
+        """
+        buy = self._modes.get("buy")
+        if buy is None:
+            return
+        cutoff = buy.params.get("soc_cutoff_pct")
+        if cutoff is None:
+            return
+        if current_soc_pct >= cutoff:
+            del self._modes["buy"]
+            self._persist()
+            emit(EventType.MODE_EXPIRED, {"kind": "buy", "reason": "soc_reached"})

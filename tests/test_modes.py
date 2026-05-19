@@ -335,3 +335,116 @@ class TestToOverrides:
         assert o.conserve_active_at[9:] == tuple([False] * 3)
         assert o.buy_ceiling_c_per_kwh == 10.0
         assert o.conserve_floor_c_per_kwh == 22.0
+
+
+class TestPruneSocReached:
+    def test_no_buy_active_is_noop(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.prune_soc_reached(80.0)
+        assert mgr.active(NOW) == []
+
+    def test_buy_without_cutoff_is_noop(self, tmp_path, monkeypatch) -> None:
+        events: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            "optimiser.modes.emit",
+            lambda et, payload: events.append((et.name, payload)),
+        )
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(hours=2),
+                params={"ceiling_c_per_kwh": 12.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        events.clear()
+        mgr.prune_soc_reached(95.0)
+        assert len(mgr.active(NOW)) == 1
+        assert not any(et == "MODE_EXPIRED" for et, _ in events)
+
+    def test_buy_with_cutoff_reached_is_pruned(self, tmp_path, monkeypatch) -> None:
+        events: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            "optimiser.modes.emit",
+            lambda et, payload: events.append((et.name, payload)),
+        )
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(hours=2),
+                params={"ceiling_c_per_kwh": 12.0, "soc_cutoff_pct": 80.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        events.clear()
+        mgr.prune_soc_reached(80.0)
+        assert mgr.active(NOW) == []
+        expired = [p for et, p in events if et == "MODE_EXPIRED"]
+        assert len(expired) == 1
+        assert expired[0] == {"kind": "buy", "reason": "soc_reached"}
+
+    def test_buy_with_cutoff_above_current_is_kept(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(hours=2),
+                params={"ceiling_c_per_kwh": 12.0, "soc_cutoff_pct": 80.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        mgr.prune_soc_reached(75.0)
+        assert len(mgr.active(NOW)) == 1
+
+    def test_prune_persists_removal(self, tmp_path) -> None:
+        path = tmp_path / "active_modes.json"
+        mgr = ModeManager(path)
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(hours=2),
+                params={"ceiling_c_per_kwh": 12.0, "soc_cutoff_pct": 80.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        mgr.prune_soc_reached(85.0)
+        mgr2 = ModeManager(path)
+        assert mgr2.active(NOW) == []
+
+
+class TestSocCutoffOverridesField:
+    def test_to_overrides_carries_soc_cutoff(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(minutes=30),
+                params={"ceiling_c_per_kwh": 12.0, "soc_cutoff_pct": 80.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        slots = [NOW + timedelta(minutes=5 * i) for i in range(6)]
+        o = mgr.to_overrides(NOW, slots)
+        assert o.buy_soc_cutoff_pct == 80.0
+
+    def test_to_overrides_no_cutoff_is_none(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(minutes=30),
+                params={"ceiling_c_per_kwh": 12.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        slots = [NOW + timedelta(minutes=5 * i) for i in range(6)]
+        o = mgr.to_overrides(NOW, slots)
+        assert o.buy_soc_cutoff_pct is None

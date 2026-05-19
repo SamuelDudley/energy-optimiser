@@ -103,6 +103,7 @@ def build_overrides_from_snapshot(
     return ModeOverrides(
         buy_active_at=tuple((buy is not None and slot < buy.end_at) for slot in slots),
         buy_ceiling_c_per_kwh=(buy.params["ceiling_c_per_kwh"] if buy else None),
+        buy_soc_cutoff_pct=(buy.params.get("soc_cutoff_pct") if buy else None),
         conserve_active_at=tuple(
             (conserve is not None and slot < conserve.end_at) for slot in slots
         ),
