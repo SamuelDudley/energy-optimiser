@@ -114,8 +114,11 @@ When active:
 ```
 
 "Activate" opens a panel asking for:
-- Duration preset (15 min / 30 min / 1 h / 2 h / 4 h) or custom end-time, with a max of `now + 24h`
-- Threshold (ceiling for buy, floor for conserve). Last-used value pre-filled.
+- Duration preset (15 min / 30 min / 1 h / 2 h / 4 h / 8h / 24h) or custom end-time, with a max of `now + 48h`.
+- Threshold (ceiling for buy, floor for conserve). Pre-filled from the current Amber forecast:
+  - **Buy ceiling suggestion:** `median(import_price[t] for t in window) + 3c`
+  - **Conserve floor suggestion:** `percentile_70(export_price[t] for t in window)`
+  - Recomputed each time the panel opens. User can edit before submitting.
 
 ## API surface
 
@@ -130,8 +133,8 @@ New module `api/handlers/modes.py`. Endpoints:
 | `DELETE /modes/conserve` | — | Cancel conserve mode early |
 
 Validation on POST:
-- `end_at` must be ISO-8601 UTC, strictly in the future, ≤ `now + 24h`.
-- Threshold must be in `[0, 100]` c/kWh.
+- `end_at` must be ISO-8601 UTC, strictly in the future, ≤ `now + 48h`.
+- Threshold must be in `(0, 100]` c/kWh — `0` rejected (avoids accidental no-op activations).
 - Reject 400 with structured error on invalid input.
 
 The current set is also folded into `GET /dashboard/config` so the dashboard front-end can paint mode state on its existing config-poll path.
@@ -198,12 +201,16 @@ Integration: existing replay machinery (`replay_cli`) re-solves a historical day
 - **Blocking PV→grid export during buy mode.** Existing `export_cap` already curtails at negative prices; blocking solar export wastes generation.
 - **CLI / shell access for activation.** Dashboard is sufficient for the urgency-driven use case.
 
-## Open questions for review
+## Design decisions resolved (2026-05-19 brainstorming)
 
-1. **Pre-fill defaults on the activate panel:** last-used value, or sensible-default-from-current-prices (e.g. ceiling = median in-window price + 2c)? Last-used is simpler; suggesting based on current prices is more helpful for first-time use.
-2. **Max window length cap (24h):** is that long enough? Could imagine a 48h conserve mode for a multi-day storm front.
-3. **Should buy mode forbid battery → house discharge during its window?** Currently the design lets the battery serve house load as normal — bought energy is preserved against export, but house pulls naturally. Alternative: forbid all battery discharge during buy window so SOC monotonically rises. Default position: no extra restriction; let the LP arbitrage normally.
-4. **Conserve floor at `0` c/kWh:** does that mean "any positive export price"? The constraint is `grid_export ≤ pv_to_export if ep < floor`. With floor=0, only negative-ep slots are constrained, which is what `export_cap` already handles. A floor of 0 is therefore effectively a no-op — should the API reject it, or accept it as a documented no-op?
+| Decision | Resolution |
+|---|---|
+| Buy-mode battery discharge to house | **Allowed.** LP retains full discretion on `bat_discharge` to house. Only `grid_export` battery-share is blocked. SOC can dip mid-window if LP economics favour it. |
+| Max window length | **48 h.** Covers multi-day weather fronts; long enough to avoid daily re-activation noise but short enough that a forgotten mode auto-expires within 2 days. |
+| Threshold pre-fill | **Suggest from current Amber forecast.** Buy ceiling = `median(in-window import) + 3c`. Conserve floor = `percentile_70(in-window export)`. Recomputed per panel open, user-editable. |
+| Threshold lower bound | **`(0, 100]` c/kWh.** Reject `0` to avoid accidental no-op activations. |
+| PV export below conserve floor | **Allowed at any positive price.** Existing `export_cap` already curtails negative-ep slots; conserve adds no new PV-export restriction. |
+| "Store PV harder" mechanism | **Wear discount only.** No positive bonus on top — avoids over-rotating into wear-cycle damage for marginal economic gain. |
 
 ## Implementation order (rough)
 
