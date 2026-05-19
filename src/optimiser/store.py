@@ -779,19 +779,27 @@ class TelemetryStore:
         weekday: bool | None = None,
         min_samples: int = 50,
         as_of: datetime | None = None,
+        statistic: str = "mean",
     ) -> list[float] | None:
         """Query a load profile with optional context filters.
 
-        Returns 48 slots (30-min averages) of *non-managed* baseload —
-        i.e. `house_load_kw` minus the sum of measured managed-load
-        power at the same timestamp. Subtraction happens per-row before
-        averaging and is floored at zero. The LP later adds its own
-        forward managed-load plan back into the energy balance, so
-        leaving managed loads in the profile would double-count them.
+        Returns 48 slots of *non-managed* baseload — `house_load_kw`
+        minus the sum of measured managed-load power at the same
+        timestamp, floored at zero. The LP later adds its own forward
+        managed-load plan back into the energy balance, so leaving
+        managed loads in the profile would double-count them.
+
+        `statistic` selects the per-slot aggregation:
+          - "mean": AVG (default; matches historical behaviour).
+          - "median": robust to single outlier days. Use to keep one
+            heavy-load day from lifting the LP's expected baseline.
 
         Returns None if insufficient samples (< min_samples).
         Excludes pre-fix (schema_version < CURRENT) rows.
         """
+        agg_fn = {"mean": "AVG", "median": "MEDIAN"}.get(statistic)
+        if agg_fn is None:
+            raise ValueError(f"unknown statistic {statistic!r}; expected 'mean' or 'median'")
         ref = as_of or datetime.now(UTC)
         conditions = [
             "t.house_load_kw IS NOT NULL",
@@ -845,7 +853,7 @@ class TelemetryStore:
             )
             SELECT
                 (EXTRACT(HOUR FROM t.ts) * 2 + EXTRACT(MINUTE FROM t.ts) / 30)::INT AS slot,
-                AVG(GREATEST(t.house_load_kw - COALESCE(m.managed_kw, 0.0), 0.0)) AS mean_kw
+                {agg_fn}(GREATEST(t.house_load_kw - COALESCE(m.managed_kw, 0.0), 0.0)) AS stat_kw
             FROM telemetry t
             LEFT JOIN managed_per_ts m ON m.ts = t.ts
             WHERE {where}

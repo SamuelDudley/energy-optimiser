@@ -366,6 +366,8 @@ async def smoke_dry_tick(config: Config) -> bool:
             outdoor_temp_c=state.outdoor_temp_c,
             occupied=True,
             timestamp=datetime.now(UTC),
+            statistic=config.planner.lp_load_statistic,
+            smoothing_slots=config.planner.lp_load_smoothing_slots,
         )
         _ok(
             f"Load profile: maturity={load_profile.maturity_level}, "

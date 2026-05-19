@@ -12,6 +12,7 @@ from pathlib import Path
 from .api import APIServer
 from .api.log_buffer import RingBufferHandler
 from .api.metrics import Metrics
+from .api.sse import SnapshotBroadcaster
 from .clients.amber import AmberClient
 from .clients.bom import BOMClient
 from .clients.shelly import ManagedLoadManager
@@ -152,6 +153,9 @@ class Service:
         # recent tick. Powers /modes/suggest so the suggestion endpoint
         # sees exactly the same horizon the LP saw.
         self._last_prices_planning: list[PriceInterval] | None = None
+        # Fan-out for /dashboard/stream — push each new snapshot to any
+        # connected SSE clients. Always live; no-op when no subscribers.
+        self._snapshot_broadcaster = SnapshotBroadcaster()
 
         # ── User-strategy modes ──────────────────────────────────
         # Live next to the heartbeat in the data volume so a service
@@ -433,6 +437,8 @@ class Service:
             outdoor_temp_c=outdoor_temp,
             occupied=occupied,
             timestamp=now,
+            statistic=self._config.planner.lp_load_statistic,
+            smoothing_slots=self._config.planner.lp_load_smoothing_slots,
         )
 
         # 6. Run the LP (or use safe-default if disabled / latched / no prices).
@@ -758,6 +764,7 @@ class Service:
             )
             self._snapshots.write(snapshot)
             self._last_snapshot = snapshot
+            self._snapshot_broadcaster.publish(snapshot)
         except Exception:
             logger.exception("Failed to write snapshot")
 
@@ -935,6 +942,12 @@ class Service:
         load cards know the daily-target unit (kWh vs minutes) and
         cap value to render fractions against."""
         return list(self._config.managed_loads)
+
+    @property
+    def snapshot_broadcaster(self) -> SnapshotBroadcaster:
+        """Fan-out for /dashboard/stream SSE clients. The Service
+        publishes each new TickSnapshot here in `_tick_body`."""
+        return self._snapshot_broadcaster
 
     def _attach_log_handlers(self) -> None:
         """Attach the ring buffer and (if configured) a rotating file
