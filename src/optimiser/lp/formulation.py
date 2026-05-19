@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pulp
 
@@ -41,6 +42,9 @@ from .scenarios import (
     PriceScenarioMode,
     build_price_scenarios,
 )
+
+if TYPE_CHECKING:
+    from ..modes import ModeOverrides
 
 
 @dataclass
@@ -143,6 +147,7 @@ def build_lp(
     slot_minutes: int = SLOT_MINUTES,
     pv_percentile: str = "p50",
     terminal_floor_override_pct: float | None = None,
+    mode_overrides: ModeOverrides | None = None,
 ) -> tuple[pulp.LpProblem, LPVars]:
     """Build a single-scenario deterministic LP.
 
@@ -180,6 +185,7 @@ def build_lp(
         wear_cost_per_kwh=wear_cost_per_kwh,
         price_scenario=point_scenario,
         terminal_floor_override_pct=terminal_floor_override_pct,
+        mode_overrides=mode_overrides,
     )
     prob += pulp.lpSum(cost_terms), "total_cost_cents"
     return prob, vars
@@ -203,6 +209,7 @@ def build_stochastic_lp(
     price_scenario_mode: PriceScenarioMode | None = None,
     slot_0_pv_override_kw: float | None = None,
     terminal_floor_override_pct: float | None = None,
+    mode_overrides: ModeOverrides | None = None,
 ) -> tuple[pulp.LpProblem, StochasticLPVars]:
     """Build a two-stage stochastic LP across compound (PV × price) scenarios.
 
@@ -291,6 +298,7 @@ def build_stochastic_lp(
                 price_scenario=price_scenario,
                 slot_0_pv_override_kw=slot_0_pv_override_kw,
                 terminal_floor_override_pct=terminal_floor_override_pct,
+                mode_overrides=mode_overrides,
             )
             scenarios[compound_name] = vars
             all_cost_terms.extend(cost_terms)
@@ -347,6 +355,7 @@ def _add_scenario_to_problem(
     price_scenario: PriceScenario,
     slot_0_pv_override_kw: float | None = None,
     terminal_floor_override_pct: float | None = None,
+    mode_overrides: ModeOverrides | None = None,
 ) -> tuple[LPVars, list[pulp.LpAffineExpression]]:
     """Add one scenario's variables, constraints, and weighted cost terms
     to the problem. Returns the LPVars and the list of cost terms (already
