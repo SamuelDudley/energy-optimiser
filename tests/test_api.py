@@ -36,6 +36,7 @@ from optimiser.api.metrics import Metrics
 from optimiser.api.probe import API_CONFIG_KEY, SERVICE_PROBE_KEY
 from optimiser.api.server import _favicon
 from optimiser.config import APIConfig, BatteryConfig
+from optimiser.modes import ModeManager
 
 TOKEN = "test-token-xyz"
 _PUBLIC = (
@@ -63,6 +64,7 @@ class _Probe:
     snapshot_dir: Path | None = None
     battery_config: BatteryConfig | None = None
     managed_load_configs: list = field(default_factory=list)
+    mode_manager: ModeManager | None = None
 
     def __post_init__(self) -> None:
         if self.metrics is None:
@@ -73,6 +75,10 @@ class _Probe:
             self.snapshot_dir = Path("/nonexistent-snapshot-dir")
         if self.battery_config is None:
             self.battery_config = BatteryConfig()
+        if self.mode_manager is None:
+            # Most tests don't care about modes; default to an empty
+            # manager backed by a path that won't exist (load is a no-op).
+            self.mode_manager = ModeManager(self.heartbeat_path.parent / "active_modes.json")
 
 
 def _fresh_heartbeat(tmp_path: Path) -> Path:
@@ -1127,6 +1133,41 @@ class TestDashboard:
             # SOC panel needs all of these to draw axes / floor line.
             for k in ("max_ac_charge_kw", "max_dc_charge_kw", "max_discharge_kw"):
                 assert k in body["battery"]
+
+    async def test_dashboard_config_includes_empty_active_modes(self, tmp_path: Path) -> None:
+        # No modes activated → key is present and empty (lets the dashboard
+        # distinguish "no override" from "field missing / unknown").
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path))
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/config", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["active_modes"] == []
+
+    async def test_dashboard_config_includes_active_modes(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from optimiser.modes import ActiveMode
+
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        end_at = datetime.now(UTC) + timedelta(hours=2)
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=end_at,
+                params={"ceiling_c_per_kwh": 12.0},
+                activated_at=datetime.now(UTC),
+                source="user",
+            )
+        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), mode_manager=mgr)
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/config", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            kinds = [m["kind"] for m in body["active_modes"]]
+            assert kinds == ["buy"]
+            assert body["active_modes"][0]["params"] == {"ceiling_c_per_kwh": 12.0}
 
     async def test_static_dir_env_override(self, tmp_path: Path, monkeypatch) -> None:
         """Setting EO_DASHBOARD_STATIC_DIR makes the handler read from a

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 from aiohttp import web
@@ -92,10 +93,13 @@ async def dashboard_config(request: web.Request) -> web.Response:
         }
         for cfg in probe.managed_load_configs
     ]
+    now = datetime.now(UTC)
+    active_modes = [m.to_dict() for m in probe.mode_manager.active(now)]
     return web.json_response(
         {
             "battery": asdict(probe.battery_config),
             "managed_loads": managed_loads,
+            "active_modes": active_modes,
             "version": probe.version,
         }
     )
