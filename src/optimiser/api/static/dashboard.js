@@ -2484,3 +2484,129 @@ async function main() {
 }
 
 document.addEventListener("DOMContentLoaded", main);
+
+// ── User-strategy modes ───────────────────────────────────────────────
+const ModesUI = (() => {
+  const panel = document.getElementById('mode-activate-panel');
+  const form = document.getElementById('mode-activate-form');
+  const title = document.getElementById('mode-panel-title');
+  const thresholdLabel = document.getElementById('mode-threshold-label');
+  const thresholdInput = document.getElementById('mode-threshold');
+  const durationSelect = document.getElementById('mode-duration');
+  const hint = document.getElementById('mode-suggest-hint');
+  let currentKind = null;
+
+  async function refreshSuggestion() {
+    if (!currentKind) return;
+    const dur = durationSelect.value;
+    try {
+      const resp = await fetch(`/modes/suggest?kind=${currentKind}&duration_minutes=${dur}`);
+      if (!resp.ok) {
+        hint.textContent = 'No suggestion available for this window.';
+        return;
+      }
+      const body = await resp.json();
+      const key = currentKind === 'buy' ? 'suggested_ceiling_c_per_kwh' : 'suggested_floor_c_per_kwh';
+      const value = body[key];
+      if (value !== undefined) {
+        thresholdInput.value = value;
+        hint.textContent = `Amber-suggested ${currentKind === 'buy' ? 'ceiling' : 'floor'}: ${value} c/kWh`;
+      }
+    } catch (_) {
+      hint.textContent = 'Could not reach /modes/suggest.';
+    }
+  }
+
+  function openActivatePanel(kind) {
+    currentKind = kind;
+    title.textContent = kind === 'buy' ? 'Activate buy mode' : 'Activate conserve mode';
+    thresholdLabel.firstChild.textContent =
+      kind === 'buy' ? 'Ceiling (c/kWh) ' : 'Floor (c/kWh) ';
+    thresholdInput.value = '';
+    hint.textContent = 'Computing suggestion…';
+    panel.showModal();
+    refreshSuggestion();
+  }
+
+  durationSelect.addEventListener('change', refreshSuggestion);
+
+  document.querySelectorAll('.mode-card__activate').forEach((btn) => {
+    btn.addEventListener('click', (e) => openActivatePanel(e.currentTarget.dataset.kind));
+  });
+
+  document.querySelectorAll('.mode-card__cancel').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      const kind = e.currentTarget.dataset.kind;
+      const resp = await fetch(`/modes/${kind}`, { method: 'DELETE' });
+      if (!resp.ok && resp.status !== 404) {
+        alert(`Failed to cancel: ${resp.status}`);
+      }
+      await render();
+    });
+  });
+
+  form.addEventListener('submit', async (e) => {
+    if (e.submitter && e.submitter.value === 'cancel') return;
+    e.preventDefault();
+    if (!currentKind) return;
+    const minutes = parseInt(durationSelect.value, 10);
+    const endAt = new Date(Date.now() + minutes * 60_000).toISOString();
+    const threshold = parseFloat(thresholdInput.value);
+    const paramKey = currentKind === 'buy' ? 'ceiling_c_per_kwh' : 'floor_c_per_kwh';
+    const body = { end_at: endAt, [paramKey]: threshold };
+    const resp = await fetch(`/modes/${currentKind}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: 'unknown' }));
+      alert(`Activation failed: ${err.error}`);
+      return;
+    }
+    panel.close();
+    await render();
+  });
+
+  async function render() {
+    const resp = await fetch('/modes');
+    if (!resp.ok) return;
+    const body = await resp.json();
+    const now = new Date(body.now);
+    const byKind = Object.fromEntries(body.modes.map((m) => [m.kind, m]));
+
+    for (const kind of ['buy', 'conserve']) {
+      const card = document.getElementById(`mode-card-${kind}`);
+      const status = card.querySelector('.mode-card__status');
+      const inactiveBody = card.querySelector('[data-empty="true"]');
+      const activeBody = card.querySelector('[data-empty="false"]');
+      const m = byKind[kind];
+
+      if (!m) {
+        status.dataset.status = 'inactive';
+        status.textContent = 'Inactive';
+        inactiveBody.hidden = false;
+        activeBody.hidden = true;
+        continue;
+      }
+      status.dataset.status = 'active';
+      status.textContent = 'Active';
+      inactiveBody.hidden = true;
+      activeBody.hidden = false;
+      const end = new Date(m.end_at);
+      const minutes = Math.max(0, Math.round((end - now) / 60_000));
+      activeBody.querySelector('[data-field="countdown"]').textContent =
+        minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
+      const paramKey = kind === 'buy' ? 'ceiling_c_per_kwh' : 'floor_c_per_kwh';
+      const field = kind === 'buy' ? 'ceiling' : 'floor';
+      activeBody.querySelector(`[data-field="${field}"]`).textContent =
+        `${m.params[paramKey]} c/kWh`;
+    }
+  }
+
+  return { render };
+})();
+
+// Poll alongside the existing dashboard refresh loop.
+setInterval(() => ModesUI.render(), 5000);
+ModesUI.render();

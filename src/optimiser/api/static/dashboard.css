@@ -675,3 +675,19 @@ main {
   .ops-window-bar .preset-row .ops-window-btn { flex: 1 1 0; }
   #ops-status { margin-left: 0; width: 100%; }
 }
+
+/* ── User-strategy modes ──────────────────────────────────────────── */
+.modes-section { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-block: 1rem; }
+.mode-card { border: 1px solid var(--card-border, #333); border-radius: 6px; padding: 1rem; background: var(--card-bg, #1a1a1a); }
+.mode-card__header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+.mode-card__title { font-weight: bold; letter-spacing: 0.05em; }
+.mode-card__status[data-status="active"] { color: var(--accent-ok, #4ec); }
+.mode-card__status[data-status="inactive"] { color: var(--muted, #888); }
+.mode-card__detail { display: flex; justify-content: space-between; padding: 0.2rem 0; }
+.mode-card__detail .label { color: var(--muted, #888); }
+.mode-card__activate, .mode-card__cancel { width: 100%; padding: 0.5rem; margin-top: 0.5rem; cursor: pointer; }
+.mode-panel { padding: 1.5rem; max-width: 24rem; }
+.mode-panel label { display: block; margin-block: 0.5rem; }
+.mode-panel select, .mode-panel input { width: 100%; padding: 0.4rem; }
+.mode-panel__hint { font-size: 0.85em; color: var(--muted, #888); margin-block: 0.4rem; }
+@media (max-width: 600px) { .modes-section { grid-template-columns: 1fr; } }

@@ -110,6 +110,57 @@
       </div>
     </section>
 
+    <section class="modes-section">
+      <div class="mode-card" id="mode-card-buy">
+        <header class="mode-card__header"><span class="mode-card__title">BUY MODE</span><span class="mode-card__status" data-status="inactive">Inactive</span></header>
+        <div class="mode-card__body" data-empty="true">
+          <button class="mode-card__activate" data-kind="buy">Activate</button>
+        </div>
+        <div class="mode-card__body" data-empty="false" hidden>
+          <div class="mode-card__detail"><span class="label">Ends in</span><span class="value" data-field="countdown">—</span></div>
+          <div class="mode-card__detail"><span class="label">Ceiling</span><span class="value" data-field="ceiling">—</span></div>
+          <button class="mode-card__cancel" data-kind="buy">Cancel</button>
+        </div>
+      </div>
+      <div class="mode-card" id="mode-card-conserve">
+        <header class="mode-card__header"><span class="mode-card__title">CONSERVE MODE</span><span class="mode-card__status" data-status="inactive">Inactive</span></header>
+        <div class="mode-card__body" data-empty="true">
+          <button class="mode-card__activate" data-kind="conserve">Activate</button>
+        </div>
+        <div class="mode-card__body" data-empty="false" hidden>
+          <div class="mode-card__detail"><span class="label">Ends in</span><span class="value" data-field="countdown">—</span></div>
+          <div class="mode-card__detail"><span class="label">Floor</span><span class="value" data-field="floor">—</span></div>
+          <button class="mode-card__cancel" data-kind="conserve">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <dialog id="mode-activate-panel" class="mode-panel">
+      <form method="dialog" id="mode-activate-form">
+        <h2 id="mode-panel-title">Activate mode</h2>
+        <label>Duration
+          <select name="duration_minutes" id="mode-duration">
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+            <option value="60" selected>1 h</option>
+            <option value="120">2 h</option>
+            <option value="240">4 h</option>
+            <option value="480">8 h</option>
+            <option value="1440">24 h</option>
+            <option value="2880">48 h</option>
+          </select>
+        </label>
+        <label id="mode-threshold-label">Threshold (c/kWh)
+          <input type="number" name="threshold" id="mode-threshold" min="0.01" max="100" step="0.01" required>
+        </label>
+        <p id="mode-suggest-hint" class="mode-panel__hint"></p>
+        <menu>
+          <button value="cancel">Cancel</button>
+          <button value="submit" id="mode-submit">Activate</button>
+        </menu>
+      </form>
+    </dialog>
+
     <section class="panel panel-events">
       <div class="panel-header">
         <h2>Recent events</h2>
