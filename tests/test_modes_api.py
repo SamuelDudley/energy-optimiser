@@ -10,6 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from optimiser.api.handlers.modes import register_modes_routes
+from optimiser.api.probe import SERVICE_PROBE_KEY
 from optimiser.modes import ActiveMode, ModeManager
 
 NOW = datetime(2026, 5, 19, 4, 0, 0, tzinfo=UTC)
@@ -28,7 +29,7 @@ class _Probe:
 async def client(tmp_path) -> TestClient:
     app = web.Application()
     mgr = ModeManager(tmp_path / "active_modes.json")
-    app["service_probe"] = _Probe(mgr)
+    app[SERVICE_PROBE_KEY] = _Probe(mgr)
     register_modes_routes(app)
     server = TestServer(app)
     await server.start_server()
@@ -170,7 +171,7 @@ async def test_suggest_buy_ceiling(client) -> None:
         )
         for i, p in enumerate([5, 6, 7, 8, 9, 10, 11, 12])
     ]
-    client.app["service_probe"].amber_price_window = lambda end_at: strip
+    client.app[SERVICE_PROBE_KEY].amber_price_window = lambda end_at: strip
 
     resp = await client.get("/modes/suggest?kind=buy&duration_minutes=40")
     assert resp.status == 200
@@ -197,7 +198,7 @@ async def test_suggest_conserve_floor(client) -> None:
         )
         for i, p in enumerate([5, 6, 7, 8, 9, 10, 15, 20, 25, 30])
     ]
-    client.app["service_probe"].amber_price_window = lambda end_at: strip
+    client.app[SERVICE_PROBE_KEY].amber_price_window = lambda end_at: strip
 
     resp = await client.get("/modes/suggest?kind=conserve&duration_minutes=50")
     assert resp.status == 200

@@ -9,6 +9,7 @@ from typing import Any
 from aiohttp import web
 
 from ...modes import ActiveMode
+from ..probe import SERVICE_PROBE_KEY
 
 MAX_WINDOW = timedelta(hours=48)
 _THRESHOLD_MIN_EXCLUSIVE = 0.0
@@ -65,7 +66,7 @@ async def _activate_handler(request: web.Request, kind: str, param_name: str) ->
     if err:
         return _bad(err)
 
-    mm = request.app["service_probe"].mode_manager
+    mm = request.app[SERVICE_PROBE_KEY].mode_manager
     mode = mm.activate(
         ActiveMode(
             kind=kind,  # type: ignore[arg-type]
@@ -87,19 +88,19 @@ async def activate_conserve(request: web.Request) -> web.Response:
 
 
 async def cancel_buy(request: web.Request) -> web.Response:
-    mm = request.app["service_probe"].mode_manager
+    mm = request.app[SERVICE_PROBE_KEY].mode_manager
     removed = mm.cancel("buy")
     return web.Response(status=204) if removed else web.Response(status=404)
 
 
 async def cancel_conserve(request: web.Request) -> web.Response:
-    mm = request.app["service_probe"].mode_manager
+    mm = request.app[SERVICE_PROBE_KEY].mode_manager
     removed = mm.cancel("conserve")
     return web.Response(status=204) if removed else web.Response(status=404)
 
 
 async def list_modes(request: web.Request) -> web.Response:
-    mm = request.app["service_probe"].mode_manager
+    mm = request.app[SERVICE_PROBE_KEY].mode_manager
     now = datetime.now(UTC)
     modes = [m.to_dict() for m in mm.active(now)]
     return web.json_response({"modes": modes, "now": now.isoformat()})
@@ -116,7 +117,7 @@ async def suggest(request: web.Request) -> web.Response:
     if duration_minutes <= 0 or duration_minutes > 48 * 60:
         return _bad("duration_minutes must be in (0, 2880]")
 
-    probe = request.app["service_probe"]
+    probe = request.app[SERVICE_PROBE_KEY]
     end_at = datetime.now(UTC) + timedelta(minutes=duration_minutes)
     strip = probe.amber_price_window(end_at)
     if not strip:
