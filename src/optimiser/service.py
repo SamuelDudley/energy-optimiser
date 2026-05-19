@@ -45,6 +45,7 @@ from .state_machine import StateMachine
 from .store import TelemetryStore
 from .time_utils import now_utc, snap_to_interval
 from .types import (
+    ActiveModeRecord,
     BatteryAction,
     EventType,
     LoadTelemetryRow,
@@ -721,6 +722,14 @@ class Service:
 
         # 12. Write tick snapshot
         try:
+            active_modes = tuple(
+                ActiveModeRecord(
+                    kind=m.kind,
+                    end_at=m.end_at,
+                    params=dict(m.params),
+                )
+                for m in self._mode_manager.active(state.timestamp)
+            )
             snapshot = TickSnapshot(
                 tick_id=tick_id,
                 timestamp=now,
@@ -739,6 +748,7 @@ class Service:
                 system_state_post_dispatch=state_post_dispatch,
                 pv_probe=pv_probe,
                 pv_avail_slot_0_used_kw=pv_probe_lp_override_kw,
+                active_modes=active_modes,
             )
             self._snapshots.write(snapshot)
             self._last_snapshot = snapshot

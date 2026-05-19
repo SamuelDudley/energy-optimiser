@@ -429,6 +429,15 @@ class PVProbeResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ActiveModeRecord:
+    """Lightweight serialisable view of one active mode at snapshot time."""
+
+    kind: str  # "buy" | "conserve"
+    end_at: datetime
+    params: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
 class TickSnapshot:
     tick_id: str
     timestamp: datetime
@@ -465,6 +474,10 @@ class TickSnapshot:
     # (LP fell back to Solcast). Replay reads this to reproduce the
     # exact LP input the live tick saw.
     pv_avail_slot_0_used_kw: float | None = None
+    # User-strategy modes active at solve time (slot 0 inclusive).
+    # Restored from this field by the replay tool so historical
+    # re-solves can reproduce mode-aware decisions.
+    active_modes: tuple[ActiveModeRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

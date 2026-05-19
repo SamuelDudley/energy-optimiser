@@ -123,8 +123,7 @@ def test_post_dispatch_state_round_trips(tmp_path: Path) -> None:
         occupied=None,
     )
     snap_with_post = snap.__class__(
-        **{**{k: getattr(snap, k) for k in snap.__slots__},
-           "system_state_post_dispatch": post},
+        **{**{k: getattr(snap, k) for k in snap.__slots__}, "system_state_post_dispatch": post},
     )
     w.write(snap_with_post)
     w.write(snap)  # default: post-dispatch is None
@@ -139,3 +138,33 @@ def test_post_dispatch_state_round_trips(tmp_path: Path) -> None:
     assert lines[0]["system_state"]["battery_power_kw"] == 0.0
     # Second snapshot has no post-dispatch reading
     assert lines[1]["system_state_post_dispatch"] is None
+
+
+def test_tick_snapshot_active_modes_round_trip(tmp_path: Path) -> None:
+    """active_modes field survives the SnapshotWriter NDJSON round-trip."""
+    import dataclasses
+
+    from optimiser.types import ActiveModeRecord
+
+    ts = datetime(2099, 5, 19, 4, 0, tzinfo=UTC)
+    snap = _snap(ts)
+    snap = dataclasses.replace(
+        snap,
+        active_modes=(
+            ActiveModeRecord(
+                kind="buy",
+                end_at=datetime(2099, 5, 19, 6, 0, 0, tzinfo=UTC),
+                params={"ceiling_c_per_kwh": 12.0},
+            ),
+        ),
+    )
+    w = SnapshotWriter(tmp_path)
+    w.write(snap)
+
+    path = tmp_path / "2099-05-19.ndjson.gz"
+    with gzip.open(path, "rt") as f:
+        row = json.loads(f.readline())
+    assert "active_modes" in row
+    assert len(row["active_modes"]) == 1
+    assert row["active_modes"][0]["kind"] == "buy"
+    assert row["active_modes"][0]["params"]["ceiling_c_per_kwh"] == 12.0
