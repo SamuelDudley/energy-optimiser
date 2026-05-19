@@ -64,6 +64,17 @@ def main() -> None:
             "the initial SOC."
         ),
     )
+    parser.add_argument(
+        "--respect-modes",
+        dest="respect_modes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reconstruct mode_overrides from snapshot.active_modes during "
+            "replay (default: True). Use --no-respect-modes to A/B against "
+            "a baseline that ignores any active user-strategy modes."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -93,6 +104,7 @@ def main() -> None:
             snapshots,
             candidate_battery_config=config.battery,
             candidate_managed_loads=config.managed_loads,
+            respect_modes=args.respect_modes,
         ):
             results.append(result)
 

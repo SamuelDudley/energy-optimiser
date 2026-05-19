@@ -40,8 +40,10 @@ from .lp.loads import build_lp_loads
 from .lp.result import SolveStatus
 from .lp.snapshot_adapter import lp_solution_to_planner_output
 from .lp.solver import solve_stochastic
+from .modes import ModeOverrides
 from .time_utils import parse_iso
 from .types import (
+    ActiveModeRecord,
     BatteryAction,
     LoadCategory,
     LoadCycleState,
@@ -79,6 +81,33 @@ class ReplayResult:
     candidate_reason: str
     candidate_solve_status: str  # 'optimal' / 'infeasible' / etc.
     candidate_solve_ms: int  # Useful for performance regression detection
+
+
+# ── Mode reconstruction (replay reproducibility) ─────────────────
+
+
+def build_overrides_from_snapshot(
+    snap_modes: tuple[ActiveModeRecord, ...],
+    now: datetime,
+    slots: list[datetime],
+) -> ModeOverrides:
+    """Reconstruct ModeOverrides from the snapshot's active_modes field.
+
+    Mirrors ModeManager.to_overrides() but operates on the frozen
+    snapshot record rather than live state, so historical replays
+    reproduce the exact mode-aware decisions the LP made at the time.
+    """
+    by_kind = {m.kind: m for m in snap_modes}
+    buy = by_kind.get("buy")
+    conserve = by_kind.get("conserve")
+    return ModeOverrides(
+        buy_active_at=tuple((buy is not None and slot < buy.end_at) for slot in slots),
+        buy_ceiling_c_per_kwh=(buy.params["ceiling_c_per_kwh"] if buy else None),
+        conserve_active_at=tuple(
+            (conserve is not None and slot < conserve.end_at) for slot in slots
+        ),
+        conserve_floor_c_per_kwh=(conserve.params["floor_c_per_kwh"] if conserve else None),
+    )
 
 
 # ── Snapshot reconstruction (unchanged from greedy version) ──────
@@ -137,6 +166,14 @@ def _reconstruct_load_profile(d: dict) -> LoadProfile:
         slots=d["slots"],
         maturity_level=d["maturity_level"],
         context=d["context"],
+    )
+
+
+def _reconstruct_active_mode(d: dict) -> ActiveModeRecord:
+    return ActiveModeRecord(
+        kind=d["kind"],
+        end_at=parse_iso(d["end_at"]),
+        params=dict(d.get("params") or {}),
     )
 
 
@@ -201,6 +238,12 @@ def _reconstruct_snapshot(raw: dict) -> TickSnapshot:
             soc_pct=pv_probe_raw.get("soc_pct"),
         )
 
+    # Active user-strategy modes are optional (introduced 2026-05-19). Old
+    # snapshots predate the field — fall through to an empty tuple so the
+    # candidate solve sees no overrides (same as if no mode was active).
+    active_modes_raw = raw.get("active_modes") or ()
+    active_modes = tuple(_reconstruct_active_mode(m) for m in active_modes_raw)
+
     return TickSnapshot(
         tick_id=raw["tick_id"],
         timestamp=parse_iso(raw["timestamp"]),
@@ -221,6 +264,7 @@ def _reconstruct_snapshot(raw: dict) -> TickSnapshot:
         lp_dispatch=None,
         pv_probe=pv_probe,
         pv_avail_slot_0_used_kw=raw.get("pv_avail_slot_0_used_kw"),
+        active_modes=active_modes,
     )
 
 
@@ -310,6 +354,7 @@ def replay(
     candidate_battery_config: BatteryConfig,
     candidate_managed_loads: list[ManagedLoadConfig] | None = None,
     candidate_scenario_weights: dict[str, float] | None = None,
+    respect_modes: bool = True,
 ) -> Iterator[ReplayResult]:
     """Replay a candidate LP configuration against historical snapshots.
 
@@ -331,6 +376,10 @@ def replay(
             into the comparison.
         candidate_scenario_weights: stochastic LP scenario weights. None
             uses the LP's defaults (P10:0.20, P50:0.60, P90:0.20).
+        respect_modes: when True (default), reconstruct ``ModeOverrides``
+            from each snapshot's ``active_modes`` so historical re-solves
+            reproduce the mode-aware decisions the live LP made. Set False
+            to A/B "what if no mode was active" against the same tick.
     """
     candidate_lp_loads = build_lp_loads(candidate_managed_loads or [])
 
@@ -342,6 +391,7 @@ def replay(
             battery_config=candidate_battery_config,
             lp_loads=candidate_lp_loads,
             scenario_weights=candidate_scenario_weights,
+            respect_modes=respect_modes,
         )
 
         # Cost both via the same model. Either side may return None when
@@ -394,6 +444,7 @@ def _solve_candidate(
     battery_config: BatteryConfig,
     lp_loads,
     scenario_weights: dict[str, float] | None,
+    respect_modes: bool = True,
 ) -> tuple[BatteryAction, str, str, int]:
     """Run one candidate solve, returning `(action, reason, status, solve_ms)`.
 
@@ -401,6 +452,24 @@ def _solve_candidate(
     runtime fallback behaviour, so the replay reflects what would have
     actually happened.
     """
+    # Reconstruct the slot grid the LP will see so we can pre-compute the
+    # ModeOverrides mask. Mirrors `_slot_grid` + `_truncate_to_priced` in
+    # `lp/formulation.py`. Importing those would create a cycle with the
+    # solver module, so we lift the constants and inline the logic.
+    from .lp.constants import HORIZON_HOURS, SLOT_MINUTES
+    from .lp.formulation import _slot_grid, _truncate_to_priced
+
+    snap_modes = getattr(snap, "active_modes", ()) if respect_modes else ()
+    slot_grid = _truncate_to_priced(
+        _slot_grid(snap.system_state.timestamp, HORIZON_HOURS, SLOT_MINUTES),
+        snap.price_forecast,
+    )
+    overrides = build_overrides_from_snapshot(
+        snap_modes,
+        snap.system_state.timestamp,
+        slot_grid,
+    )
+
     try:
         solution = solve_stochastic(
             state=snap.system_state,
@@ -417,6 +486,7 @@ def _solve_candidate(
             # P10/P50/P90 forecast at slot-0 while the live LP saw a
             # measured value, biasing the comparison.
             slot_0_pv_override_kw=snap.pv_avail_slot_0_used_kw,
+            mode_overrides=overrides,
         )
     except Exception as exc:
         logger.warning("Candidate solve raised for %s: %s", snap.tick_id, exc)
