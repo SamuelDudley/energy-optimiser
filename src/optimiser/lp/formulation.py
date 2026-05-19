@@ -706,9 +706,26 @@ def _add_scenario_to_problem(
             cost_terms.append(
                 -weight * grid_import[t] * IMPORT_TIE_BREAK_REWARD_PER_KWH * slot_hours
             )
+        # Wear cost. Per-slot factors zero out the relevant component
+        # under user-strategy mode overrides:
+        #   - buy mode at slot t   → wear on bat_charge_grid is 0
+        #   - conserve mode at slot t → wear on bat_charge_pv is 0
+        # Moot above buy ceiling (bat_charge_grid is pinned to 0 there)
+        # but harmless to include the factor. Discharge-side wear is
+        # unchanged.
+        wear_grid_factor = (
+            0.0 if (mode_overrides is not None and mode_overrides.buy_active_at[t]) else 1.0
+        )
+        wear_pv_factor = (
+            0.0 if (mode_overrides is not None and mode_overrides.conserve_active_at[t]) else 1.0
+        )
         cost_terms.append(
             weight
-            * (bat_charge_grid[t] + bat_charge_pv[t] + bat_discharge[t])
+            * (
+                bat_charge_grid[t] * wear_grid_factor
+                + bat_charge_pv[t] * wear_pv_factor
+                + bat_discharge[t]
+            )
             * wear_cost_per_kwh
             * slot_hours
         )

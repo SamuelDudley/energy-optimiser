@@ -168,3 +168,84 @@ def test_conserve_mode_blocks_battery_export_below_floor() -> None:
     # Sub-floor slot must export only PV (which is zero here since no
     # PV forecast → 0).
     assert base[2].grid_export_kw <= base[2].pv_to_export_kw + 1e-6
+
+
+def test_buy_mode_wear_discount_increases_grid_charge() -> None:
+    """With buy mode active and a marginal-arbitrage scenario, the
+    wear discount should tip the LP into charging more.
+
+    Setup: marginal arbitrage where the spread (5c) is below the full
+    wear-cost round-trip (5c) plus efficiency loss but above the
+    discounted round-trip (2.5c wear + efficiency). Without the buy-
+    mode wear discount, the LP refuses to cycle; with the discount,
+    it charges hard in the cheap window.
+    """
+    # 06:00 UTC == 16:00 Canberra. 2h horizon ends at 18:00 NEM where
+    # terminal_soc_floor_pct = 28% — keeps the LP from just discharging
+    # to floor and never grid-charging.
+    now = datetime(2026, 5, 19, 6, 0, 0, tzinfo=UTC)
+    n_slots = 24  # 2h horizon at 5min slots
+    imports = [18.0] * 6 + [23.0] * (n_slots - 6)  # cheap-ish then expensive
+    exports = [3.0] * n_slots
+    state = SystemState(
+        timestamp=now,
+        soc_pct=30.0,
+        battery_power_kw=0.0,
+        pv_power_kw=0.0,
+        grid_power_kw=0.0,
+        house_load_kw=0.0,
+        ems_mode=2,
+        outdoor_temp_c=20.0,
+        occupied=True,
+    )
+    prices = [
+        PriceInterval(
+            start=now + SLOT * i,
+            end=now + SLOT * (i + 1),
+            import_per_kwh=imports[i],
+            export_per_kwh=exports[i],
+            spot_per_kwh=imports[i] * 0.3,
+            renewables_pct=40.0,
+            spike_status="none",
+            descriptor="neutral",
+        )
+        for i in range(n_slots)
+    ]
+    profile = _profile(2.0)
+    battery = _battery()
+    lp_loads = build_lp_loads(configs=[])
+
+    # Baseline: no overrides.
+    base_result = solve_stochastic(
+        state=state,
+        prices_planning=prices,
+        pv_forecast=None,
+        load_profile=profile,
+        managed_loads=[],
+        lp_loads=lp_loads,
+        battery_config=battery,
+    )
+
+    # Buy mode active across the cheap window (first 6 slots),
+    # ceiling well above the cheap-import price so no ceiling block.
+    overrides = ModeOverrides(
+        buy_active_at=tuple([True] * 6 + [False] * (n_slots - 6)),
+        buy_ceiling_c_per_kwh=20.0,
+        conserve_active_at=tuple([False] * n_slots),
+        conserve_floor_c_per_kwh=None,
+    )
+    with_buy = solve_stochastic(
+        state=state,
+        prices_planning=prices,
+        pv_forecast=None,
+        load_profile=profile,
+        managed_loads=[],
+        lp_loads=lp_loads,
+        battery_config=battery,
+        mode_overrides=overrides,
+    )
+
+    base_charge = sum(slot.grid_to_battery_kw for slot in base_result.forward_trajectory[:6])
+    buy_charge = sum(slot.grid_to_battery_kw for slot in with_buy.forward_trajectory[:6])
+    # Discount should push charging strictly higher in the in-window slots.
+    assert buy_charge > base_charge + 1e-3
