@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import pulp
 
@@ -30,6 +31,9 @@ from .formulation import LPVars, build_lp, build_stochastic_lp
 from .loads import LPLoad
 from .result import LPSolution, SlotDecision, SolveStatus
 
+if TYPE_CHECKING:
+    from ..modes import ModeOverrides
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +46,7 @@ def solve(
     lp_loads: list[LPLoad],
     battery_config: BatteryConfig,
     timeout_s: float = SOLVER_TIMEOUT_S,
+    mode_overrides: ModeOverrides | None = None,
 ) -> LPSolution:
     """Build and solve the deterministic LP. Returns an `LPSolution`."""
     t0 = time.monotonic()
@@ -54,6 +59,7 @@ def solve(
             managed_loads=managed_loads,
             lp_loads=lp_loads,
             battery_config=battery_config,
+            mode_overrides=mode_overrides,
         )
     except Exception as exc:
         logger.exception("LP build failed")
@@ -84,6 +90,7 @@ def solve_stochastic(
     price_scenario_mode=None,  # type: ignore[no-untyped-def]
     slot_0_pv_override_kw: float | None = None,
     terminal_floor_override_pct: float | None = None,
+    mode_overrides: ModeOverrides | None = None,
 ) -> LPSolution:
     """Build and solve the stochastic LP across compound (PV × price)
     scenarios.
@@ -117,6 +124,7 @@ def solve_stochastic(
             price_scenario_mode=price_scenario_mode,
             slot_0_pv_override_kw=slot_0_pv_override_kw,
             terminal_floor_override_pct=terminal_floor_override_pct,
+            mode_overrides=mode_overrides,
         )
     except Exception as exc:
         logger.exception("Stochastic LP build failed")
