@@ -259,6 +259,24 @@ class PlannerConfig:
     # max(operational floor, backup, cutoff) inside the LP, so it
     # cannot drop below the safety floor.
     lp_terminal_floor_override_pct: float | None = None
+    # Load profile statistic + smoothing. The LP's `house_base` is
+    # currently a deterministic per-slot baseline derived from the last
+    # 90 days of telemetry. Two known weaknesses, both addressed here:
+    #
+    # (1) `AVG` is pulled up by rare high-load days (one big-cook
+    #     evening lifts the slot's mean for the next 90 days). The LP
+    #     then reserves SOC for a peak that usually doesn't recur and
+    #     skips evening-export arbitrage. `median` is robust to single
+    #     outliers and is the better point estimate of a "typical day".
+    # (2) Sharp single-slot peaks encode a false precision about when
+    #     an event lands. A 3- or 5-slot boxcar redistributes that
+    #     mass across the window. Energy-preserving (daily total
+    #     unchanged), wraps around the day boundary.
+    #
+    # Defaults preserve historical behaviour. Flip via config.toml to
+    # A/B in /sim-sweep before changing defaults.
+    lp_load_statistic: str = "mean"
+    lp_load_smoothing_slots: int = 1
 
     @property
     def lp_scenario_weights(self) -> dict[str, float]:

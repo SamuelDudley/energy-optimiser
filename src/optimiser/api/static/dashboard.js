@@ -6,16 +6,19 @@
 // noise added "for visual interest".
 //
 // Data sources, in order of authority:
-//   /plan/current        — the in-memory TickSnapshot. Drives "now" and
-//                          all future projections. Polled every 15 s.
+//   /dashboard/stream    — SSE push of TickSnapshots. Primary "now"
+//                          source; fires once per tick (~60 s). The
+//                          `/plan/current` poll below is a fallback
+//                          used only while the stream is disconnected.
+//   /plan/current        — fallback snapshot fetch when SSE is down.
 //   /telemetry           — historical 5-min rows. Past lines.
 //   /dashboard/config    — battery config (soc_floor_pct etc.).
 //   /logs                — recent operational events.
 //
 // Layout: one Plotly figure (#ts-figure) holds 6 stacked subplots that
 // share a single x-axis: prices, decision ribbon, solar, SOC, grid,
-// cost. A separate Plotly figure (#sankey-figure) holds the energy-flow
-// Sankey, redrawn whenever the cursor moves. Status strip and loads /
+// cost. A second figure (#sankey-today-figure) holds the today/range
+// energy-flow Sankey, summed from telemetry. Status strip and loads /
 // events are plain DOM.
 
 "use strict";
@@ -25,6 +28,10 @@
 const POLL_INTERVAL_MS = 15_000;
 const HISTORY_LOOKBACK_MS = 24 * 3600 * 1000;       // past 24h
 const FUTURE_HORIZON_MS = 48 * 3600 * 1000;          // x-axis right edge
+// Telemetry rows land every 5 min; refresh history at twice that rate so
+// the chart's right edge keeps marching forward without the SSE-driven
+// cursor pulling away from the last drawn sample.
+const HISTORY_REFRESH_MS = 150_000;
 
 const TOKEN_LS_KEY = "eo_dashboard_token";
 
@@ -216,6 +223,7 @@ const state = {
   config: null,
   snapshot: null,
   ready: null,                    // /readyz response: { ok, state, sigenergy_connected }
+  sseConnected: false,            // true while /dashboard/stream is live; falls back to polling when false
   history: {
     rows: [],                    // telemetry rows ascending by ts
     priceForecast: [],           // latest forecast band per (interval_start, resolution)
@@ -223,6 +231,8 @@ const state = {
     amberUsage: [],              // amber_usage rows (settled per-5-min spend)
     loadTelemetry: [],           // load_telemetry rows (per-load 5-min power/energy)
     dailySpend: [],              // /daily_spend rows (descending by nem_date)
+    loadedAt: 0,                 // ms epoch of last successful loadHistory()
+    inFlight: false,             // guard against overlapping refreshes
   },
   events: [],                     // recent notable events
   cursor: {
@@ -234,7 +244,7 @@ const state = {
   // the past, no snapshot forward overlay, x-axis fixed to the range.
   range: null,
   activePreset: "live",
-  built: { ts: false, sankey: false, sankeyToday: false, spend: false },
+  built: { ts: false, sankeyToday: false, spend: false },
 };
 
 function isHistorical() { return state.range != null; }
@@ -569,31 +579,6 @@ function disambiguateFlows({ pv, batt, grid, load }) {
   return out;
 }
 
-// Same shape directly off a SlotDecision (no inference).
-function flowsFromSlot(slot) {
-  if (!slot) return null;
-  const b = slot.battery_kw ?? 0;
-  const battDischarge = b < 0 ? -b : 0;
-  // The slot carries pv_to_export and grid_export; battery's contribution
-  // to export is whatever export isn't covered by PV.
-  const grid_export = slot.grid_export_kw ?? 0;
-  const pv_to_export = slot.pv_to_export_kw ?? 0;
-  const batt_to_export = Math.max(0, grid_export - pv_to_export);
-  const batt_to_load = Math.max(0, battDischarge - batt_to_export);
-  // grid_import covers grid→batt and grid→load.
-  const grid_to_batt = slot.grid_to_battery_kw ?? 0;
-  const grid_to_load = Math.max(0, (slot.grid_import_kw ?? 0) - grid_to_batt);
-  return {
-    pv_to_load: slot.pv_to_house_kw ?? 0,
-    pv_to_batt: slot.pv_to_battery_kw ?? 0,
-    pv_to_export: pv_to_export,
-    grid_to_load: grid_to_load,
-    grid_to_batt: grid_to_batt,
-    batt_to_load: batt_to_load,
-    batt_to_export: batt_to_export,
-  };
-}
-
 // ── Cursor model ───────────────────────────────────────────────────
 
 function nowFromSnapshot() {
@@ -643,7 +628,6 @@ function setCursor(time, { pinned } = {}) {
   state.cursor.time = time;
   if (pinned !== undefined) state.cursor.pinned = pinned;
   renderCursorReadout();
-  redrawSankey();
   redrawCursorLine();
   redrawSpendCursor();
 }
@@ -654,7 +638,6 @@ function snapToNow() {
   // resolve to the latest in-range telemetry row instead.
   state.cursor.time = isHistorical() ? null : nowFromSnapshot();
   renderCursorReadout();
-  redrawSankey();
   redrawCursorLine();
   redrawSpendCursor();
 }
@@ -666,6 +649,23 @@ function nearestSlotAt(time) {
 }
 
 // ── Status strip ───────────────────────────────────────────────────
+
+// Refresh just the "Ns · vX.Y.Z" freshness chip from the cached snapshot.
+// Cheap (one DOM write); designed to be called from a 1 s interval so
+// the age counter advances smoothly even though full snapshots only
+// arrive once per tick.
+function renderTickAge() {
+  const el = document.getElementById("status-tick-age");
+  if (!el) return;
+  const snap = state.snapshot;
+  if (!snap) { el.textContent = "—"; return; }
+  const tickAgeS = (Date.now() - new Date(snap.timestamp).getTime()) / 1000;
+  // Two spans so mobile CSS can hide "· v0.2.0" without dropping the
+  // freshness indicator. Desktop keeps the full text.
+  el.innerHTML =
+    `<span class="tick-age">${tickAgeS.toFixed(0)}s</span>` +
+    `<span class="tick-version"> · v${escapeHtml(snap.version)}</span>`;
+}
 
 function renderStatusStrip() {
   const snap = state.snapshot;
@@ -684,30 +684,43 @@ function renderStatusStrip() {
     return;
   }
 
-  // State badge: prefer the actual ServiceState from /readyz; if that
-  // hasn't arrived yet, fall back to the LP solve status from the
-  // snapshot — we never invent "ACTIVE" without evidence.
+  // State badge priority:
+  //   1. Plumbing problems (FALLBACK / DEGRADED / INITIALISE) — these
+  //      dominate over LP solve quality, so they win whenever ready.state
+  //      is anything other than "active".
+  //   2. LP solve status (OPTIMAL / FEASIBLE / INFEASIBLE / TIMEOUT) —
+  //      when the service is healthy, the user-facing question is "is the
+  //      LP doing its job", not "is the process running".
+  //   3. Whatever ready.state says, as a last resort.
+  // We never invent "ACTIVE" without evidence — the LP-status path only
+  // triggers when there's a real lp_solution attached to the snapshot.
+  // "LP " prefix dropped to keep the badge compact; the "Service" label
+  // above the badge already supplies the context.
   const ready = state.ready;
   const lp = snap.lp_solution;
   const lpStatus = lp ? lp.status : null;
   let badgeKey = "unknown", badgeText = "—";
-  if (ready && ready.state) {
+  if (ready && ready.state && ready.state !== "active") {
     badgeKey = ready.state;
     badgeText = ready.state.toUpperCase();
     if (ready.sigenergy_connected === false) badgeText += " (NO INV)";
   } else if (lpStatus) {
     badgeKey = (lpStatus === "optimal" || lpStatus === "feasible") ? "active" : "degraded";
-    badgeText = `LP ${lpStatus.toUpperCase()}`;
+    badgeText = lpStatus.toUpperCase();
+    if (ready && ready.sigenergy_connected === false) badgeText += " (NO INV)";
+  } else if (ready && ready.state) {
+    badgeKey = ready.state;
+    badgeText = ready.state.toUpperCase();
+    if (ready.sigenergy_connected === false) badgeText += " (NO INV)";
   }
   stateEl.textContent = badgeText;
   stateEl.className = `status-value ${STATE_CLASS[badgeKey] || "status-state-unknown"}`;
 
-  const tickAgeS = (Date.now() - new Date(snap.timestamp).getTime()) / 1000;
-  // Two spans so mobile CSS can hide "· v0.2.0" without dropping the
-  // freshness indicator. Desktop keeps the full text.
-  tickAgeEl.innerHTML =
-    `<span class="tick-age">${tickAgeS.toFixed(0)}s</span>` +
-    `<span class="tick-version"> · v${escapeHtml(snap.version)}</span>`;
+  // Tick-age is its own render so a 1 s interval can refresh it
+  // between snapshots — under SSE, full status renders only fire on
+  // each new tick (~60 s), but the age counter should still tick
+  // smoothly so the "freshness" signal is honest.
+  renderTickAge();
 
   // SOC + SOH from system_state (post-dispatch preferred).
   const ss = snap.system_state_post_dispatch || snap.system_state;
@@ -1730,79 +1743,6 @@ function onPlotlyClick(ev) {
 
 // ── Sankey ─────────────────────────────────────────────────────────
 
-function flowsAtCursor() {
-  // Returns { flows, label, source } where source ∈ {planned, measured, telemetry}.
-  const t = effectiveCursor();
-  if (!t) return null;
-  const tMs = +t;
-  // Historical mode: always read from telemetry — there's no "future" or
-  // "now" to fall through to.
-  if (isHistorical()) {
-    const row = state.history.rows.find((r) => {
-      const rs = +new Date(r.ts);
-      return rs <= tMs && tMs < rs + SLOT_MS;
-    });
-    if (!row) return null;
-    const flows = disambiguateFlows({
-      pv: row.pv_kw, batt: row.battery_kw,
-      grid: row.grid_kw, load: row.house_load_kw,
-    });
-    if (!flows) return null;
-    return { flows, label: `measured · ${fmtTime(row.ts)}`, source: "telemetry" };
-  }
-  const now = nowFromSnapshot();
-  if (!now) return null;
-  const nowMs = +now;
-
-  // Future ⇒ planned slot from forward_trajectory.
-  if (tMs > nowMs) {
-    const fwd = state.snapshot?.lp_solution?.forward_trajectory || [];
-    const slot = fwd.find((s) => {
-      const ss = +new Date(s.slot_start);
-      return ss <= tMs && tMs < ss + SLOT_MS;
-    });
-    if (!slot) return null;
-    return { flows: flowsFromSlot(slot), label: `planned · ${fmtTime(slot.slot_start)}`, source: "planned" };
-  }
-
-  // "Now" — within the most recent slot relative to snapshot. Try
-  // measured (post-dispatch state) first; fall back to slot_0 plan if
-  // any of the four signals is null (grid sensor offline, etc.) so the
-  // operator still sees a useful flow diagram.
-  if (Math.abs(tMs - nowMs) < SLOT_MS) {
-    const ss = state.snapshot?.system_state_post_dispatch || state.snapshot?.system_state;
-    if (ss) {
-      const flows = disambiguateFlows({
-        pv: ss.pv_power_kw, batt: ss.battery_power_kw,
-        grid: ss.grid_power_kw, load: ss.house_load_kw,
-      });
-      if (flows) {
-        return { flows, label: `measured · ${fmtTime(state.snapshot.timestamp)}`, source: "measured" };
-      }
-    }
-    // Fall back to the LP's slot-0 plan — labelled clearly so the user
-    // sees this is the *plan*, not measurement.
-    const slot0 = state.snapshot?.lp_solution?.slot_0;
-    if (slot0) {
-      return { flows: flowsFromSlot(slot0), label: `slot-0 plan · ${fmtTime(slot0.slot_start)}`, source: "planned" };
-    }
-    return null;
-  }
-
-  // Past ⇒ telemetry row at that slot.
-  const row = state.history.rows.find((r) => {
-    const rs = +new Date(r.ts);
-    return rs <= tMs && tMs < rs + SLOT_MS;
-  });
-  if (!row) return null;
-  const flows = disambiguateFlows({
-    pv: row.pv_kw, batt: row.battery_kw,
-    grid: row.grid_kw, load: row.house_load_kw,
-  });
-  if (!flows) return null;
-  return { flows, label: `measured · ${fmtTime(row.ts)}`, source: "telemetry" };
-}
-
 // Plotly Sankey collapses links with value=0, which would make absent
 // flows disappear. We always emit all 7 link defs (so every source ↔
 // sink relationship is visible at all times, growing/shrinking rather
@@ -1854,31 +1794,6 @@ function buildSankeyTrace(flows, unit = "kW", precision = 2) {
       hovertemplate: "%{label}<extra></extra>",
     },
   };
-}
-
-async function redrawSankey() {
-  const div = document.getElementById("sankey-figure");
-  const subtitle = document.getElementById("sankey-subtitle");
-  const result = flowsAtCursor();
-  if (!result) {
-    subtitle.textContent = "no flow data at cursor";
-    // Wipe the prior Sankey so a stale frame doesn't sit there.
-    if (state.built.sankey) Plotly.purge(div);
-    state.built.sankey = false;
-    return;
-  }
-  subtitle.textContent = result.label;
-  const trace = buildSankeyTrace(result.flows);
-  // Plotly.react sometimes leaves Sankey in a half-rendered state when
-  // the node count is constant but link counts change. The cheap-but-
-  // reliable fix is purge + newPlot each redraw. Sankey is small —
-  // 6 nodes, ≤7 links — so the redraw cost is trivial.
-  Plotly.purge(div);
-  await Plotly.newPlot(div, [trace], sankeyLayout(), {
-    responsive: true, displaylogo: false,
-  });
-  state.built.sankey = true;
-  window.eoChart.registerPlot("sankey-figure");
 }
 
 function sankeyLayout() {
@@ -2122,7 +2037,113 @@ function redrawSpendCursor() {
   Plotly.relayout(div, { shapes: spendCursorShapes(dates) });
 }
 
-// ── Polling + auto-refresh ─────────────────────────────────────────
+// ── Live snapshot stream + auto-refresh ────────────────────────────
+
+// Apply a freshly-arrived snapshot — shared between the SSE push path
+// and the polling fallback path (used when SSE is disconnected).
+async function applySnapshot(snap) {
+  state.snapshot = snap;
+  clearError();
+
+  // Auto-advance cursor when not pinned. In historical mode, leave
+  // it on the latest in-range telemetry row (effectiveCursor handles
+  // that) — never jump it to live "now", which would be off-chart.
+  if (!state.cursor.pinned && !isHistorical()) {
+    state.cursor.time = nowFromSnapshot();
+  }
+
+  renderStatusStrip();
+  renderLoads();
+  renderCursorReadout();
+  // In historical mode the time-series figure is driven by static
+  // history; redrawing it on every snapshot poll just wastes work and
+  // can fight a hovered cursor. Status strip / loads / events still
+  // refresh because they reflect live operational state.
+  if (!isHistorical()) {
+    await redrawTSFigure();
+    await redrawDailySankey();
+    await redrawDailySpend();
+  }
+}
+
+// Long-lived SSE client. Uses fetch + ReadableStream (not EventSource)
+// so the bearer token rides on the Authorization header instead of
+// leaking into the URL query string. Reconnects with exponential
+// backoff on transient failures; gives up only on 401.
+const SSE_BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
+
+function parseSseFrame(frame) {
+  let event = "message";
+  let dataLines = [];
+  for (const line of frame.split("\n")) {
+    if (line === "" || line.startsWith(":")) continue;          // blank or comment
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (dataLines.length === 0) return null;
+  return { event, data: dataLines.join("\n") };
+}
+
+async function streamSnapshots() {
+  let attempt = 0;
+  while (true) {
+    if (!state.token) {
+      // Token not entered yet (or just cleared by a 401). Hold off.
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
+    try {
+      const res = await fetch("/dashboard/stream", {
+        headers: { "Authorization": `Bearer ${state.token}` },
+        cache: "no-store",
+      });
+      if (res.status === 401) {
+        localStorage.removeItem(TOKEN_LS_KEY);
+        state.token = null;
+        showError("SSE unauthorized — reload to re-enter token");
+        return;
+      }
+      if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`);
+
+      state.sseConnected = true;
+      attempt = 0;
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        // SSE frames are separated by a blank line. The server emits
+        // LF-only separators (see api/handlers/stream.py), so a plain
+        // "\n\n" indexOf is sufficient.
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const parsed = parseSseFrame(frame);
+          if (!parsed) continue;
+          if (parsed.event === "snapshot") {
+            try {
+              const snap = JSON.parse(parsed.data);
+              applySnapshot(snap).catch((err) => console.warn("applySnapshot failed", err));
+            } catch (err) {
+              console.warn("bad SSE snapshot payload", err);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("SSE stream error", err);
+    } finally {
+      state.sseConnected = false;
+    }
+    const delay = SSE_BACKOFF_MS[Math.min(attempt, SSE_BACKOFF_MS.length - 1)];
+    attempt += 1;
+    await new Promise((r) => setTimeout(r, delay));
+  }
+}
 
 async function pollOnce() {
   // Fetch /readyz first — it's public and tells us the actual service
@@ -2133,37 +2154,20 @@ async function pollOnce() {
     console.warn("readyz fetch failed", err);
   }
 
-  try {
-    const snap = await fetchSnapshot();
-    state.snapshot = snap;
-    clearError();
-
-    // Auto-advance cursor when not pinned. In historical mode, leave
-    // it on the latest in-range telemetry row (effectiveCursor handles
-    // that) — never jump it to live "now", which would be off-chart.
-    if (!state.cursor.pinned && !isHistorical()) {
-      state.cursor.time = nowFromSnapshot();
-    }
-
-    renderStatusStrip();
-    renderLoads();
-    renderCursorReadout();
-    // In historical mode the time-series figure is driven by static
-    // history; redrawing it on every snapshot poll just wastes work and
-    // can fight a hovered cursor. Status strip / loads / events still
-    // refresh because they reflect live operational state.
-    if (!isHistorical()) {
-      await redrawTSFigure();
-      await redrawSankey();
-      await redrawDailySankey();
-      await redrawDailySpend();
-    }
-  } catch (err) {
-    if (err.status === 503) {
-      showError("Service hasn't completed a tick yet (HTTP 503). Will retry.");
-    } else {
-      showError(`fetch failed: ${err.message}`);
-      console.warn(err);
+  // Snapshot path is normally driven by SSE. Fall back to polling
+  // /plan/current only while the SSE stream is disconnected (initial
+  // connect, reconnect backoff, or hard auth/network failure).
+  if (!state.sseConnected) {
+    try {
+      const snap = await fetchSnapshot();
+      await applySnapshot(snap);
+    } catch (err) {
+      if (err.status === 503) {
+        showError("Service hasn't completed a tick yet (HTTP 503). Will retry.");
+      } else {
+        showError(`fetch failed: ${err.message}`);
+        console.warn(err);
+      }
     }
   }
 
@@ -2194,49 +2198,71 @@ async function loadHistory() {
   //   historical → user-selected range, end-exclusive at midnight of `to+1`.
   // Partial failure is OK — each panel guards against its own data being
   // missing.
-  let sinceISO, untilISO;
-  if (state.range) {
-    sinceISO = state.range.from.toISOString();
-    untilISO = state.range.to.toISOString();
-  } else {
-    const now = new Date();
-    const since = new Date(+now - HISTORY_LOOKBACK_MS);
-    sinceISO = since.toISOString();
-    untilISO = now.toISOString();
+  if (state.history.inFlight) return;
+  state.history.inFlight = true;
+  try {
+    let sinceISO, untilISO;
+    if (state.range) {
+      sinceISO = state.range.from.toISOString();
+      untilISO = state.range.to.toISOString();
+    } else {
+      const now = new Date();
+      const since = new Date(+now - HISTORY_LOOKBACK_MS);
+      sinceISO = since.toISOString();
+      untilISO = now.toISOString();
+    }
+
+    const [tel, priceLog, pvLog, amberUsage, dailySpend, loadTel] = await Promise.allSettled([
+      fetchTelemetry(sinceISO, untilISO),
+      fetchPriceForecastLog(sinceISO, untilISO),
+      fetchPVForecastLog(sinceISO, untilISO),
+      // amber_usage only contains settled NEM days, so the most recent
+      // entries cover roughly the older half of the time-series window.
+      fetchAmberUsage(sinceISO, untilISO),
+      fetchDailySpend(60),
+      fetchLoadTelemetry(sinceISO, untilISO),
+    ]);
+
+    if (tel.status === "fulfilled") state.history.rows = tel.value;
+    else console.warn("telemetry fetch failed", tel.reason);
+
+    if (priceLog.status === "fulfilled") {
+      state.history.priceForecast = bucketLatestPriceForecast(priceLog.value);
+    } else console.warn("price_forecast_log fetch failed", priceLog.reason);
+
+    if (pvLog.status === "fulfilled") {
+      state.history.pvForecast = bucketLatestPVForecast(pvLog.value);
+    } else console.warn("pv_forecast_log fetch failed", pvLog.reason);
+
+    if (amberUsage.status === "fulfilled") {
+      state.history.amberUsage = amberUsage.value;
+    } else console.warn("amber_usage fetch failed", amberUsage.reason);
+
+    if (dailySpend.status === "fulfilled") {
+      state.history.dailySpend = dailySpend.value;
+    } else console.warn("daily_spend fetch failed", dailySpend.reason);
+
+    if (loadTel.status === "fulfilled") state.history.loadTelemetry = loadTel.value;
+    else console.warn("load_telemetry fetch failed", loadTel.reason);
+
+    state.history.loadedAt = Date.now();
+  } finally {
+    state.history.inFlight = false;
   }
+}
 
-  const [tel, priceLog, pvLog, amberUsage, dailySpend, loadTel] = await Promise.allSettled([
-    fetchTelemetry(sinceISO, untilISO),
-    fetchPriceForecastLog(sinceISO, untilISO),
-    fetchPVForecastLog(sinceISO, untilISO),
-    // amber_usage only contains settled NEM days, so the most recent
-    // entries cover roughly the older half of the time-series window.
-    fetchAmberUsage(sinceISO, untilISO),
-    fetchDailySpend(60),
-    fetchLoadTelemetry(sinceISO, untilISO),
-  ]);
-
-  if (tel.status === "fulfilled") state.history.rows = tel.value;
-  else console.warn("telemetry fetch failed", tel.reason);
-
-  if (priceLog.status === "fulfilled") {
-    state.history.priceForecast = bucketLatestPriceForecast(priceLog.value);
-  } else console.warn("price_forecast_log fetch failed", priceLog.reason);
-
-  if (pvLog.status === "fulfilled") {
-    state.history.pvForecast = bucketLatestPVForecast(pvLog.value);
-  } else console.warn("pv_forecast_log fetch failed", pvLog.reason);
-
-  if (amberUsage.status === "fulfilled") {
-    state.history.amberUsage = amberUsage.value;
-  } else console.warn("amber_usage fetch failed", amberUsage.reason);
-
-  if (dailySpend.status === "fulfilled") {
-    state.history.dailySpend = dailySpend.value;
-  } else console.warn("daily_spend fetch failed", dailySpend.reason);
-
-  if (loadTel.status === "fulfilled") state.history.loadTelemetry = loadTel.value;
-  else console.warn("load_telemetry fetch failed", loadTel.reason);
+// Refresh history if we're in live mode and it's gone stale. Used both
+// by the periodic poller and the visibilitychange handler — when a user
+// returns to a backgrounded tab the cursor has advanced via SSE while
+// loadHistory() was throttled, leaving the chart traces ending at the
+// last sample fetched before the tab was hidden.
+async function refreshLiveHistory({ force = false } = {}) {
+  if (isHistorical()) return;
+  if (!force && Date.now() - state.history.loadedAt < HISTORY_REFRESH_MS) return;
+  await loadHistory();
+  await redrawTSFigure();
+  await redrawDailySankey();
+  await redrawDailySpend();
 }
 
 // For each (interval_start, resolution), keep the latest fetched_at row
@@ -2411,7 +2437,6 @@ async function applyRange(range, presetName = null) {
   // (status strip, loads) keep showing live state regardless of mode.
   renderCursorReadout();
   await redrawTSFigure();
-  await redrawSankey();
   await redrawDailySankey();
   await redrawDailySpend();
 }
@@ -2465,7 +2490,6 @@ async function main() {
   window.eoChart.onBreakpointChange(() => {
     if (state.built.ts) redrawTSFigure();
     if (state.built.spend) redrawDailySpend();
-    if (state.built.sankey) redrawSankey();
     if (state.built.sankeyToday) redrawDailySankey();
   });
 
@@ -2473,13 +2497,37 @@ async function main() {
 
   await loadConfig();
   await loadHistory();
+  // Open the live SSE stream — this is the primary path for snapshot
+  // updates. pollOnce() is a fallback that only fires when SSE drops.
+  // Don't await: the fetch() resolves only when the stream ends.
+  streamSnapshots();
+  // Tick-age counter advances between snapshots. The full status strip
+  // only re-renders on each new TickSnapshot (~60 s under SSE); this
+  // 1 s interval just rewrites the "Ns" chip so the freshness reading
+  // stays honest.
+  setInterval(renderTickAge, 1000);
   await pollOnce();
+
+  // Refresh history immediately when the tab becomes visible. Browsers
+  // throttle setInterval in background tabs (Chrome: ≥60s, often more),
+  // so by the time the user returns the SSE-driven cursor has marched
+  // ahead while history.rows still ends at the pre-background sample.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      refreshLiveHistory({ force: true }).catch((err) =>
+        console.warn("visibility refresh failed", err)
+      );
+    }
+  });
 
   setInterval(() => {
     pollOnce();
-    // Re-pull history every ~5 min so the past edge keeps moving forward.
-    // Only meaningful in live mode — historical windows are fixed.
-    if (!isHistorical() && Math.random() < 0.05) loadHistory();
+    // Past edge advances deterministically — fires on the first poll
+    // past HISTORY_REFRESH_MS since the last successful reload. Live
+    // mode only; historical windows are fixed.
+    refreshLiveHistory().catch((err) =>
+      console.warn("periodic history refresh failed", err)
+    );
   }, POLL_INTERVAL_MS);
 }
 

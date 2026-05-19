@@ -210,13 +210,10 @@ main {
 }
 #ts-figure { width: 100%; height: var(--ts-figure-h); }
 
-/* Sankey row: the two diagrams sit side-by-side in their own grid
-   cells so each can use its full column width and a generous height
-   without the previous "stacked-in-one-panel" layout clipping them.
-   Managed loads + events drop to the row below. */
-.panel-sankey-cursor { grid-column: 1 / span 1; }
-.panel-sankey-today  { grid-column: 2 / span 1; }
-#sankey-figure, #sankey-today-figure { width: 100%; height: var(--sankey-figure-h); }
+/* Daily Sankey spans the full row — the per-tick cursor Sankey was
+   removed, so today's totals can use the full panel width. */
+.panel-sankey-today  { grid-column: 1 / span 2; }
+#sankey-today-figure { width: 100%; height: var(--sankey-figure-h); }
 
 .panel-spend  { grid-column: 1 / span 2; padding: 8px 8px 0 8px; }
 #spend-figure { width: 100%; height: var(--spend-figure-h); }
@@ -463,7 +460,6 @@ main {
   .panel-events { padding: 8px; }
 
   .panel-charts,
-  .panel-sankey-cursor,
   .panel-sankey-today,
   .panel-spend,
   .panel-loads,

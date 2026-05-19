@@ -16,6 +16,7 @@ from ..config import APIConfig, BatteryConfig, ManagedLoadConfig
 from ..types import TickSnapshot
 from .log_buffer import RingBufferHandler
 from .metrics import Metrics
+from .sse import SnapshotBroadcaster
 
 
 @runtime_checkable
@@ -50,6 +51,9 @@ class ServiceProbe(Protocol):
     # cards can render the right target unit (kWh vs minutes) and
     # progress fraction without rebuilding state per tick.
     managed_load_configs: list[ManagedLoadConfig]
+    # Fan-out for /dashboard/stream — Service publishes each new
+    # TickSnapshot, the SSE handler subscribes per connected client.
+    snapshot_broadcaster: SnapshotBroadcaster
 
 
 # Typed app key — handlers retrieve the probe via

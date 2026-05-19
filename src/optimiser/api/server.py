@@ -34,6 +34,7 @@ from .handlers.ops import (
 )
 from .handlers.plan import plan_current
 from .handlers.snapshots import snapshots
+from .handlers.stream import dashboard_stream
 from .handlers.tables import table_rows
 from .probe import API_CONFIG_KEY, SERVICE_PROBE_KEY, ServiceProbe
 
@@ -109,6 +110,11 @@ class APIServer:
         app.router.add_get("/dashboard", dashboard_index)
         app.router.add_get("/dashboard/static/{filename}", dashboard_static)
         app.router.add_get("/dashboard/config", dashboard_config)
+        # Live snapshot push (replaces the per-15s /plan/current poll).
+        # Authed via the same bearer-header path as every other endpoint;
+        # the frontend uses fetch + ReadableStream (not EventSource) so
+        # it can attach the Authorization header.
+        app.router.add_get("/dashboard/stream", dashboard_stream)
         app.router.add_get("/{table}/schema", table_schema)
         app.router.add_get("/{table}", table_rows)
 

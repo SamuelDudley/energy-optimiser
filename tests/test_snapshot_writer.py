@@ -100,6 +100,158 @@ def test_close_is_safe_without_writes(tmp_path: Path) -> None:
     w.close()
 
 
+def test_recover_torn_gzip_heals_corrupted_member(tmp_path: Path) -> None:
+    """Hard-crash repro: a single garbage gzip member between good ones
+    breaks DuckDB's ``read_ndjson_objects``. ``recover_torn_gzip`` must
+    walk member starts, drop the bad member, rewrite the file, and leave
+    DuckDB able to decode it end-to-end."""
+    import duckdb
+
+    from optimiser.logging_utils import recover_torn_gzip
+
+    w = SnapshotWriter(tmp_path)
+    ts = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    for i in range(3):
+        w.write(_snap(ts.replace(minute=i)))
+    path = tmp_path / "2026-04-24.ndjson.gz"
+    blob = path.read_bytes()
+
+    # Find the boundary between members (next 0x1f8b after the first one)
+    # and splice 16 bytes of garbage starting with the gzip magic right
+    # there. The walker will see the synthetic "member start", but the
+    # 0x00 compression-method byte is invalid, so ``gzip.decompress``
+    # fails on that span — same shape as a hard-crash torn member.
+    boundary = blob.find(b"\x1f\x8b", 2)
+    assert boundary > 0, "test fixture needs at least 2 members"
+    bad = b"\x1f\x8b" + b"\x00" * 14
+    path.write_bytes(blob[:boundary] + bad + blob[boundary:])
+
+    # DuckDB cannot read the corrupted file.
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("SELECT COUNT(*) FROM read_ndjson_objects(?)", [str(path)]).fetchone()
+        broken = False
+    except Exception:
+        broken = True
+    assert broken, "test setup failed: corrupted file should not decode"
+
+    n = recover_torn_gzip(path)
+    assert n is not None and n >= 3, f"expected ≥3 recovered lines, got {n}"
+
+    # Post-recovery: DuckDB reads it cleanly and recovers all 3 originals.
+    rows = con.execute(
+        "SELECT json_extract_string(j, '$.timestamp') "
+        "FROM read_ndjson_objects(?) AS t(j) "
+        "ORDER BY 1",
+        [str(path)],
+    ).fetchall()
+    timestamps = [r[0] for r in rows]
+    assert any(t.startswith("2026-04-24T12:00") for t in timestamps)
+    assert any(t.startswith("2026-04-24T12:02") for t in timestamps)
+
+
+def test_recover_torn_gzip_noop_on_healthy_file(tmp_path: Path) -> None:
+    """Idempotency: a healthy multi-member gzip must be left untouched."""
+    from optimiser.logging_utils import recover_torn_gzip
+
+    w = SnapshotWriter(tmp_path)
+    ts = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    for i in range(3):
+        w.write(_snap(ts.replace(minute=i)))
+    path = tmp_path / "2026-04-24.ndjson.gz"
+    before = path.read_bytes()
+
+    assert recover_torn_gzip(path) is None
+    assert path.read_bytes() == before
+
+
+def test_recover_torn_gzip_preserves_big_member_with_internal_magic_bytes(
+    tmp_path: Path,
+) -> None:
+    """Regression: an earlier byte-scanning algorithm split a single
+    healthy big gzip member into many false-positive sub-spans whenever
+    the compressed payload happened to contain ``0x1f 0x8b`` internally,
+    erasing the entire member on a startup self-heal. This is the bug
+    that ate ~245 lines of post-recovery data on 2026-05-08.
+
+    Construct a single big gzip member whose compressed bytes contain
+    multiple ``0x1f 0x8b`` sequences (achieved cheaply by writing many
+    randomly-flavoured lines), append a deliberately corrupt member
+    after it, and verify ``recover_torn_gzip`` keeps every line from the
+    big member.
+    """
+    import gzip as _gzip
+    import os
+
+    path = tmp_path / "2026-04-24.ndjson.gz"
+    # 200 lines of varied bytes — a few internal 0x1f8b sequences are
+    # near-certain at this size; not relying on luck, just on volume.
+    lines = [json.dumps({"i": i, "blob": os.urandom(64).hex()}).encode("utf-8") for i in range(200)]
+    with _gzip.open(path, "wb") as f:
+        for ln in lines:
+            f.write(ln)
+            f.write(b"\n")
+
+    raw = path.read_bytes()
+    n_internal_magic = sum(
+        1 for i in range(2, len(raw) - 1) if raw[i] == 0x1F and raw[i + 1] == 0x8B
+    )
+    assert n_internal_magic >= 1, "test fixture failed to produce internal magic bytes"
+
+    # Append a deliberately corrupt "second member" so the file fails
+    # the multi-member probe and triggers recovery.
+    bad = b"\x1f\x8b" + b"\x00" * 14
+    path.write_bytes(raw + bad)
+
+    from optimiser.logging_utils import recover_torn_gzip
+
+    n = recover_torn_gzip(path)
+    assert n is not None and n == 200, (
+        f"big member fragmentation regression: expected 200 lines, got {n}"
+    )
+
+
+def test_recover_torn_gzip_handles_missing_and_empty(tmp_path: Path) -> None:
+    """Missing file or zero-byte file should return None without raising."""
+    from optimiser.logging_utils import recover_torn_gzip
+
+    missing = tmp_path / "no-such-file.ndjson.gz"
+    assert recover_torn_gzip(missing) is None
+
+    empty = tmp_path / "empty.ndjson.gz"
+    empty.write_bytes(b"")
+    assert recover_torn_gzip(empty) is None
+
+
+def test_snapshot_writer_init_heals_today_file(tmp_path: Path, monkeypatch) -> None:
+    """SnapshotWriter.__init__ probes today's file and recovers it before
+    the first append. Reproduces the hard-crash scenario observed
+    2026-05-08 where the dashboard /ops/solve series cleanly stopped at
+    the UTC rotation boundary because today's file was unreadable by
+    DuckDB."""
+    import duckdb
+
+    from optimiser import logging_utils
+
+    today = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    # Pre-populate today's file with a torn gzip *before* spinning up
+    # a fresh SnapshotWriter — this is the "service restarts after a
+    # hard crash" path we're regression-testing.
+    pre = SnapshotWriter(tmp_path)
+    for i in range(2):
+        pre.write(_snap(today.replace(minute=i)))
+    path = tmp_path / "2026-04-24.ndjson.gz"
+    blob = path.read_bytes()
+    path.write_bytes(blob + b"\x1f\x8b" + b"\x00" * 14)
+
+    monkeypatch.setattr(logging_utils, "now_utc", lambda: today)
+    SnapshotWriter(tmp_path)  # __init__ should run recover_torn_gzip
+
+    con = duckdb.connect(":memory:")
+    n = con.execute("SELECT COUNT(*) FROM read_ndjson_objects(?)", [str(path)]).fetchone()[0]
+    assert n >= 2
+
+
 def test_post_dispatch_state_round_trips(tmp_path: Path) -> None:
     """The new system_state_post_dispatch field — populated by service.py
     after dispatch is applied, observability use only — must serialise
@@ -123,8 +275,7 @@ def test_post_dispatch_state_round_trips(tmp_path: Path) -> None:
         occupied=None,
     )
     snap_with_post = snap.__class__(
-        **{**{k: getattr(snap, k) for k in snap.__slots__},
-           "system_state_post_dispatch": post},
+        **{**{k: getattr(snap, k) for k in snap.__slots__}, "system_state_post_dispatch": post},
     )
     w.write(snap_with_post)
     w.write(snap)  # default: post-dispatch is None

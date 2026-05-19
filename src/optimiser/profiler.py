@@ -58,11 +58,49 @@ def temp_to_bucket(temp_c: float | None) -> str | None:
     return "hot"
 
 
+def smooth_slots(slots: list[float], window: int) -> list[float]:
+    """Apply a circular centred boxcar smoother to a 48-slot day profile.
+
+    A sharp peak in any single slot — typically an artefact of
+    averaging a rare event (kettle, oven, AC burst) that happened to
+    land in that bin in the historical window — propagates into the LP
+    as a reserve obligation every day. Smoothing across `window`
+    neighbouring slots spreads that mass evenly, which models the real
+    uncertainty about *when* such an event will recur. The smoother
+    wraps around the day boundary because the profile represents a
+    circular 24h cycle.
+
+    Energy-preserving: `sum(smoothed) == sum(slots)` to floating-point
+    tolerance, so the LP's expected daily consumption baseline doesn't
+    drift as the smoothing window changes.
+
+    `window` must be odd (centred) and >= 1. `window=1` is the
+    identity.
+    """
+    if window <= 1:
+        return list(slots)
+    if window % 2 == 0:
+        raise ValueError(f"smoothing window must be odd, got {window}")
+    n = len(slots)
+    if window > n:
+        raise ValueError(f"smoothing window {window} exceeds slot count {n}")
+    half = window // 2
+    out: list[float] = []
+    for i in range(n):
+        total = 0.0
+        for offset in range(-half, half + 1):
+            total += slots[(i + offset) % n]
+        out.append(total / window)
+    return out
+
+
 def build_load_profile(
     store: TelemetryStore,
     outdoor_temp_c: float | None = None,
     occupied: bool = True,
     timestamp: datetime | None = None,
+    statistic: str = "mean",
+    smoothing_slots: int = 1,
 ) -> LoadProfile:
     """Build a load profile with fallback chain.
 
@@ -72,14 +110,27 @@ def build_load_profile(
     3. slot × occupied
     4. slot (flat average)
     5. constant default (L0)
+
+    `statistic` ("mean" | "median") controls how the per-slot
+    aggregation reduces ~90 days of telemetry into one value per slot;
+    "median" is robust to single high-load days that would otherwise
+    lift the LP's expected baseline.
+
+    `smoothing_slots` applies a circular boxcar to the assembled
+    profile — `1` is the identity, larger odd values redistribute peak
+    mass across neighbouring slots. See `smooth_slots`.
     """
+    # Validate eagerly so cold-start / fallback paths fail the same way.
+    if statistic not in {"mean", "median"}:
+        raise ValueError(f"unknown statistic {statistic!r}; expected 'mean' or 'median'")
+
     maturity = assess_maturity(store)
 
     if maturity == 0:
         # Cold start — no data
         kw = DEFAULT_OCCUPIED_KW if occupied else DEFAULT_UNOCCUPIED_KW
         return LoadProfile(
-            slots=[kw] * 48,
+            slots=smooth_slots([kw] * 48, smoothing_slots),
             maturity_level=0,
             context="L0 default",
         )
@@ -110,6 +161,7 @@ def build_load_profile(
             occupied=occ,
             weekday=wd,
             as_of=timestamp,
+            statistic=statistic,
         )
         if slots is not None:
             level = maturity
@@ -126,7 +178,7 @@ def build_load_profile(
                     },
                 )
             return LoadProfile(
-                slots=slots,
+                slots=smooth_slots(slots, smoothing_slots),
                 maturity_level=level,
                 context=context,
             )
@@ -134,7 +186,7 @@ def build_load_profile(
     # Ultimate fallback
     kw = DEFAULT_OCCUPIED_KW if occupied else DEFAULT_UNOCCUPIED_KW
     return LoadProfile(
-        slots=[kw] * 48,
+        slots=smooth_slots([kw] * 48, smoothing_slots),
         maturity_level=0,
         context="L0 default (fallback)",
     )
