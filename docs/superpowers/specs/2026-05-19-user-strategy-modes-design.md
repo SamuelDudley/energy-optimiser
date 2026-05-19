@@ -12,7 +12,7 @@ Concrete case that motivated this work (2026-05-19): overnight, the LP discharge
 
 The existing Sigenergy app has an override that charges blindly through 5-min price spikes. That's the lower bar this design must clear: **smart override that skips spikes without micro-management**.
 
-A symmetric situation exists for export: an inbound event (storm forecast, planned high evening load tonight) where the user wants to **stop selling cheap** to preserve stored energy for the event.
+A symmetric situation exists for export: an inbound event (storm forecast, planned high evening load tonight) where the user wants to **stop selling cheap and bank PV more aggressively** to preserve and build stored energy for the event.
 
 ## Design summary
 
@@ -20,12 +20,20 @@ Two user-invoked modes, both expressed as **time-bounded LP-side constraints**:
 
 | Mode | User specifies | LP behaviour during window |
 |---|---|---|
-| **Buy** | end-time `T`, max import price `ceiling` (c/kWh) | Battery cannot import-charge at slots where `ip > ceiling`. Wear cost on import-charge set to 0 during window. Battery cannot export. |
-| **Conserve** | end-time `T`, min export price `floor` (c/kWh) | Battery cannot export at slots where `ep < floor`. PV→grid behaviour unchanged (existing `export_cap` still applies). |
+| **Buy** | end-time `T`, max import price `ceiling` (c/kWh) | Battery cannot import-charge at slots where `ip > ceiling`. Wear cost on import-charge set to 0 during window (charge more aggressively). Battery cannot export. |
+| **Conserve** | end-time `T`, min export price `floor` (c/kWh) | Battery cannot export at slots where `ep < floor`. Wear cost on PV-charge set to 0 during window (store PV more aggressively). PV-sourced export still allowed at any price — existing `export_cap` unchanged. |
 
-Both modes are **additive constraints**. The LP keeps doing its normal cost-min job inside the constraint set. No parallel control path, no new dispatch logic — the existing `dispatch_from_slot` reads `slot_0` as today.
+Both modes are **additive constraints + objective tweaks**. The LP keeps doing its normal cost-min job inside the constraint set. No parallel control path, no new dispatch logic — the existing `dispatch_from_slot` reads `slot_0` as today.
 
-They **compose cleanly**: buy mode forbids `bat_charge_grid` above the ceiling; conserve mode forbids battery contribution to `grid_export` below the floor; neither touches the other's variables.
+The symmetric shape:
+
+| | Buy | Conserve |
+|---|---|---|
+| **Charge side** | wear discount on `bat_charge_grid` (charge harder) | wear discount on `pv_to_battery` (store harder) |
+| **Threshold side** | hard ceiling on `bat_charge_grid` (skip spikes) | hard floor on battery export (skip cheap sales) |
+| **Export rule** | no battery export at all (preserve buy-in) | no battery export below floor (preserve stored) |
+
+They **compose cleanly**: buy mode touches `bat_charge_grid` and the export equality; conserve mode touches `pv_to_battery` and the same export equality at a different threshold. Constraints on `grid_export` are additive (the tighter wins per slot); the wear discounts target disjoint variables.
 
 ## Why this clears the Sigenergy-app bar
 
@@ -69,9 +77,15 @@ PV-sourced export (`pv_to_export`) is **not** blocked — that's controlled by t
 # No battery contribution to export at sub-floor prices:
 if ep[t] < conserve.floor:
     grid_export[t] <= pv_to_export[t]
+
+# Wear cost discount on PV-to-battery: the wear penalty on
+# pv_to_battery[t] is zeroed in the objective for every in-window
+# slot (regardless of ep[t]). The LP will now bank any PV slot where
+# future_use_value > ep[t], rather than the today-default
+# future_use_value > ep[t] + wear. Discharge-side wear is unchanged.
 ```
 
-That single constraint is all conserve mode needs. Charging behaviour is unaffected.
+Charging from grid is unaffected by conserve mode. PV-sourced export at slots with `ep >= floor` is also unaffected — solar still earns export revenue when prices justify it.
 
 ### Non-anticipativity
 
@@ -167,6 +181,7 @@ Unit tests in `tests/test_modes.py` + `tests/test_lp_modes.py`:
 1. `ModeOverrides` slot-alignment — a mode active 13:00–14:00 yields `buy_active_at[t]=True` only for slots in that range.
 2. LP with buy mode + a synthetic price strip (`[5, 5, 15, 5]`, ceiling=10): `bat_charge_grid[2] == 0`, others > 0.
 3. LP with conserve mode + a synthetic export-price strip (`[20, 20, 5, 20]`, floor=15): `grid_export[2] <= pv_to_export[2]`, others can exceed.
+3b. LP with conserve mode + a PV-rich midday + cheap export (e.g. ep=4c, future-evening use=6c, wear=2c default): without conserve, LP exports PV at 4c (since 4c > 6c−2c is false, but the LP picks the marginal-value option) — with conserve, the zero-wear discount tips `pv_to_battery` past `pv_to_export`. Verify `pv_to_battery[t]` strictly increases compared to a baseline solve.
 4. Composition: both modes active, overlapping window, both constraints honoured.
 5. Persistence round-trip: write, restart `ModeManager`, verify reload + auto-drop of expired entries.
 6. API validation: past `end_at` rejected; out-of-range threshold rejected; replacing existing mode succeeds.
@@ -193,7 +208,7 @@ Integration: existing replay machinery (`replay_cli`) re-solves a historical day
 ## Implementation order (rough)
 
 1. `modes.py` (data classes, `ModeManager`, persistence) + tests
-2. `lp/formulation.py` — accept `ModeOverrides`, add per-slot constraints + zero-out wear on `bat_charge_grid` inside buy windows
+2. `lp/formulation.py` — accept `ModeOverrides`, add per-slot constraints + zero-out wear on `bat_charge_grid` inside buy windows + zero-out wear on `pv_to_battery` inside conserve windows
 3. `solve_stochastic` plumb-through; `service.py::_run_lp` wires it
 4. API handlers + validation
 5. Dashboard frontend (cards + activate panel)
