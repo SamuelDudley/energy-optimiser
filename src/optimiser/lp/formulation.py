@@ -623,6 +623,30 @@ def _add_scenario_to_problem(
         f"{prefix}terminal_soc",
     )
 
+    # ── Mode overrides: buy ──────────────────────────────────────
+    # Hard ceiling on grid-charging: at any slot where buy mode is
+    # active AND the import price for this scenario exceeds the
+    # user-supplied ceiling, force bat_charge_grid to zero. Also,
+    # for every in-window slot, forbid battery contribution to
+    # grid_export (preserve what was bought). PV export is
+    # unaffected — that's controlled by export_cap.
+    if mode_overrides is not None and mode_overrides.any_buy_active():
+        ceiling = mode_overrides.buy_ceiling_c_per_kwh
+        for t in range(n):
+            if not mode_overrides.buy_active_at[t]:
+                continue
+            ip_t = price_scenario.resolve_ip(_price_at(prices_planning, slots[t]))
+            if ceiling is not None and ip_t > ceiling:
+                prob += (
+                    bat_charge_grid[t] == 0,
+                    f"{prefix}buy_ceiling_{t}",
+                )
+            # Battery cannot contribute to grid_export during buy window.
+            prob += (
+                grid_export[t] <= pv_to_export[t],
+                f"{prefix}buy_no_bat_export_{t}",
+            )
+
     # ── Cost terms (already weighted) ────────────────────────────
     # Per-slot price resolution is delegated to `price_scenario`. Its
     # resolver applies the chain: requested band leg → predicted →
