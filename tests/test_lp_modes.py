@@ -251,6 +251,53 @@ def test_buy_mode_wear_discount_increases_grid_charge() -> None:
     assert buy_charge > base_charge + 1e-3
 
 
+def test_buy_mode_cutoff_picks_cheapest_slots() -> None:
+    """When the SOC cutoff is reachable using only the cheapest in-window
+    slots, the LP should leave the more-expensive (but still sub-ceiling)
+    slots alone — i.e. the standard cost-min argument holds inside the
+    buy-mode wear-discount regime.
+    """
+    n_window = 24  # 2h buy window
+    n_total = 48  # 4h total horizon — expensive tail motivates the charge
+    # Window: alternating cheap (5c) / middle (9c), both sub-ceiling 12c.
+    # Tail: 25c — drives the LP to bank energy during the cheap window.
+    imports = [5.0 if i % 2 == 0 else 9.0 for i in range(n_window)] + [25.0] * (n_total - n_window)
+    exports = [3.0] * n_total
+    # Start at the floor so the LP is forced to use grid for both
+    # house-load and any banking for the expensive tail — that's what
+    # makes the cheap/middle selection observable.
+    state = _state(soc=10.0)
+    overrides = ModeOverrides(
+        buy_active_at=tuple([True] * n_window + [False] * (n_total - n_window)),
+        buy_ceiling_c_per_kwh=12.0,
+        buy_soc_cutoff_pct=30.0,
+        conserve_active_at=tuple([False] * n_total),
+        conserve_floor_c_per_kwh=None,
+    )
+    result = solve_stochastic(
+        state=state,
+        prices_planning=_prices(imports, exports),
+        pv_forecast=None,
+        load_profile=_profile(2.0),
+        managed_loads=[],
+        lp_loads=build_lp_loads(configs=[]),
+        battery_config=_battery(),
+        mode_overrides=overrides,
+    )
+    assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+    traj = result.forward_trajectory[:n_window]
+    cheap_charge = sum(s.grid_to_battery_kw for i, s in enumerate(traj) if i % 2 == 0)
+    middle_charge = sum(s.grid_to_battery_kw for i, s in enumerate(traj) if i % 2 == 1)
+    # Cheapest slots take essentially all the charging; the 9c slots only
+    # get touched if there's not enough cheap capacity (there is here:
+    # 12 cheap slots × ~1.9 %/slot ≈ 23 % SOC headroom > the 10 % we need).
+    assert cheap_charge > 0, "LP did not charge in cheap slots"
+    assert middle_charge < cheap_charge * 0.05, (
+        f"middle-priced slots got non-trivial charging; "
+        f"cheap={cheap_charge:.3f} kW·slots, middle={middle_charge:.3f}"
+    )
+
+
 def test_buy_mode_soc_cutoff_caps_charging() -> None:
     """With soc_cutoff_pct set, the LP must not plan SOC past the cutoff
     at any in-window slot end."""
