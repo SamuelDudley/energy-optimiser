@@ -224,6 +224,7 @@ const state = {
   snapshot: null,
   ready: null,                    // /readyz response: { ok, state, sigenergy_connected }
   sseConnected: false,            // true while /dashboard/stream is live; falls back to polling when false
+  modes: [],                      // active user-strategy modes; refreshed from snap.active_modes
   history: {
     rows: [],                    // telemetry rows ascending by ts
     priceForecast: [],           // latest forecast band per (interval_start, resolution)
@@ -2043,6 +2044,7 @@ function redrawSpendCursor() {
 // and the polling fallback path (used when SSE is disconnected).
 async function applySnapshot(snap) {
   state.snapshot = snap;
+  state.modes = snap.active_modes || [];
   clearError();
 
   // Auto-advance cursor when not pinned. In historical mode, leave
@@ -2055,6 +2057,7 @@ async function applySnapshot(snap) {
   renderStatusStrip();
   renderLoads();
   renderCursorReadout();
+  ModesUI.render();
   // In historical mode the time-series figure is driven by static
   // history; redrawing it on every snapshot poll just wastes work and
   // can fight a hovered cursor. Status strip / loads / events still
@@ -2643,7 +2646,12 @@ const ModesUI = (() => {
       showError(`Failed to cancel ${kind} mode: HTTP ${resp.status}`);
       return;
     }
-    await render();
+    // Optimistic local update — strip the cancelled mode from state.modes
+    // so the card flips to Inactive immediately. The next SSE snapshot
+    // (~60s later) will reconcile this with the server's authoritative
+    // active_modes list.
+    state.modes = (state.modes || []).filter((m) => m.kind !== kind);
+    render();
   }
 
   form.addEventListener("submit", async (e) => {
@@ -2658,8 +2666,9 @@ const ModesUI = (() => {
     const minutes = parseInt(durationSelect.value, 10);
     const endAt = new Date(Date.now() + minutes * 60_000).toISOString();
     const body = { end_at: endAt, [paramKey(currentKind)]: threshold };
+    let newMode;
     try {
-      await apiFetch(`/modes/${currentKind}`, {
+      newMode = await apiFetch(`/modes/${currentKind}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
@@ -2668,8 +2677,13 @@ const ModesUI = (() => {
       hint.textContent = `Activation failed: ${e.message}`;
       return;
     }
+    // Optimistic local update — splice the newly-activated mode into
+    // state.modes so the card flips to Active immediately. SSE snapshot
+    // will reconcile.
+    state.modes = (state.modes || []).filter((m) => m.kind !== newMode.kind);
+    state.modes.push(newMode);
     closePanel();
-    await render();
+    render();
   });
 
   function formatCountdown(minutes) {
@@ -2678,16 +2692,12 @@ const ModesUI = (() => {
     return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
   }
 
-  async function render() {
-    if (!state.token) return;
-    let body;
-    try {
-      body = await apiFetch("/modes");
-    } catch (_) {
-      return;
-    }
-    const now = new Date(body.now);
-    const byKind = Object.fromEntries(body.modes.map((m) => [m.kind, m]));
+  function render() {
+    // Synchronous render — reads from state.modes (refreshed on every
+    // SSE snapshot via applySnapshot, and mutated locally after
+    // activate/cancel for instant feedback). No polling, no fetch.
+    const now = new Date();
+    const byKind = Object.fromEntries((state.modes || []).map((m) => [m.kind, m]));
     for (const kind of ["buy", "conserve"]) {
       const card = document.getElementById(`mode-card-${kind}`);
       if (!card) continue;
@@ -2719,8 +2729,8 @@ const ModesUI = (() => {
   return { render };
 })();
 
-// Poll alongside the existing dashboard refresh loop. The main loop
-// runs after DOMContentLoaded; we kick the first render once the token
-// is available.
-setInterval(() => ModesUI.render(), 5000);
-document.addEventListener("DOMContentLoaded", () => ModesUI.render());
+// Countdown re-render — purely client-side. State.modes is refreshed
+// from the SSE snapshot push (~60s cadence via applySnapshot); this
+// 30s tick keeps the "Ends in Xm" text fresh between snapshots without
+// any network call. Render is a no-op when no modes are active.
+setInterval(() => ModesUI.render(), 30_000);
