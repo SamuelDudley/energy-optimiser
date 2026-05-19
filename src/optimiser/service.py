@@ -39,6 +39,7 @@ from .lp.snapshot_adapter import (
 )
 from .lp.solver import solve_stochastic
 from .lp.watcher import WATCHER_PERIOD_S, VerificationWatcher
+from .modes import ModeManager
 from .profiler import build_load_profile
 from .state_machine import StateMachine
 from .store import TelemetryStore
@@ -146,6 +147,19 @@ class Service:
         # it without re-reading the NDJSON file. Set at the end of every
         # successful tick; stays None until the first snapshot is written.
         self._last_snapshot: TickSnapshot | None = None
+
+        # ── User-strategy modes ──────────────────────────────────
+        # Live next to the heartbeat in the data volume so a service
+        # restart resumes any modes still inside their window. JSON
+        # over DuckDB because the dataset is ~2 rows and easy to
+        # eyeball with `cat`.
+        modes_path = Path(
+            os.environ.get(
+                "EO_MODES_PATH",
+                str(self.heartbeat_path.parent / "active_modes.json"),
+            )
+        )
+        self._mode_manager = ModeManager(modes_path)
 
     async def start(self) -> None:
         """Start the service: connect, initialise, then run wake loops."""
@@ -886,6 +900,13 @@ class Service:
         return self._config.battery
 
     @property
+    def mode_manager(self) -> ModeManager:
+        """User-strategy mode store (buy/conserve overrides). Exposed
+        so dashboard/API handlers can activate, clear, or inspect modes
+        against the same instance the tick consults."""
+        return self._mode_manager
+
+    @property
     def managed_load_configs(self):
         """Managed-load configs. Exposed for /dashboard/config so the
         load cards know the daily-target unit (kWh vs minutes) and
@@ -1046,6 +1067,17 @@ class Service:
                 self._config.planner.lp_price_scenario_mode,
             )
             price_scenario_mode = None
+        # Build the slot grid the same way the LP formulation does so
+        # the overrides line up tick-for-tick. Anchored on the state's
+        # timestamp (not wall clock) so replay/backtests stay
+        # deterministic.
+        from .lp.constants import HORIZON_HOURS, SLOT_MINUTES
+        from .lp.formulation import _slot_grid
+
+        slot_start = state.timestamp.replace(second=0, microsecond=0)
+        slot_minute_aligned = slot_start - timedelta(minutes=slot_start.minute % SLOT_MINUTES)
+        slots = _slot_grid(slot_minute_aligned, HORIZON_HOURS, SLOT_MINUTES)
+        mode_overrides = self._mode_manager.to_overrides(state.timestamp, slots)
         try:
             solution = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1062,6 +1094,7 @@ class Service:
                     wear_cost_per_kwh=self._config.planner.lp_wear_cost_per_kwh,
                     terminal_floor_override_pct=self._config.planner.lp_terminal_floor_override_pct,
                     slot_0_pv_override_kw=slot_0_pv_override_kw,
+                    mode_overrides=mode_overrides,
                 ),
                 timeout=self._config.planner.lp_wall_clock_timeout_s,
             )

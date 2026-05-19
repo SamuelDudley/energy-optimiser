@@ -25,6 +25,7 @@ from optimiser.config import BatteryConfig
 from optimiser.lp.dispatch import DispatchKind
 from optimiser.lp.result import LPSolution, SlotDecision, SolveStatus
 from optimiser.lp.runtime import FallbackReason, LPRuntime
+from optimiser.modes import ModeManager
 from optimiser.service import Service
 from optimiser.types import EventType
 
@@ -111,6 +112,14 @@ def _make_service() -> Service:
     svc._loads = MagicMock()
     svc._loads.controllers = []  # No managed loads → no relays to open
 
+    # Mode manager — `_run_lp` builds the slot grid and asks the
+    # manager for overrides each tick. Empty manager → empty overrides,
+    # so the LP path behaves exactly as it did pre-T12.
+    import tempfile
+    from pathlib import Path
+
+    svc._mode_manager = ModeManager(Path(tempfile.mkdtemp()) / "active_modes.json")
+
     return svc
 
 
@@ -122,6 +131,10 @@ def _solver_args() -> dict:
     against a threshold to pick mode 5 vs 6."""
     state = MagicMock()
     state.pv_power_kw = 0.0
+    # `_run_lp` reads `state.timestamp` to build a slot grid for the
+    # ModeManager. Must be a real datetime so `.minute` and arithmetic
+    # work (MagicMock defaults blow up `timedelta(minutes=...)`).
+    state.timestamp = NOW
     return {
         "state": state,
         "prices_planning": [MagicMock()],
@@ -402,17 +415,19 @@ class TestMaybeRunPVProbe:
         from optimiser.types import PVProbeResult
 
         probe = PVProbeResult(
-            pv_kw=8.0, saturated=False,
-            bat_kw=7.5, bat_avail_kw=13.0,
-            grid_export_kw=0.4, export_cap_kw=5.0,
-            house_kw=0.1, soc_pct=50.0,
+            pv_kw=8.0,
+            saturated=False,
+            bat_kw=7.5,
+            bat_avail_kw=13.0,
+            grid_export_kw=0.4,
+            export_cap_kw=5.0,
+            house_kw=0.1,
+            soc_pct=50.0,
         )
         svc = self._service_with_sigenergy(measure_return=probe)
         result = await svc._maybe_run_pv_probe(self._state(pv_kw=8.0), "tick-1")
         assert result is probe
-        svc._sigenergy.measure_uncapped_pv.assert_awaited_once_with(
-            export_cap_kw=5.0
-        )
+        svc._sigenergy.measure_uncapped_pv.assert_awaited_once_with(export_cap_kw=5.0)
 
     @pytest.mark.asyncio
     async def test_passes_none_export_cap_on_first_tick(self) -> None:
@@ -421,17 +436,19 @@ class TestMaybeRunPVProbe:
         from optimiser.types import PVProbeResult
 
         probe = PVProbeResult(
-            pv_kw=6.0, saturated=False,
-            bat_kw=5.5, bat_avail_kw=13.0,
-            grid_export_kw=0.0, export_cap_kw=None,
-            house_kw=0.1, soc_pct=40.0,
+            pv_kw=6.0,
+            saturated=False,
+            bat_kw=5.5,
+            bat_avail_kw=13.0,
+            grid_export_kw=0.0,
+            export_cap_kw=None,
+            house_kw=0.1,
+            soc_pct=40.0,
         )
         svc = self._service_with_sigenergy(measure_return=probe, last_export_kw=None)
         result = await svc._maybe_run_pv_probe(self._state(pv_kw=6.0), "tick-1")
         assert result is probe
-        svc._sigenergy.measure_uncapped_pv.assert_awaited_once_with(
-            export_cap_kw=None
-        )
+        svc._sigenergy.measure_uncapped_pv.assert_awaited_once_with(export_cap_kw=None)
 
     @pytest.mark.asyncio
     async def test_returns_none_on_uncap_write_failure(self) -> None:
