@@ -773,7 +773,12 @@ class TestForecastLogTableQuery:
             assert [row["temp_c"] for row in body["rows"]] == [20.0, 21.0]
 
 
-def _make_snapshot(timestamp: datetime, soc_pct: float = 50.0, action: str = "self_consume"):
+def _make_snapshot(
+    timestamp: datetime,
+    soc_pct: float = 50.0,
+    action: str = "self_consume",
+    active_modes: tuple = (),
+):
     """Build a minimal TickSnapshot with one forward slot for tests."""
     from optimiser.lp.result import LPSolution, SlotDecision, SolveStatus
     from optimiser.types import (
@@ -840,6 +845,7 @@ def _make_snapshot(timestamp: datetime, soc_pct: float = 50.0, action: str = "se
         output=output,
         lp_solution=solution,
         lp_dispatch=None,
+        active_modes=active_modes,
     )
 
 
@@ -872,6 +878,43 @@ class TestPlanCurrent:
             assert len(body["lp_solution"]["forward_trajectory"]) == 1
             assert body["lp_solution"]["forward_trajectory"][0]["battery_kw"] == -2.0
             assert body["output"]["battery_action"] == "discharge_ess"
+
+    async def test_active_modes_empty_when_none_active(self, tmp_path: Path) -> None:
+        """Default — no user-invoked modes — must serialise to []
+        (not omitted) so /explain-plan can treat the field as load-bearing."""
+        ts = datetime.fromisoformat("2026-04-24T10:00:00+00:00")
+        snapshot = _make_snapshot(ts)
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), last_snapshot=snapshot)
+        async with await _client(probe) as c:
+            r = await c.get("/plan/current", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["active_modes"] == []
+
+    async def test_active_modes_surfaced_when_present(self, tmp_path: Path) -> None:
+        """When a mode is active in the snapshot, /plan/current must
+        surface kind / end_at / params so /explain-plan can summarise
+        'Buy mode active until 15:30 (ceiling 12 c/kWh)'-style lines."""
+        from optimiser.types import ActiveModeRecord
+
+        ts = datetime.fromisoformat("2026-04-24T10:00:00+00:00")
+        end_at = datetime.fromisoformat("2026-04-24T15:30:00+00:00")
+        mode = ActiveModeRecord(
+            kind="buy",
+            end_at=end_at,
+            params={"ceiling_c_per_kwh": 12.0},
+        )
+        snapshot = _make_snapshot(ts, active_modes=(mode,))
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), last_snapshot=snapshot)
+        async with await _client(probe) as c:
+            r = await c.get("/plan/current", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert len(body["active_modes"]) == 1
+            entry = body["active_modes"][0]
+            assert entry["kind"] == "buy"
+            assert entry["end_at"] == "2026-04-24T15:30:00+00:00"
+            assert entry["params"] == {"ceiling_c_per_kwh": 12.0}
 
 
 class TestSnapshots:

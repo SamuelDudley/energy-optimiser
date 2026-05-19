@@ -71,6 +71,7 @@ jq '{
   slot0: .lp_solution.slot_0,
   dispatch: .lp_dispatch,
   output: .output,
+  active_modes: .active_modes,
   # Slice the 5-min head of the merged price_forecast. Spacing tells you
   # whether the 5-min array was populated this tick.
   price_head: [.price_forecast[0:9][] | {
@@ -161,7 +162,16 @@ Interpret `lp_dispatch.mode` together with `slot0.battery_kw` and `slot0.grid_to
 
 Discharge cap = physical max on purpose, so load transients stay on battery. Don't confuse `dispatch.cap_kw` on discharge (= `max_discharge_kw`) with the LP's signed intent (kept on `signed_intent_kw`).
 
-### 6. Time zones
+### 6. User-invoked strategy modes (`active_modes` on the snapshot)
+
+The user can temporarily impose hard constraints on the LP via `/modes/buy` or `/modes/conserve` (see `optimiser/modes.py`). When active, each entry has `kind` (`"buy"` or `"conserve"`), `end_at` (UTC ISO timestamp), and a `params` dict. The active set at solve time is recorded on the snapshot as `active_modes` — `[]` when none are active.
+
+- **`buy`** — sets an import-price ceiling: while active, the LP may charge the battery from grid only when `import_per_kwh ≤ params.ceiling_c_per_kwh`, and battery export is hard-blocked. Use case: user knows a cheap window is coming and wants to overrule wear-cost gating.
+- **`conserve`** — blocks battery export below a SOC floor: while active, the LP cannot discharge the battery below `params.floor_pct`. Use case: user expects an outage / hot evening and wants reserve held back.
+
+If `active_modes` is non-empty, **surface a one-line summary per mode at the top of the Evidence section** before the usual measured/plan/price block — e.g. "Buy mode active until 15:30 UTC, ceiling 12 c/kWh" or "Conserve mode active until 19:00 UTC, floor 60%". These are user-imposed overrides, not LP heuristics — if the LP's slot-0 choice looks counter-intuitive given prices, an active mode is the first thing to point at ("LP would normally export here, but conserve mode blocks battery → export below 60% SOC").
+
+### 7. Time zones
 
 All snapshot/price timestamps are UTC. If the user refers to a local-clock event ("at 10am"), convert using `time_utils`. Canberra is UTC+10 (AEST) in winter, UTC+11 (AEDT) in summer; being an hour off here can make an explanation wrong. 30-min NEM intervals align to `:00` and `:30` wall-clock in UTC.
 
@@ -169,15 +179,16 @@ All snapshot/price timestamps are UTC. If the user refers to a local-clock event
 
 Work through this checklist, out loud if it helps, but keep the final written answer tight.
 
-1. **What is the system actually doing?** Read `measured.battery_kw` and `measured.grid_kw`. Describe in one sentence ("battery is charging at 3.5 kW, grid is exporting 4.3 kW").
-2. **What did the LP plan for this slot?** Read `slot0.battery_kw`, `slot0.grid_export_kw`, `slot0.pv_to_export_kw`, `slot0.pv_to_battery_kw`, `slot0.pv_to_house_kw`. Do the measured values roughly match the plan? If not, call out the deviation.
-3. **What is the LP optimising against right now?** List the next 2–4 intervals of `import_per_kwh` and `export_per_kwh`. Look for a flip (positive → negative or vice versa) in the near future that motivates the current action.
-4. **Which cost term dominates the slot-0 decision?** Cross-reference section 2 above. Typical shapes:
+1. **Are any user-invoked modes active?** Check `active_modes`. If non-empty, lead the explanation with them — they are hard constraints overriding the LP's normal cost optimisation, and a counterintuitive slot-0 choice may be entirely explained by an active mode (see section 6).
+2. **What is the system actually doing?** Read `measured.battery_kw` and `measured.grid_kw`. Describe in one sentence ("battery is charging at 3.5 kW, grid is exporting 4.3 kW").
+3. **What did the LP plan for this slot?** Read `slot0.battery_kw`, `slot0.grid_export_kw`, `slot0.pv_to_export_kw`, `slot0.pv_to_battery_kw`, `slot0.pv_to_house_kw`. Do the measured values roughly match the plan? If not, call out the deviation.
+4. **What is the LP optimising against right now?** List the next 2–4 intervals of `import_per_kwh` and `export_per_kwh`. Look for a flip (positive → negative or vice versa) in the near future that motivates the current action.
+5. **Which cost term dominates the slot-0 decision?** Cross-reference section 2 above. Typical shapes:
    - Export > 0 while export price ≈ 0 and `pv_to_export == grid_export` → curtail-penalty mechanism, benign.
    - Battery charging from grid → `grid_to_battery > 0`, import price currently low, discharge planned at a later expensive slot (check `forward_trajectory` if you need to prove the arbitrage).
    - Battery idling (deadband) while export cap = 5 kW → mode 2 cascade routing surplus PV to export; battery is preserving wear.
    - Mode 6 + no PV reading → expected (mode 6 zeroes PV).
-5. **Is it bug-worthy?** Apply the red-flag checklist in the next section. If any trigger, say so and recommend `/review-services` or a deeper look.
+6. **Is it bug-worthy?** Apply the red-flag checklist in the next section. If any trigger, say so and recommend `/review-services` or a deeper look.
 
 ## Red flags (escalate, don't just explain)
 
