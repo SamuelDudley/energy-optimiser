@@ -129,6 +129,11 @@ class EventType(StrEnum):
     #       tick-budget signal that matters for ops.
     API_CALL = auto()
     MODBUS_READ_BATCH = auto()
+    # User strategy modes
+    #   MODE_ACTIVATED: {kind, params, source, end_at, activated_at}
+    #   MODE_EXPIRED:   {kind, reason}  reason ∈ {"window_ended", "user_cancelled", "service_started_after_end_at"}
+    MODE_ACTIVATED = auto()
+    MODE_EXPIRED = auto()
 
 
 # ── Value Objects ────────────────────────────────────────────────
