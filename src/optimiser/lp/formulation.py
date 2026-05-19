@@ -647,6 +647,23 @@ def _add_scenario_to_problem(
                 f"{prefix}buy_no_bat_export_{t}",
             )
 
+    # ── Mode overrides: conserve ─────────────────────────────────
+    # No battery contribution to grid_export at slots where the
+    # export price (this scenario) is below the user-supplied floor.
+    # PV-sourced export is unaffected (existing export_cap handles
+    # negative-price curtailment).
+    if mode_overrides is not None and mode_overrides.any_conserve_active():
+        floor = mode_overrides.conserve_floor_c_per_kwh
+        for t in range(n):
+            if not mode_overrides.conserve_active_at[t]:
+                continue
+            ep_t = price_scenario.resolve_ep(_price_at(prices_planning, slots[t]))
+            if floor is not None and ep_t < floor:
+                prob += (
+                    grid_export[t] <= pv_to_export[t],
+                    f"{prefix}conserve_floor_{t}",
+                )
+
     # ── Cost terms (already weighted) ────────────────────────────
     # Per-slot price resolution is delegated to `price_scenario`. Its
     # resolver applies the chain: requested band leg → predicted →

@@ -137,3 +137,34 @@ def test_buy_mode_forbids_battery_export() -> None:
     for slot in base:
         # Battery cannot contribute to export.
         assert slot.grid_export_kw <= slot.pv_to_export_kw + 1e-6
+
+
+def test_conserve_mode_blocks_battery_export_below_floor() -> None:
+    """Slot 2 has ep=5c, floor=15c → battery cannot contribute to export at slot 2."""
+    n_slots = 12
+    imports = [25.0] * n_slots
+    # Low export at slot 2 only.
+    exports = [20.0, 20.0, 5.0] + [20.0] * (n_slots - 3)
+    state = _state(soc=90.0)  # high SOC so LP would happily discharge
+
+    overrides = ModeOverrides(
+        buy_active_at=tuple([False] * n_slots),
+        buy_ceiling_c_per_kwh=None,
+        conserve_active_at=tuple([True] * n_slots),
+        conserve_floor_c_per_kwh=15.0,
+    )
+    result = solve_stochastic(
+        state=state,
+        prices_planning=_prices(imports, exports),
+        pv_forecast=None,
+        load_profile=_profile(2.0),
+        managed_loads=[],
+        lp_loads=build_lp_loads(configs=[]),
+        battery_config=_battery(),
+        mode_overrides=overrides,
+    )
+    assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+    base = result.forward_trajectory
+    # Sub-floor slot must export only PV (which is zero here since no
+    # PV forecast → 0).
+    assert base[2].grid_export_kw <= base[2].pv_to_export_kw + 1e-6
