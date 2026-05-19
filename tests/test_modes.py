@@ -270,3 +270,68 @@ class TestModeManagerExpiry:
         assert expired[0]["reason"] == "service_started_after_end_at"
         # And the mode is not in live state.
         assert mgr.active(datetime.now(UTC)) == []
+
+
+class TestToOverrides:
+    def _slots(self, start: datetime, count: int, minutes: int = 5) -> list[datetime]:
+        return [start + timedelta(minutes=minutes * i) for i in range(count)]
+
+    def test_no_active_modes_returns_empty_mask(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        slots = self._slots(NOW, 12)
+        o = mgr.to_overrides(NOW, slots)
+        assert o.any_buy_active() is False
+        assert o.any_conserve_active() is False
+        assert o.buy_ceiling_c_per_kwh is None
+        assert o.conserve_floor_c_per_kwh is None
+
+    def test_buy_window_aligns_to_slots(self, tmp_path) -> None:
+        """Buy mode active NOW → NOW+30min: only first 6 of 12 slots
+        (each 5 min) should be marked active."""
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(minutes=30),
+                params={"ceiling_c_per_kwh": 12.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        slots = self._slots(NOW, 12)  # NOW + 0, 5, 10, ..., 55 min
+        o = mgr.to_overrides(NOW, slots)
+        assert o.buy_active_at[:6] == (True, True, True, True, True, True)
+        assert o.buy_active_at[6:] == (False, False, False, False, False, False)
+        assert o.buy_ceiling_c_per_kwh == 12.0
+        assert o.conserve_floor_c_per_kwh is None
+
+    def test_both_modes_active_with_different_windows(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "active_modes.json")
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(minutes=15),
+                params={"ceiling_c_per_kwh": 10.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        mgr.activate(
+            ActiveMode(
+                kind="conserve",
+                end_at=NOW + timedelta(minutes=45),
+                params={"floor_c_per_kwh": 22.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        slots = self._slots(NOW, 12)
+        o = mgr.to_overrides(NOW, slots)
+        # Buy: first 3 slots (NOW, NOW+5, NOW+10) — slot 3 starts at +15 which equals end_at, so excluded.
+        assert o.buy_active_at[:3] == (True, True, True)
+        assert o.buy_active_at[3] is False
+        # Conserve: first 9 slots.
+        assert o.conserve_active_at[:9] == tuple([True] * 9)
+        assert o.conserve_active_at[9:] == tuple([False] * 3)
+        assert o.buy_ceiling_c_per_kwh == 10.0
+        assert o.conserve_floor_c_per_kwh == 22.0

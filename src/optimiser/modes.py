@@ -208,3 +208,23 @@ class ModeManager:
             emit(EventType.MODE_EXPIRED, {"kind": kind, "reason": "window_ended"})
         self._persist()
         return list(self._modes.values())
+
+    def to_overrides(self, now: datetime, slots: list[datetime]) -> ModeOverrides:
+        """Compute the per-slot mask consumed by the LP formulation.
+
+        ``slots`` are the slot *start* times. A slot is considered
+        in-window if ``slot_start < end_at`` (strict inequality —
+        a slot starting exactly at ``end_at`` belongs to the
+        post-window epoch).
+        """
+        active = {m.kind: m for m in self.active(now)}
+        buy = active.get("buy")
+        conserve = active.get("conserve")
+        buy_mask = tuple((buy is not None and slot < buy.end_at) for slot in slots)
+        conserve_mask = tuple((conserve is not None and slot < conserve.end_at) for slot in slots)
+        return ModeOverrides(
+            buy_active_at=buy_mask,
+            buy_ceiling_c_per_kwh=(buy.params["ceiling_c_per_kwh"] if buy else None),
+            conserve_active_at=conserve_mask,
+            conserve_floor_c_per_kwh=(conserve.params["floor_c_per_kwh"] if conserve else None),
+        )
