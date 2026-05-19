@@ -2618,15 +2618,30 @@ const ModesUI = (() => {
   });
 
   async function cancelMode(kind) {
+    // DELETE returns 204 No Content on success; apiFetch's unconditional
+    // res.json() chokes on the empty body. Use a bare auth fetch and
+    // inspect status directly. 404 is benign (mode already expired
+    // between render-poll and click).
+    if (!state.token) return;
+    let resp;
     try {
-      await apiFetch(`/modes/${kind}`, { method: "DELETE" });
+      resp = await fetch(`/modes/${kind}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${state.token}` },
+      });
     } catch (e) {
-      // 404 is benign (already cancelled / expired between fetch and click).
-      // apiFetch throws on every non-2xx so we filter manually here.
-      if (!/HTTP 404/.test(e.message || "")) {
-        showError(`Failed to cancel ${kind} mode: ${e.message}`);
-        return;
-      }
+      showError(`Failed to cancel ${kind} mode: ${e.message}`);
+      return;
+    }
+    if (resp.status === 401) {
+      localStorage.removeItem(TOKEN_LS_KEY);
+      state.token = null;
+      showError(`Unauthorised — reload and re-enter the API token.`);
+      return;
+    }
+    if (!resp.ok && resp.status !== 404) {
+      showError(`Failed to cancel ${kind} mode: HTTP ${resp.status}`);
+      return;
     }
     await render();
   }
