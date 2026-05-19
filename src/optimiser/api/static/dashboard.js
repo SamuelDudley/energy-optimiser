@@ -2534,127 +2534,178 @@ async function main() {
 document.addEventListener("DOMContentLoaded", main);
 
 // ── User-strategy modes ───────────────────────────────────────────────
+// All HTTP calls route through apiFetch (sets the Authorization header,
+// handles 401 by clearing the token). Bare fetch() would 401 silently
+// against the protected /modes routes.
 const ModesUI = (() => {
-  const panel = document.getElementById('mode-activate-panel');
-  const form = document.getElementById('mode-activate-form');
-  const title = document.getElementById('mode-panel-title');
-  const thresholdLabel = document.getElementById('mode-threshold-label');
-  const thresholdInput = document.getElementById('mode-threshold');
-  const durationSelect = document.getElementById('mode-duration');
-  const hint = document.getElementById('mode-suggest-hint');
+  const panel = document.getElementById("mode-activate-panel");
+  const form = document.getElementById("mode-activate-form");
+  const title = document.getElementById("mode-panel-title");
+  const thresholdLabel = document.getElementById("mode-threshold-label");
+  const thresholdInput = document.getElementById("mode-threshold");
+  const durationSelect = document.getElementById("mode-duration");
+  const hint = document.getElementById("mode-suggest-hint");
+  const cancelBtn = document.getElementById("mode-panel-cancel");
   let currentKind = null;
+  let suggestSeq = 0;  // dropped-old-response guard
+
+  function paramKey(kind) {
+    return kind === "buy" ? "ceiling_c_per_kwh" : "floor_c_per_kwh";
+  }
+  function responseKey(kind) {
+    return kind === "buy" ? "suggested_ceiling_c_per_kwh" : "suggested_floor_c_per_kwh";
+  }
+  function thresholdLabelText(kind) {
+    return kind === "buy" ? "Ceiling (c/kWh)" : "Floor (c/kWh)";
+  }
 
   async function refreshSuggestion() {
     if (!currentKind) return;
+    const seq = ++suggestSeq;
     const dur = durationSelect.value;
+    hint.textContent = "Computing suggestion…";
     try {
-      const resp = await fetch(`/modes/suggest?kind=${currentKind}&duration_minutes=${dur}`);
-      if (!resp.ok) {
-        hint.textContent = 'No suggestion available for this window.';
-        return;
-      }
-      const body = await resp.json();
-      const key = currentKind === 'buy' ? 'suggested_ceiling_c_per_kwh' : 'suggested_floor_c_per_kwh';
-      const value = body[key];
-      if (value !== undefined) {
+      const body = await apiFetch(
+        `/modes/suggest?kind=${currentKind}&duration_minutes=${dur}`,
+      );
+      if (seq !== suggestSeq) return;  // stale response
+      const value = body[responseKey(currentKind)];
+      if (typeof value === "number") {
         thresholdInput.value = value;
-        hint.textContent = `Amber-suggested ${currentKind === 'buy' ? 'ceiling' : 'floor'}: ${value} c/kWh`;
+        hint.textContent =
+          `Suggested ${currentKind === "buy" ? "ceiling" : "floor"}: ${value} c/kWh ` +
+          `(${currentKind === "buy" ? "median + 3c" : "70th percentile"} of in-window ${currentKind === "buy" ? "import" : "export"} prices)`;
+      } else {
+        hint.textContent = "No suggestion available for this window.";
       }
-    } catch (_) {
-      hint.textContent = 'Could not reach /modes/suggest.';
+    } catch (e) {
+      if (seq !== suggestSeq) return;
+      hint.textContent = `Could not load suggestion (${e.message}).`;
     }
   }
 
   function openActivatePanel(kind) {
     currentKind = kind;
-    title.textContent = kind === 'buy' ? 'Activate buy mode' : 'Activate conserve mode';
-    thresholdLabel.firstChild.textContent =
-      kind === 'buy' ? 'Ceiling (c/kWh) ' : 'Floor (c/kWh) ';
-    thresholdInput.value = '';
-    hint.textContent = 'Computing suggestion…';
+    title.textContent = `Activate ${kind} mode`;
+    thresholdLabel.textContent = thresholdLabelText(kind);
+    thresholdInput.value = "";
+    hint.textContent = "Computing suggestion…";
     panel.showModal();
     refreshSuggestion();
   }
 
-  durationSelect.addEventListener('change', refreshSuggestion);
+  function closePanel() {
+    currentKind = null;
+    suggestSeq++;  // invalidate any in-flight suggest
+    panel.close();
+  }
 
-  document.querySelectorAll('.mode-card__activate').forEach((btn) => {
-    btn.addEventListener('click', (e) => openActivatePanel(e.currentTarget.dataset.kind));
+  durationSelect.addEventListener("change", refreshSuggestion);
+  cancelBtn.addEventListener("click", closePanel);
+  // Pressing Escape on the dialog also closes — the native behaviour is
+  // already correct; no extra wiring needed.
+
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest(".mode-card-action");
+    if (!btn) return;
+    const kind = btn.dataset.kind;
+    const action = btn.dataset.action;
+    if (action === "activate") {
+      openActivatePanel(kind);
+    } else if (action === "cancel") {
+      cancelMode(kind);
+    }
   });
 
-  document.querySelectorAll('.mode-card__cancel').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
-      const kind = e.currentTarget.dataset.kind;
-      const resp = await fetch(`/modes/${kind}`, { method: 'DELETE' });
-      if (!resp.ok && resp.status !== 404) {
-        alert(`Failed to cancel: ${resp.status}`);
+  async function cancelMode(kind) {
+    try {
+      await apiFetch(`/modes/${kind}`, { method: "DELETE" });
+    } catch (e) {
+      // 404 is benign (already cancelled / expired between fetch and click).
+      // apiFetch throws on every non-2xx so we filter manually here.
+      if (!/HTTP 404/.test(e.message || "")) {
+        showError(`Failed to cancel ${kind} mode: ${e.message}`);
+        return;
       }
-      await render();
-    });
-  });
+    }
+    await render();
+  }
 
-  form.addEventListener('submit', async (e) => {
-    if (e.submitter && e.submitter.value === 'cancel') return;
+  form.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (!currentKind) return;
-    const minutes = parseInt(durationSelect.value, 10);
-    const endAt = new Date(Date.now() + minutes * 60_000).toISOString();
     const threshold = parseFloat(thresholdInput.value);
-    const paramKey = currentKind === 'buy' ? 'ceiling_c_per_kwh' : 'floor_c_per_kwh';
-    const body = { end_at: endAt, [paramKey]: threshold };
-    const resp = await fetch(`/modes/${currentKind}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ error: 'unknown' }));
-      alert(`Activation failed: ${err.error}`);
+    if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 100) {
+      hint.textContent = "Threshold must be a number in (0, 100] c/kWh.";
+      thresholdInput.focus();
       return;
     }
-    panel.close();
+    const minutes = parseInt(durationSelect.value, 10);
+    const endAt = new Date(Date.now() + minutes * 60_000).toISOString();
+    const body = { end_at: endAt, [paramKey(currentKind)]: threshold };
+    try {
+      await apiFetch(`/modes/${currentKind}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      hint.textContent = `Activation failed: ${e.message}`;
+      return;
+    }
+    closePanel();
     await render();
   });
 
+  function formatCountdown(minutes) {
+    if (minutes <= 0) return "<1m";
+    if (minutes < 60) return `${minutes}m`;
+    return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  }
+
   async function render() {
-    const resp = await fetch('/modes');
-    if (!resp.ok) return;
-    const body = await resp.json();
+    if (!state.token) return;
+    let body;
+    try {
+      body = await apiFetch("/modes");
+    } catch (_) {
+      return;
+    }
     const now = new Date(body.now);
     const byKind = Object.fromEntries(body.modes.map((m) => [m.kind, m]));
-
-    for (const kind of ['buy', 'conserve']) {
+    for (const kind of ["buy", "conserve"]) {
       const card = document.getElementById(`mode-card-${kind}`);
-      const status = card.querySelector('.mode-card__status');
-      const inactiveBody = card.querySelector('[data-empty="true"]');
-      const activeBody = card.querySelector('[data-empty="false"]');
+      if (!card) continue;
+      const stateEl = card.querySelector('[data-field="state"]');
+      const inactiveBody = card.querySelector('[data-state="inactive"]');
+      const activeBody = card.querySelector('[data-state="active"]');
       const m = byKind[kind];
-
       if (!m) {
-        status.dataset.status = 'inactive';
-        status.textContent = 'Inactive';
+        card.dataset.active = "false";
+        stateEl.textContent = "Inactive";
         inactiveBody.hidden = false;
         activeBody.hidden = true;
         continue;
       }
-      status.dataset.status = 'active';
-      status.textContent = 'Active';
+      card.dataset.active = "true";
+      stateEl.textContent = "Active";
       inactiveBody.hidden = true;
       activeBody.hidden = false;
       const end = new Date(m.end_at);
       const minutes = Math.max(0, Math.round((end - now) / 60_000));
       activeBody.querySelector('[data-field="countdown"]').textContent =
-        minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
-      const paramKey = kind === 'buy' ? 'ceiling_c_per_kwh' : 'floor_c_per_kwh';
-      const field = kind === 'buy' ? 'ceiling' : 'floor';
-      activeBody.querySelector(`[data-field="${field}"]`).textContent =
-        `${m.params[paramKey]} c/kWh`;
+        formatCountdown(minutes);
+      const v = m.params[paramKey(kind)];
+      activeBody.querySelector('[data-field="threshold"]').textContent =
+        `${v} c/kWh`;
     }
   }
 
   return { render };
 })();
 
-// Poll alongside the existing dashboard refresh loop.
+// Poll alongside the existing dashboard refresh loop. The main loop
+// runs after DOMContentLoaded; we kick the first render once the token
+// is available.
 setInterval(() => ModesUI.render(), 5000);
-ModesUI.render();
+document.addEventListener("DOMContentLoaded", () => ModesUI.render());

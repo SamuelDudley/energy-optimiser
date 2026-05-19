@@ -102,35 +102,60 @@
       </div>
     </section>
 
-    <section class="modes-section">
-      <div class="mode-card" id="mode-card-buy">
-        <header class="mode-card__header"><span class="mode-card__title">BUY MODE</span><span class="mode-card__status" data-status="inactive">Inactive</span></header>
-        <div class="mode-card__body" data-empty="true">
-          <button class="mode-card__activate" data-kind="buy">Activate</button>
-        </div>
-        <div class="mode-card__body" data-empty="false" hidden>
-          <div class="mode-card__detail"><span class="label">Ends in</span><span class="value" data-field="countdown">—</span></div>
-          <div class="mode-card__detail"><span class="label">Ceiling</span><span class="value" data-field="ceiling">—</span></div>
-          <button class="mode-card__cancel" data-kind="buy">Cancel</button>
-        </div>
+    <section class="panel panel-events">
+      <div class="panel-header">
+        <h2>Recent events</h2>
       </div>
-      <div class="mode-card" id="mode-card-conserve">
-        <header class="mode-card__header"><span class="mode-card__title">CONSERVE MODE</span><span class="mode-card__status" data-status="inactive">Inactive</span></header>
-        <div class="mode-card__body" data-empty="true">
-          <button class="mode-card__activate" data-kind="conserve">Activate</button>
+      <ol id="events-list" class="events-list">
+        <li class="muted">—</li>
+      </ol>
+    </section>
+
+    <section class="panel panel-modes">
+      <div class="panel-header">
+        <h2>Strategy modes</h2>
+      </div>
+      <div class="modes-grid">
+        <div class="mode-card" id="mode-card-buy" data-kind="buy" data-active="false">
+          <div class="mode-card-header">
+            <span class="mode-card-name">Buy</span>
+            <span class="mode-card-state" data-field="state">Inactive</span>
+          </div>
+          <div class="mode-card-body" data-state="inactive">
+            <div class="mode-card-blurb">Charge from grid below a price ceiling. LP picks cheapest slots, skips spikes.</div>
+            <button type="button" class="mode-card-action" data-kind="buy" data-action="activate">Activate</button>
+          </div>
+          <div class="mode-card-body" data-state="active" hidden>
+            <div class="mode-card-power" data-field="threshold">— c/kWh</div>
+            <div class="mode-card-meta">Ends in <span data-field="countdown">—</span></div>
+            <button type="button" class="mode-card-action mode-card-action--cancel" data-kind="buy" data-action="cancel">Cancel</button>
+          </div>
         </div>
-        <div class="mode-card__body" data-empty="false" hidden>
-          <div class="mode-card__detail"><span class="label">Ends in</span><span class="value" data-field="countdown">—</span></div>
-          <div class="mode-card__detail"><span class="label">Floor</span><span class="value" data-field="floor">—</span></div>
-          <button class="mode-card__cancel" data-kind="conserve">Cancel</button>
+        <div class="mode-card" id="mode-card-conserve" data-kind="conserve" data-active="false">
+          <div class="mode-card-header">
+            <span class="mode-card-name">Conserve</span>
+            <span class="mode-card-state" data-field="state">Inactive</span>
+          </div>
+          <div class="mode-card-body" data-state="inactive">
+            <div class="mode-card-blurb">Bank PV aggressively. Battery only exports above a price floor.</div>
+            <button type="button" class="mode-card-action" data-kind="conserve" data-action="activate">Activate</button>
+          </div>
+          <div class="mode-card-body" data-state="active" hidden>
+            <div class="mode-card-power" data-field="threshold">— c/kWh</div>
+            <div class="mode-card-meta">Ends in <span data-field="countdown">—</span></div>
+            <button type="button" class="mode-card-action mode-card-action--cancel" data-kind="conserve" data-action="cancel">Cancel</button>
+          </div>
         </div>
       </div>
     </section>
 
     <dialog id="mode-activate-panel" class="mode-panel">
-      <form method="dialog" id="mode-activate-form">
-        <h2 id="mode-panel-title">Activate mode</h2>
-        <label>Duration
+      <form id="mode-activate-form">
+        <header class="mode-panel-header">
+          <h2 id="mode-panel-title">Activate mode</h2>
+        </header>
+        <label class="mode-panel-field">
+          <span class="mode-panel-field-label">Duration</span>
           <select name="duration_minutes" id="mode-duration">
             <option value="15">15 min</option>
             <option value="30">30 min</option>
@@ -142,25 +167,17 @@
             <option value="2880">48 h</option>
           </select>
         </label>
-        <label id="mode-threshold-label">Threshold (c/kWh)
-          <input type="number" name="threshold" id="mode-threshold" min="0.01" max="100" step="0.01" required>
+        <label class="mode-panel-field">
+          <span class="mode-panel-field-label" id="mode-threshold-label">Threshold (c/kWh)</span>
+          <input type="number" name="threshold" id="mode-threshold" min="0.01" max="100" step="0.01" inputmode="decimal">
         </label>
-        <p id="mode-suggest-hint" class="mode-panel__hint"></p>
-        <menu>
-          <button value="cancel">Cancel</button>
-          <button value="submit" id="mode-submit">Activate</button>
-        </menu>
+        <p id="mode-suggest-hint" class="mode-panel-hint">—</p>
+        <div class="mode-panel-actions">
+          <button type="button" id="mode-panel-cancel" class="mode-panel-btn">Cancel</button>
+          <button type="submit" id="mode-panel-submit" class="mode-panel-btn mode-panel-btn--primary">Activate</button>
+        </div>
       </form>
     </dialog>
-
-    <section class="panel panel-events">
-      <div class="panel-header">
-        <h2>Recent events</h2>
-      </div>
-      <ol id="events-list" class="events-list">
-        <li class="muted">—</li>
-      </ol>
-    </section>
   </main>
 
   <main id="ops-view" class="tab-view" hidden>

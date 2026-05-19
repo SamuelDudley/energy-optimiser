@@ -673,17 +673,176 @@ main {
 }
 
 /* ── User-strategy modes ──────────────────────────────────────────── */
-.modes-section { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-block: 1rem; }
-.mode-card { border: 1px solid var(--card-border, #333); border-radius: 6px; padding: 1rem; background: var(--card-bg, #1a1a1a); }
-.mode-card__header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
-.mode-card__title { font-weight: bold; letter-spacing: 0.05em; }
-.mode-card__status[data-status="active"] { color: var(--accent-ok, #4ec); }
-.mode-card__status[data-status="inactive"] { color: var(--muted, #888); }
-.mode-card__detail { display: flex; justify-content: space-between; padding: 0.2rem 0; }
-.mode-card__detail .label { color: var(--muted, #888); }
-.mode-card__activate, .mode-card__cancel { width: 100%; padding: 0.5rem; margin-top: 0.5rem; cursor: pointer; }
-.mode-panel { padding: 1.5rem; max-width: 24rem; }
-.mode-panel label { display: block; margin-block: 0.5rem; }
-.mode-panel select, .mode-panel input { width: 100%; padding: 0.4rem; }
-.mode-panel__hint { font-size: 0.85em; color: var(--muted, #888); margin-block: 0.4rem; }
-@media (max-width: 600px) { .modes-section { grid-template-columns: 1fr; } }
+/* ── User-strategy modes ───────────────────────────────────────── */
+/* Mirrors .panel + .load-card so it sits in the existing design     */
+/* language. Uses --bg/--border/--muted/etc. from :root, no fallbacks. */
+
+.panel-modes { grid-column: 1 / span 2; }
+.modes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.mode-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mode-card[data-active="true"] { border-left-color: var(--good); }
+
+.mode-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12px;
+}
+.mode-card-name { color: var(--text); font-weight: 600; }
+.mode-card-state {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+.mode-card[data-active="true"] .mode-card-state { color: var(--good); }
+
+.mode-card-blurb {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.35;
+  margin-bottom: 4px;
+}
+.mode-card-power {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+}
+.mode-card-meta { font-size: 11px; color: var(--muted); }
+
+.mode-card-action {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.mode-card-action:hover { border-color: var(--accent); }
+.mode-card-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.mode-card-action--cancel:hover { border-color: var(--bad); color: var(--bad); }
+
+/* ── Activation dialog (themed dark to match the dashboard) ── */
+dialog.mode-panel {
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0;
+  max-width: 360px;
+  width: calc(100vw - 32px);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+dialog.mode-panel::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+dialog.mode-panel form { padding: 16px; }
+
+.mode-panel-header { margin-bottom: 12px; }
+.mode-panel-header h2 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.mode-panel-field { display: block; margin-bottom: 12px; }
+.mode-panel-field-label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.mode-panel select,
+.mode-panel input[type="number"] {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+.mode-panel select:focus,
+.mode-panel input[type="number"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.mode-panel-hint {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+  margin: 0 0 16px 0;
+  min-height: 1.4em;
+}
+
+.mode-panel-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.mode-panel-btn {
+  padding: 6px 14px;
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.mode-panel-btn:hover { border-color: var(--accent); }
+.mode-panel-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.mode-panel-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+.mode-panel-btn--primary:hover {
+  background: var(--text);
+  border-color: var(--text);
+}
+
+@media (max-width: 720px) {
+  .panel-modes { grid-column: 1 / -1; }
+  .modes-grid { grid-template-columns: 1fr; }
+}
