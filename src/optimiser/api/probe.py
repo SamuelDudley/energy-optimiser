@@ -7,7 +7,7 @@ Broken out so handlers can import it without cycling through
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import duckdb
 from aiohttp import web
@@ -16,6 +16,9 @@ from ..config import APIConfig, BatteryConfig, ManagedLoadConfig
 from ..types import TickSnapshot
 from .log_buffer import RingBufferHandler
 from .metrics import Metrics
+
+if TYPE_CHECKING:
+    from ..modes import ModeManager
 
 
 @runtime_checkable
@@ -50,6 +53,9 @@ class ServiceProbe(Protocol):
     # cards can render the right target unit (kWh vs minutes) and
     # progress fraction without rebuilding state per tick.
     managed_load_configs: list[ManagedLoadConfig]
+
+    @property
+    def mode_manager(self) -> ModeManager: ...
 
 
 # Typed app key — handlers retrieve the probe via

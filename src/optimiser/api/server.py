@@ -26,6 +26,7 @@ from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
 from .handlers.logs import logs as logs_handler
 from .handlers.metrics import metrics as metrics_handler
+from .handlers.modes import register_modes_routes
 from .handlers.ops import (
     ops_api_health,
     ops_modbus,
@@ -109,6 +110,9 @@ class APIServer:
         app.router.add_get("/dashboard", dashboard_index)
         app.router.add_get("/dashboard/static/{filename}", dashboard_static)
         app.router.add_get("/dashboard/config", dashboard_config)
+        # User-strategy mode endpoints (concrete paths — must register
+        # before the /{table} catch-all).
+        register_modes_routes(app)
         app.router.add_get("/{table}/schema", table_schema)
         app.router.add_get("/{table}", table_rows)
 
