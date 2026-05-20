@@ -15,6 +15,7 @@ from optimiser.modes import ModeOverrides
 from optimiser.types import (
     LoadProfile,
     PriceInterval,
+    PVForecast,
     SystemState,
 )
 
@@ -139,12 +140,23 @@ def test_buy_mode_forbids_battery_export() -> None:
         assert slot.grid_export_kw <= slot.pv_to_export_kw + 1e-6
 
 
-def test_conserve_mode_blocks_battery_export_below_floor() -> None:
-    """Slot 2 has ep=5c, floor=15c → battery cannot contribute to export at slot 2."""
+def test_conserve_mode_blocks_all_export_below_floor() -> None:
+    """Below floor: total grid_export must be 0 (no battery, no PV).
+    Above floor: battery still cannot contribute, but PV may export."""
     n_slots = 12
     imports = [25.0] * n_slots
-    # Low export at slot 2 only.
+    # Low export at slot 2 only; others are above the floor.
     exports = [20.0, 20.0, 5.0] + [20.0] * (n_slots - 3)
+    pv = [
+        PVForecast(
+            start=NOW + SLOT * i,
+            end=NOW + SLOT * (i + 1),
+            pv_estimate_kw=6.0,
+            pv_estimate10_kw=6.0,
+            pv_estimate90_kw=6.0,
+        )
+        for i in range(n_slots)
+    ]
     state = _state(soc=90.0)  # high SOC so LP would happily discharge
 
     overrides = ModeOverrides(
@@ -156,7 +168,7 @@ def test_conserve_mode_blocks_battery_export_below_floor() -> None:
     result = solve_stochastic(
         state=state,
         prices_planning=_prices(imports, exports),
-        pv_forecast=None,
+        pv_forecast=pv,
         load_profile=_profile(2.0),
         managed_loads=[],
         lp_loads=build_lp_loads(configs=[]),
@@ -165,9 +177,11 @@ def test_conserve_mode_blocks_battery_export_below_floor() -> None:
     )
     assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
     base = result.forward_trajectory
-    # Sub-floor slot must export only PV (which is zero here since no
-    # PV forecast → 0).
-    assert base[2].grid_export_kw <= base[2].pv_to_export_kw + 1e-6
+    # Slot 2 (ep=5c < floor=15c): total export must be 0 even with PV.
+    assert base[2].grid_export_kw == pytest.approx(0.0, abs=1e-6)
+    # Above-floor slots: battery still cannot contribute, but PV can.
+    for i in (0, 1, 3, 4, 5):
+        assert base[i].grid_export_kw <= base[i].pv_to_export_kw + 1e-6
 
 
 def test_buy_mode_wear_discount_increases_grid_charge() -> None:

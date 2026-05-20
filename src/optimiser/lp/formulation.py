@@ -658,10 +658,11 @@ def _add_scenario_to_problem(
                 )
 
     # ── Mode overrides: conserve ─────────────────────────────────
-    # No battery contribution to grid_export at slots where the
-    # export price (this scenario) is below the user-supplied floor.
-    # PV-sourced export is unaffected (existing export_cap handles
-    # negative-price curtailment).
+    # Battery → grid is never allowed while conserve is active (hold
+    # every drop). PV → grid is allowed only when the export price
+    # (this scenario) is ≥ the user-supplied floor; below the floor,
+    # PV that the battery can't absorb is curtailed rather than
+    # exported.
     if mode_overrides is not None and mode_overrides.any_conserve_active():
         floor = mode_overrides.conserve_floor_c_per_kwh
         for t in range(n):
@@ -670,8 +671,13 @@ def _add_scenario_to_problem(
             ep_t = price_scenario.resolve_ep(_price_at(prices_planning, slots[t]))
             if floor is not None and ep_t < floor:
                 prob += (
+                    grid_export[t] == 0,
+                    f"{prefix}conserve_no_export_{t}",
+                )
+            else:
+                prob += (
                     grid_export[t] <= pv_to_export[t],
-                    f"{prefix}conserve_floor_{t}",
+                    f"{prefix}conserve_pv_only_{t}",
                 )
 
     # ── Cost terms (already weighted) ────────────────────────────
