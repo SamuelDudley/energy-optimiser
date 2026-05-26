@@ -2549,10 +2549,23 @@ const ModesUI = (() => {
   const durationSelect = document.getElementById("mode-duration");
   const hint = document.getElementById("mode-suggest-hint");
   const cancelBtn = document.getElementById("mode-panel-cancel");
+  const submitBtn = document.getElementById("mode-panel-submit");
   const socCutoffField = document.getElementById("mode-soc-cutoff-field");
   const socCutoffInput = document.getElementById("mode-soc-cutoff");
   let currentKind = null;
+  let currentMode = null;  // when editing, the mode being edited; else null
   let suggestSeq = 0;  // dropped-old-response guard
+
+  // Preset duration options on the <select>. Used by edit-mode to
+  // snap "remaining minutes" to the closest available preset so the
+  // initial selection reflects the in-flight window.
+  const DURATION_PRESETS = [15, 30, 60, 120, 240, 480, 1440, 2880];
+  function closestDurationPreset(minutes) {
+    if (!Number.isFinite(minutes) || minutes <= 0) return 60;
+    // Prefer the smallest preset >= remaining; falls through to the max.
+    for (const p of DURATION_PRESETS) if (p >= minutes) return p;
+    return DURATION_PRESETS[DURATION_PRESETS.length - 1];
+  }
 
   function paramKey(kind) {
     return kind === "buy" ? "ceiling_c_per_kwh" : "floor_c_per_kwh";
@@ -2564,7 +2577,7 @@ const ModesUI = (() => {
     return kind === "buy" ? "Ceiling (c/kWh)" : "Floor (c/kWh)";
   }
 
-  async function refreshSuggestion() {
+  async function refreshSuggestion({ overwriteThreshold = true } = {}) {
     if (!currentKind) return;
     const seq = ++suggestSeq;
     const dur = durationSelect.value;
@@ -2576,7 +2589,7 @@ const ModesUI = (() => {
       if (seq !== suggestSeq) return;  // stale response
       const value = body[responseKey(currentKind)];
       if (typeof value === "number") {
-        thresholdInput.value = value;
+        if (overwriteThreshold) thresholdInput.value = value;
         hint.textContent =
           `Suggested ${currentKind === "buy" ? "ceiling" : "floor"}: ${value} c/kWh ` +
           `(75th percentile of in-window ${currentKind === "buy" ? "import" : "export"} prices)`;
@@ -2589,26 +2602,55 @@ const ModesUI = (() => {
     }
   }
 
-  function openActivatePanel(kind) {
+  function openActivatePanel(kind, existing = null) {
     currentKind = kind;
-    title.textContent = `Activate ${kind} mode`;
+    currentMode = existing;
+    const editing = existing !== null;
+    title.textContent = `${editing ? "Edit" : "Activate"} ${kind} mode`;
+    submitBtn.textContent = editing ? "Update" : "Activate";
     thresholdLabel.textContent = thresholdLabelText(kind);
-    thresholdInput.value = "";
-    socCutoffInput.value = "";
     // SOC cutoff is buy-mode only.
     socCutoffField.hidden = kind !== "buy";
-    hint.textContent = "Computing suggestion…";
+
+    if (editing) {
+      // Prefill from the running mode: threshold + SOC cutoff + duration
+      // closest to remaining minutes. The user can change any of these
+      // before submitting; submit replaces the running mode.
+      const tv = existing.params[paramKey(kind)];
+      thresholdInput.value = typeof tv === "number" ? tv : "";
+      const cutoff = existing.params.soc_cutoff_pct;
+      socCutoffInput.value =
+        kind === "buy" && typeof cutoff === "number" ? cutoff : "";
+      const remainingMin = Math.max(
+        1,
+        Math.round((new Date(existing.end_at) - new Date()) / 60_000),
+      );
+      durationSelect.value = String(closestDurationPreset(remainingMin));
+      hint.textContent = "Editing the running mode. Submit replaces it with the values shown.";
+    } else {
+      thresholdInput.value = "";
+      socCutoffInput.value = "";
+      durationSelect.value = "60";
+      hint.textContent = "Computing suggestion…";
+    }
     panel.showModal();
-    refreshSuggestion();
+    // On edit, fetch the suggestion as advisory (don't overwrite the
+    // user's running threshold). On activate, overwrite the blank input
+    // with the suggested value as before.
+    refreshSuggestion({ overwriteThreshold: !editing });
   }
 
   function closePanel() {
     currentKind = null;
+    currentMode = null;
     suggestSeq++;  // invalidate any in-flight suggest
     panel.close();
   }
 
-  durationSelect.addEventListener("change", refreshSuggestion);
+  durationSelect.addEventListener("change", () => {
+    // On edit, don't clobber the user's threshold; on activate, do.
+    refreshSuggestion({ overwriteThreshold: currentMode === null });
+  });
   cancelBtn.addEventListener("click", closePanel);
   // Pressing Escape on the dialog also closes — the native behaviour is
   // already correct; no extra wiring needed.
@@ -2620,6 +2662,13 @@ const ModesUI = (() => {
     const action = btn.dataset.action;
     if (action === "activate") {
       openActivatePanel(kind);
+    } else if (action === "edit") {
+      const existing = (state.modes || []).find((m) => m.kind === kind);
+      if (!existing) {
+        showError(`Cannot edit ${kind} mode: not active`);
+        return;
+      }
+      openActivatePanel(kind, existing);
     } else if (action === "cancel") {
       cancelMode(kind);
     }

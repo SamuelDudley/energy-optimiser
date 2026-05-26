@@ -744,6 +744,8 @@ main {
   outline-offset: 1px;
 }
 .mode-card-action--cancel:hover { border-color: var(--bad); color: var(--bad); }
+.mode-card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.mode-card-actions .mode-card-action { margin-top: 0; }
 
 /* ── Activation dialog (themed dark to match the dashboard) ── */
 dialog.mode-panel {
@@ -774,6 +776,7 @@ dialog.mode-panel form { padding: 16px; }
 }
 
 .mode-panel-field { display: block; margin-bottom: 12px; }
+.mode-panel-field[hidden] { display: none; }
 .mode-panel-field-label {
   display: block;
   font-size: 11px;

@@ -129,7 +129,10 @@
             <div class="mode-card-power" data-field="threshold">— c/kWh</div>
             <div class="mode-card-meta">Ends in <span data-field="countdown">—</span></div>
             <div class="mode-card-meta" data-field="soc-cutoff-row" hidden>Auto-exit at <span data-field="soc-cutoff">—</span>% SOC</div>
-            <button type="button" class="mode-card-action mode-card-action--cancel" data-kind="buy" data-action="cancel">Cancel</button>
+            <div class="mode-card-actions">
+              <button type="button" class="mode-card-action" data-kind="buy" data-action="edit">Edit</button>
+              <button type="button" class="mode-card-action mode-card-action--cancel" data-kind="buy" data-action="cancel">Cancel</button>
+            </div>
           </div>
         </div>
         <div class="mode-card" id="mode-card-conserve" data-kind="conserve" data-active="false">
@@ -144,7 +147,10 @@
           <div class="mode-card-body" data-state="active" hidden>
             <div class="mode-card-power" data-field="threshold">— c/kWh</div>
             <div class="mode-card-meta">Ends in <span data-field="countdown">—</span></div>
-            <button type="button" class="mode-card-action mode-card-action--cancel" data-kind="conserve" data-action="cancel">Cancel</button>
+            <div class="mode-card-actions">
+              <button type="button" class="mode-card-action" data-kind="conserve" data-action="edit">Edit</button>
+              <button type="button" class="mode-card-action mode-card-action--cancel" data-kind="conserve" data-action="cancel">Cancel</button>
+            </div>
           </div>
         </div>
       </div>
@@ -175,7 +181,7 @@
         <label class="mode-panel-field" id="mode-soc-cutoff-field" hidden>
           <span class="mode-panel-field-label">SOC cutoff (optional, %)</span>
           <input type="number" name="soc_cutoff_pct" id="mode-soc-cutoff" min="1" max="100" step="1" inputmode="numeric" placeholder="e.g. 80">
-          <small class="mode-panel-field-help">Buy mode auto-exits when SOC reaches this. Leave blank to run for the full window.</small>
+          <small class="mode-panel-field-help">Buy mode auto-exits when SOC reaches this. Leave blank to charge for the full window.</small>
         </label>
         <p id="mode-suggest-hint" class="mode-panel-hint">—</p>
         <div class="mode-panel-actions">
