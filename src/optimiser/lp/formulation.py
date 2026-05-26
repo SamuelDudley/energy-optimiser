@@ -25,6 +25,7 @@ import pulp
 from ..config import BatteryConfig
 from ..types import LoadProfile, ManagedLoadStatus, PriceInterval, PVForecast, SystemState
 from .constants import (
+    BUY_SOC_DELTA_INCENTIVE_PER_PCT,
     DEFAULT_SCENARIO_WEIGHTS,
     EXPORT_TIE_BREAK_PENALTY_PER_KWH,
     HORIZON_HOURS,
@@ -84,6 +85,10 @@ class LPVars:
     soc_over_ceiling: list[pulp.LpVariable] = field(default_factory=list)
     soc_terminal_slack: pulp.LpVariable | None = None
     weight: float = 1.0
+    # Index of the last buy-window slot, or None if buy mode is inactive.
+    # Exposed so the solver can subtract the lexicographic SOC incentive
+    # from reported cost (parallel to `soc_over_ceiling` / `soc_terminal_slack`).
+    buy_last_slot_idx: int | None = None
 
 
 @dataclass
@@ -630,12 +635,23 @@ def _add_scenario_to_problem(
     # for every in-window slot, forbid battery contribution to
     # grid_export (preserve what was bought). PV export is
     # unaffected — that's controlled by export_cap.
+    #
+    # `soc_cutoff_pct` (optional) is the upper bound on SOC during
+    # the window — the LP will not overshoot it. It also serves as
+    # the service-side auto-exit trigger (see ModeManager.prune_soc_reached).
+    #
+    # Lexicographic incentive on end-of-window SOC: a strong reward
+    # on `soc_pct[last_buy_slot]` so the LP fills the battery to its
+    # cap (cutoff or battery ceiling) using the cheapest sub-ceiling
+    # slots. Added below as a single term in the cost objective.
+    buy_last_t: int | None = None
     if mode_overrides is not None and mode_overrides.any_buy_active():
         ceiling = mode_overrides.buy_ceiling_c_per_kwh
         soc_cutoff = mode_overrides.buy_soc_cutoff_pct
         for t in range(n):
             if not mode_overrides.buy_active_at[t]:
                 continue
+            buy_last_t = t
             ip_t = price_scenario.resolve_ip(_price_at(prices_planning, slots[t]))
             if ceiling is not None and ip_t > ceiling:
                 prob += (
@@ -647,10 +663,7 @@ def _add_scenario_to_problem(
                 grid_export[t] <= pv_to_export[t],
                 f"{prefix}buy_no_bat_export_{t}",
             )
-            # Optional SOC cutoff — LP plans to land at the cutoff
-            # without overshoot. The service-side prune_soc_reached
-            # auto-cancels the mode once SOC actually reaches the
-            # cutoff, so this constraint goes away on the next tick.
+            # Per-slot upper bound — no overshoot above cutoff.
             if soc_cutoff is not None:
                 prob += (
                     soc_pct[t] <= soc_cutoff,
@@ -658,11 +671,10 @@ def _add_scenario_to_problem(
                 )
 
     # ── Mode overrides: conserve ─────────────────────────────────
-    # Battery → grid is never allowed while conserve is active (hold
-    # every drop). PV → grid is allowed only when the export price
-    # (this scenario) is ≥ the user-supplied floor; below the floor,
-    # PV that the battery can't absorb is curtailed rather than
-    # exported.
+    # Below the floor: total grid_export pinned to zero (battery
+    # held, PV that can't be absorbed is curtailed). At or above the
+    # floor: no extra constraint — battery and PV may both export
+    # subject to standard LP economics.
     if mode_overrides is not None and mode_overrides.any_conserve_active():
         floor = mode_overrides.conserve_floor_c_per_kwh
         for t in range(n):
@@ -673,11 +685,6 @@ def _add_scenario_to_problem(
                 prob += (
                     grid_export[t] == 0,
                     f"{prefix}conserve_no_export_{t}",
-                )
-            else:
-                prob += (
-                    grid_export[t] <= pv_to_export[t],
-                    f"{prefix}conserve_pv_only_{t}",
                 )
 
     # ── Cost terms (already weighted) ────────────────────────────
@@ -759,6 +766,13 @@ def _add_scenario_to_problem(
         cost_terms.append(weight * SOC_BOUND_PENALTY * soc_over_ceiling[t])
     # Terminal SOC slack (one variable for the whole horizon).
     cost_terms.append(weight * SOC_BOUND_PENALTY * soc_terminal_slack)
+    # Buy mode end-of-window SOC incentive (lexicographic). Negative
+    # term: rewards higher SOC at the last buy slot, dominating cost
+    # re-allocation among same-final-SOC schedules. Capped naturally
+    # by the cutoff (if set) or the battery's soc_ceiling_pct.
+    # Subtracted back from reported cost in solver._extract_solution.
+    if buy_last_t is not None:
+        cost_terms.append(-weight * soc_pct[buy_last_t] * BUY_SOC_DELTA_INCENTIVE_PER_PCT)
 
     return (
         LPVars(
@@ -778,6 +792,7 @@ def _add_scenario_to_problem(
             soc_over_ceiling=soc_over_ceiling,
             soc_terminal_slack=soc_terminal_slack,
             weight=weight,
+            buy_last_slot_idx=buy_last_t,
         ),
         cost_terms,
     )

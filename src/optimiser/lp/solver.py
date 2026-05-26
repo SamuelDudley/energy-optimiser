@@ -26,7 +26,12 @@ from ..types import (
     PVForecast,
     SystemState,
 )
-from .constants import NUMERIC_EPS, SOC_BOUND_PENALTY, SOLVER_TIMEOUT_S
+from .constants import (
+    BUY_SOC_DELTA_INCENTIVE_PER_PCT,
+    NUMERIC_EPS,
+    SOC_BOUND_PENALTY,
+    SOLVER_TIMEOUT_S,
+)
 from .formulation import LPVars, build_lp, build_stochastic_lp
 from .loads import LPLoad
 from .result import LPSolution, SlotDecision, SolveStatus
@@ -346,11 +351,22 @@ def _extract_solution(
             parts.append(_v(v.soc_terminal_slack))
         return v.weight * SOC_BOUND_PENALTY * sum(parts)
 
+    # Buy-mode SOC incentive: objective subtracted `weight * soc_pct[last] *
+    # INCENTIVE` per scenario. Add it back so reported cost reflects the
+    # real grid bill, not the LP's lexicographic preference for charging.
+    def _buy_incentive_for(v: LPVars) -> float:
+        if v.buy_last_slot_idx is None:
+            return 0.0
+        soc_end = _v(v.soc_pct[v.buy_last_slot_idx])
+        return v.weight * BUY_SOC_DELTA_INCENTIVE_PER_PCT * soc_end
+
     if scenarios is not None:
         penalty_cost = sum(_penalty_for(s) for s in scenarios.values())
+        buy_incentive = sum(_buy_incentive_for(s) for s in scenarios.values())
     else:
         penalty_cost = _penalty_for(vars)
-    cost = raw_cost - penalty_cost
+        buy_incentive = _buy_incentive_for(vars)
+    cost = raw_cost - penalty_cost + buy_incentive
 
     extra = ""
     if stochastic_meta:

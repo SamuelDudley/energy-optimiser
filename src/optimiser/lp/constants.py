@@ -234,6 +234,26 @@ IMPORT_TIE_BREAK_REWARD_PER_KWH: float = 0.05
 SOC_BOUND_PENALTY: float = 1e4
 
 
+# ── Buy mode end-of-window SOC incentive ─────────────────────────
+#
+# Per-%-SOC reward applied to `soc_pct[last_buy_slot]` while buy mode
+# is active. Implements a lexicographic-style objective: the LP first
+# maximises end-of-window SOC (filling the battery as much as possible
+# in sub-ceiling slots), then minimises real cost among schedules with
+# that same final SOC (so the cheapest slots win).
+#
+# Sizing: must dominate any plausible cost re-allocation among same-
+# final-SOC schedules. Worst-case re-allocation: 30 %-SOC of charge
+# (~12 kWh) shuffled between the cheapest sub-ceiling slot (~5 c/kWh)
+# and the most expensive (~30 c/kWh) = 25 c/kWh × 12 kWh = 300 c.
+# Per-% incentive of 1000 c gives a 30 % SOC gain ≈ 30000 c of
+# objective swing — comfortably larger. Stays well below big-M.
+#
+# Subtracted back from the reported cost in `solver.py::_extract_solution`
+# so dashboards see the real grid bill, not the LP's internal subsidy.
+BUY_SOC_DELTA_INCENTIVE_PER_PCT: float = 1e3
+
+
 # ── Solver ───────────────────────────────────────────────────────
 
 # Hard wall-clock limit for the LP solve. Past this, the optimiser

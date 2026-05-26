@@ -85,10 +85,16 @@ class ModeOverrides:
     buy_ceiling_c_per_kwh: float | None
     conserve_active_at: tuple[bool, ...]
     conserve_floor_c_per_kwh: float | None
-    # Optional early-exit trigger for buy mode: once SOC reaches this
-    # threshold, the mode auto-cancels (see ModeManager.prune_soc_reached).
-    # While active, the LP also caps soc_pct[t] <= cutoff on in-window
-    # slots so it plans to land at the cutoff without overshoot.
+    # Optional upper bound + auto-exit threshold for buy mode:
+    #   1. The LP caps soc_pct[t] <= cutoff on every in-window slot —
+    #      no overshoot above the cutoff.
+    #   2. Once measured SOC actually reaches the cutoff, the mode
+    #      auto-cancels (see ModeManager.prune_soc_reached).
+    # The LP also gets a strong lexicographic incentive to maximise
+    # end-of-window SOC during the buy window — so it charges as much
+    # as it can in the cheapest sub-ceiling slots, capped here.
+    # Leave None to charge for the full window with no cap beyond the
+    # battery's physical ceiling.
     # Defaulted (and placed last) to keep ModeOverrides backwards-
     # compatible with call sites that predate the cutoff feature.
     buy_soc_cutoff_pct: float | None = None

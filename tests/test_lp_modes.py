@@ -142,7 +142,7 @@ def test_buy_mode_forbids_battery_export() -> None:
 
 def test_conserve_mode_blocks_all_export_below_floor() -> None:
     """Below floor: total grid_export must be 0 (no battery, no PV).
-    Above floor: battery still cannot contribute, but PV may export."""
+    Above floor: no extra constraint — battery and PV may both export."""
     n_slots = 12
     imports = [25.0] * n_slots
     # Low export at slot 2 only; others are above the floor.
@@ -179,9 +179,40 @@ def test_conserve_mode_blocks_all_export_below_floor() -> None:
     base = result.forward_trajectory
     # Slot 2 (ep=5c < floor=15c): total export must be 0 even with PV.
     assert base[2].grid_export_kw == pytest.approx(0.0, abs=1e-6)
-    # Above-floor slots: battery still cannot contribute, but PV can.
-    for i in (0, 1, 3, 4, 5):
-        assert base[i].grid_export_kw <= base[i].pv_to_export_kw + 1e-6
+
+
+def test_conserve_mode_allows_battery_export_above_floor() -> None:
+    """Above the floor, battery is free to contribute to grid_export.
+    Setup: no PV, high SOC, export price well above the floor and well
+    above the round-trip wear/RTE break-even — LP should empty the
+    battery to grid rather than hold it."""
+    n_slots = 12
+    imports = [5.0] * n_slots  # cheap import so no banking incentive
+    exports = [40.0] * n_slots  # well above the floor, well above wear break-even
+    state = _state(soc=90.0)  # high SOC, plenty of headroom above floor
+
+    overrides = ModeOverrides(
+        buy_active_at=tuple([False] * n_slots),
+        buy_ceiling_c_per_kwh=None,
+        conserve_active_at=tuple([True] * n_slots),
+        conserve_floor_c_per_kwh=15.0,
+    )
+    result = solve_stochastic(
+        state=state,
+        prices_planning=_prices(imports, exports),
+        pv_forecast=None,
+        load_profile=_profile(0.0),
+        managed_loads=[],
+        lp_loads=build_lp_loads(configs=[]),
+        battery_config=_battery(),
+        mode_overrides=overrides,
+    )
+    assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+    base = result.forward_trajectory
+    # With no PV, any grid_export must come from battery — assert that
+    # exporting actually happens above the floor.
+    battery_exports = [slot.grid_export_kw for slot in base if slot.grid_export_kw > 0.01]
+    assert len(battery_exports) > 0, "LP should discharge battery to grid above floor"
 
 
 def test_buy_mode_wear_discount_increases_grid_charge() -> None:
@@ -309,6 +340,135 @@ def test_buy_mode_cutoff_picks_cheapest_slots() -> None:
     assert middle_charge < cheap_charge * 0.05, (
         f"middle-priced slots got non-trivial charging; "
         f"cheap={cheap_charge:.3f} kW·slots, middle={middle_charge:.3f}"
+    )
+
+
+def test_buy_mode_charges_without_arbitrage_signal() -> None:
+    """Buy mode's lexicographic end-of-window SOC incentive forces the
+    LP to charge during the window even when its forecast view sees no
+    profitable arbitrage — "I asked for buy, so buy".
+
+    Setup: flat prices across the whole horizon (no future peak,
+    nothing to arbitrage into). Without the incentive the LP would
+    leave SOC where it started; with it, the LP fills to the cutoff
+    using the cheapest sub-ceiling slots.
+    """
+    n_window = 24  # 2h buy window at 5-min slots
+    n_total = 48  # 4h horizon
+    # Flat 20c throughout — no future peak, no arb signal. Ceiling 25c
+    # so every in-window slot is eligible for grid charging.
+    imports = [20.0] * n_total
+    exports = [3.0] * n_total
+    state = _state(soc=10.0)  # start at floor, well below cutoff
+    overrides = ModeOverrides(
+        buy_active_at=tuple([True] * n_window + [False] * (n_total - n_window)),
+        buy_ceiling_c_per_kwh=25.0,
+        buy_soc_cutoff_pct=30.0,
+        conserve_active_at=tuple([False] * n_total),
+        conserve_floor_c_per_kwh=None,
+    )
+    result = solve_stochastic(
+        state=state,
+        prices_planning=_prices(imports, exports),
+        pv_forecast=None,
+        load_profile=_profile(0.0),  # zero load so charging is the only effect
+        managed_loads=[],
+        lp_loads=build_lp_loads(configs=[]),
+        battery_config=_battery(),
+        mode_overrides=overrides,
+    )
+    assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+    # SOC at the end of the buy window (slot n_window - 1) must reach
+    # the cutoff. Allow a tiny tolerance for solver numerics.
+    soc_end_window = result.forward_trajectory[n_window - 1].soc_pct_end
+    assert soc_end_window >= 30.0 - 1e-3, (
+        f"LP failed to reach buy target by end of window: "
+        f"soc_end_window={soc_end_window:.2f}, target=30.0"
+    )
+
+
+def test_buy_mode_skips_spikes_above_ceiling() -> None:
+    """When some in-window slots exceed the ceiling (spikes), the LP
+    must fill using only the sub-ceiling slots — never charging at or
+    above the ceiling — and still reach the cutoff if the available
+    cheap-slot capacity is enough."""
+    n_window = 24
+    n_total = 48
+    # Alternating cheap (10c) and spike (50c) — ceiling at 30c skips
+    # every spike. 12 sub-ceiling slots in the window must still be
+    # enough to hit the target.
+    imports = [10.0 if i % 2 == 0 else 50.0 for i in range(n_window)] + [20.0] * (
+        n_total - n_window
+    )
+    exports = [3.0] * n_total
+    state = _state(soc=10.0)
+    overrides = ModeOverrides(
+        buy_active_at=tuple([True] * n_window + [False] * (n_total - n_window)),
+        buy_ceiling_c_per_kwh=30.0,
+        buy_soc_cutoff_pct=25.0,
+        conserve_active_at=tuple([False] * n_total),
+        conserve_floor_c_per_kwh=None,
+    )
+    result = solve_stochastic(
+        state=state,
+        prices_planning=_prices(imports, exports),
+        pv_forecast=None,
+        load_profile=_profile(0.0),
+        managed_loads=[],
+        lp_loads=build_lp_loads(configs=[]),
+        battery_config=_battery(),
+        mode_overrides=overrides,
+    )
+    assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+    traj = result.forward_trajectory[:n_window]
+    spike_charge = sum(s.grid_to_battery_kw for i, s in enumerate(traj) if i % 2 == 1)
+    cheap_charge = sum(s.grid_to_battery_kw for i, s in enumerate(traj) if i % 2 == 0)
+    # Spike slots must be untouched (hard ceiling constraint).
+    assert spike_charge < 1e-3, f"LP charged during spike slots: {spike_charge}"
+    # All the charging happens in the cheap slots.
+    assert cheap_charge > 0
+    # Target must still be reached.
+    soc_end_window = traj[-1].soc_pct_end
+    assert soc_end_window >= 25.0 - 1e-3
+
+
+def test_buy_mode_charges_without_cutoff() -> None:
+    """SOC cutoff is optional: with it unset, the LP still charges
+    aggressively during the buy window (capped only by the battery's
+    physical soc_ceiling_pct), picking the cheapest sub-ceiling slots.
+    """
+    n_window = 24
+    n_total = 48
+    # Flat 20c throughout — no arb signal. Ceiling 25c so all eligible.
+    imports = [20.0] * n_total
+    exports = [3.0] * n_total
+    state = _state(soc=10.0)
+    overrides = ModeOverrides(
+        buy_active_at=tuple([True] * n_window + [False] * (n_total - n_window)),
+        buy_ceiling_c_per_kwh=25.0,
+        buy_soc_cutoff_pct=None,  # ← no cutoff
+        conserve_active_at=tuple([False] * n_total),
+        conserve_floor_c_per_kwh=None,
+    )
+    result = solve_stochastic(
+        state=state,
+        prices_planning=_prices(imports, exports),
+        pv_forecast=None,
+        load_profile=_profile(0.0),
+        managed_loads=[],
+        lp_loads=build_lp_loads(configs=[]),
+        battery_config=_battery(),
+        mode_overrides=overrides,
+    )
+    assert result.status in (SolveStatus.OPTIMAL, SolveStatus.FEASIBLE)
+    # SOC must have grown materially during the buy window — without a
+    # cutoff the LP charges as much as possible, bounded by the battery
+    # ceiling (95%) or window duration. From 10% over 2h at 10kW that's
+    # roughly 28% of growth before efficiency losses, more than enough
+    # to clear a 20% delta threshold here.
+    soc_end_window = result.forward_trajectory[n_window - 1].soc_pct_end
+    assert soc_end_window >= 30.0, (
+        f"LP failed to charge without a cutoff: soc_end_window={soc_end_window:.2f}"
     )
 
 
