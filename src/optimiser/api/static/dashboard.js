@@ -362,8 +362,17 @@ async function fetchReady() {
   const res = await fetch("/readyz");
   try { return await res.json(); } catch { return null; }
 }
+// The telemetry table is ~50 columns wide (alarms, MPPT strings, lifetime
+// counters, cell temps, phase voltages…) but the dashboard plots only
+// these. Projecting server-side cuts the /telemetry payload ~5x.
+const TELEMETRY_COLUMNS = [
+  "ts", "soc_pct", "battery_kw", "pv_kw", "grid_kw", "grid_kw_shelly",
+  "house_load_kw", "import_price", "export_price", "ems_mode", "planner_action",
+];
 async function fetchTelemetry(sinceISO, untilISO) {
-  return await fetchTablePaged("telemetry", sinceISO, untilISO, "ts");
+  return await fetchTablePaged("telemetry", sinceISO, untilISO, "ts", {
+    columns: TELEMETRY_COLUMNS,
+  });
 }
 async function fetchLoadTelemetry(sinceISO, untilISO) {
   // 1 row per load per 5-min boundary. With ~2 loads × 288 slots/day,
@@ -415,6 +424,11 @@ async function fetchDailySpend(limit = 60) {
 async function fetchTablePaged(table, sinceISO, untilISO, timeCol, opts = {}) {
   const LIMIT = opts.limit ?? 1000;
   const MAX_PAGES = opts.maxPages ?? 6;
+  // Optional server-side column projection. timeCol is force-included so
+  // the paging cursor (page[…][timeCol]) always has a value to advance on.
+  const cols = opts.columns
+    ? [...new Set([timeCol, ...opts.columns])].join(",")
+    : null;
   let cursor = sinceISO || null;
   const rows = [];
   for (let i = 0; i < MAX_PAGES; i++) {
@@ -422,6 +436,7 @@ async function fetchTablePaged(table, sinceISO, untilISO, timeCol, opts = {}) {
     if (cursor) params.set("since", cursor);
     if (untilISO) params.set("until", untilISO);
     params.set("limit", String(LIMIT));
+    if (cols) params.set("columns", cols);
     const data = await apiFetch(`/${table}?${params.toString()}`);
     const page = data.rows || [];
     if (page.length === 0) break;

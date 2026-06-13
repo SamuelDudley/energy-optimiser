@@ -1416,3 +1416,52 @@ class TestDashboard:
         # Restore the un-overridden module so other tests see the real assets.
         monkeypatch.delenv("EO_DASHBOARD_STATIC_DIR", raising=False)
         importlib.reload(dashboard_mod)
+
+
+class TestTableColumnProjection:
+    """`?columns=` projects the SELECT server-side so the dashboard fetches
+    only the telemetry columns it plots (~11 of ~50) instead of SELECT *."""
+
+    async def test_columns_param_returns_only_requested(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 2)  # columns: ts, soc_pct, battery_kw
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry?columns=ts,soc_pct", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 2
+            assert set(body["rows"][0].keys()) == {"ts", "soc_pct"}
+
+    async def test_no_columns_param_returns_all(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 1)
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry", headers=_auth())
+            body = await r.json()
+            assert set(body["rows"][0].keys()) == {"ts", "soc_pct", "battery_kw"}
+
+    async def test_unknown_column_is_400(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 1)
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get("/telemetry?columns=ts,bogus_col", headers=_auth())
+            assert r.status == 400
+
+    async def test_projection_still_orders_and_filters(self, tmp_path: Path) -> None:
+        # ORDER BY ts must work even when ts-only projection is requested,
+        # and since/until still filter (frontend paging depends on this).
+        conn = duckdb.connect()
+        _seed_telemetry(conn, 5)
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get(
+                "/telemetry?columns=soc_pct&since=2026-01-01T03:00:00%2B00:00",
+                headers=_auth(),
+            )
+            body = await r.json()
+            assert body["count"] == 2  # hours 3, 4
+            assert set(body["rows"][0].keys()) == {"soc_pct"}
+            assert body["rows"][0]["soc_pct"] == 53.0

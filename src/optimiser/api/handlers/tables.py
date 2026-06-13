@@ -77,32 +77,69 @@ def _to_jsonable(v: Any) -> Any:
     return v
 
 
+def _parse_columns(raw: str | None) -> list[str] | None:
+    """Parse the `columns=` projection param (comma-separated). None means
+    no projection → SELECT *. Empty/blank entries are dropped."""
+    if not raw:
+        return None
+    cols = [c.strip() for c in raw.split(",") if c.strip()]
+    return cols or None
+
+
 def _run_query(
-    conn, table: str, since: datetime | None, until: datetime | None, limit: int
+    conn,
+    table: str,
+    since: datetime | None,
+    until: datetime | None,
+    limit: int,
+    columns: list[str] | None = None,
 ) -> tuple[list[str], list[list[Any]]]:
     """Synchronous core. Called via asyncio.to_thread.
 
     Uses `conn.cursor()` so this runs on a separate DuckDB query
     handle and doesn't serialise behind the tick loop's writes.
+
+    `columns`, if given, projects the SELECT down to those columns —
+    validated against the table's real schema (raises ValueError →
+    surfaced as 400) so unknown names can't be interpolated.
     """
     time_col = TABLE_TIME_COLUMNS[table]
-    where = []
-    params: list[Any] = []
-    if since is not None:
-        where.append(f"{time_col} >= ?")
-        params.append(since)
-    if until is not None:
-        where.append(f"{time_col} < ?")
-        params.append(until)
-    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-
-    # `table` and `time_col` are taken from the whitelist above — safe to
-    # interpolate. Filter values are still parameterised.
-    sql = f"SELECT * FROM {table} {where_sql} ORDER BY {time_col} ASC LIMIT ?"  # noqa: S608 — interpolation is whitelisted
-    params.append(limit)
 
     cur = conn.cursor()
     try:
+        if columns:
+            valid = {
+                row[0]
+                for row in cur.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                    [table],
+                ).fetchall()
+            }
+            unknown = [c for c in columns if c not in valid]
+            if unknown:
+                raise ValueError(f"unknown column(s): {', '.join(sorted(unknown))}")
+            # Each name is a verified member of the table schema — safe to
+            # interpolate (double-quoted). ORDER BY may reference a column
+            # not in the projection; DuckDB allows that.
+            select_sql = ", ".join(f'"{c}"' for c in columns)
+        else:
+            select_sql = "*"
+
+        where = []
+        params: list[Any] = []
+        if since is not None:
+            where.append(f"{time_col} >= ?")
+            params.append(since)
+        if until is not None:
+            where.append(f"{time_col} < ?")
+            params.append(until)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        # `table`, `time_col` and projected column names are whitelisted —
+        # safe to interpolate. Filter values are still parameterised.
+        sql = f"SELECT {select_sql} FROM {table} {where_sql} ORDER BY {time_col} ASC LIMIT ?"  # noqa: S608 — interpolation is whitelisted
+        params.append(limit)
+
         cur.execute(sql, params)
         cols = [c[0] for c in cur.description]
         rows = cur.fetchall()
@@ -114,35 +151,30 @@ def _run_query(
 async def table_rows(request: web.Request) -> web.Response:
     table = request.match_info["table"]
     if table not in QUERYABLE_TABLES:
-        return web.json_response(
-            {"error": "unknown table", "table": table}, status=404
-        )
+        return web.json_response({"error": "unknown table", "table": table}, status=404)
 
     probe = request.app[SERVICE_PROBE_KEY]
     api_cfg = request.app[API_CONFIG_KEY]
     since = _parse_iso(request.query.get("since"))
     until = _parse_iso(request.query.get("until"))
     limit = _parse_limit(request.query.get("limit"), cap=api_cfg.query_max_limit)
+    columns = _parse_columns(request.query.get("columns"))
 
     try:
         cols, rows = await asyncio.wait_for(
-            asyncio.to_thread(
-                _run_query, probe.db_connection, table, since, until, limit
-            ),
+            asyncio.to_thread(_run_query, probe.db_connection, table, since, until, limit, columns),
             timeout=api_cfg.query_timeout_s,
         )
     except TimeoutError:
-        return web.json_response(
-            {"error": "query timed out", "table": table}, status=504
-        )
+        return web.json_response({"error": "query timed out", "table": table}, status=504)
+    except ValueError as exc:
+        # Unknown projected column — client error, not a server fault.
+        return web.json_response({"error": "bad columns", "detail": str(exc)}, status=400)
     except Exception as exc:
         logger.exception("table query failed: %s", table)
-        return web.json_response(
-            {"error": "query failed", "detail": str(exc)}, status=500
-        )
+        return web.json_response({"error": "query failed", "detail": str(exc)}, status=500)
 
     out_rows = [
-        {col: _to_jsonable(val) for col, val in zip(cols, row, strict=True)}
-        for row in rows
+        {col: _to_jsonable(val) for col, val in zip(cols, row, strict=True)} for row in rows
     ]
     return web.json_response({"table": table, "count": len(out_rows), "rows": out_rows})
