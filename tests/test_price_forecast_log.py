@@ -96,13 +96,15 @@ def _fi(
 
 class TestAmberDrainLogRows:
     async def test_empty_drain_before_fetch(
-        self, amber_config: AmberConfig,
+        self,
+        amber_config: AmberConfig,
     ) -> None:
         client = AmberClient(amber_config)
         assert client.drain_log_rows() == []
 
     async def test_30min_fetch_populates_log_rows(
-        self, amber_config: AmberConfig,
+        self,
+        amber_config: AmberConfig,
     ) -> None:
         start = "2026-04-15T00:00:00Z"
         payload = [
@@ -130,7 +132,8 @@ class TestAmberDrainLogRows:
         assert r.export_per_kwh == pytest.approx(-6.0)
 
     async def test_feedin_advancedprice_lands_in_log_row(
-        self, amber_config: AmberConfig,
+        self,
+        amber_config: AmberConfig,
     ) -> None:
         """advancedPrice on the feedIn channel populates the export-side
         forecast columns on PriceForecastLogRow with the customer-
@@ -163,7 +166,8 @@ class TestAmberDrainLogRows:
         assert r.export_forecast_high == pytest.approx(5.0)
 
     async def test_drain_is_destructive(
-        self, amber_config: AmberConfig,
+        self,
+        amber_config: AmberConfig,
     ) -> None:
         """Second drain returns empty. No double-logging."""
         start = "2026-04-15T00:00:00Z"
@@ -180,7 +184,8 @@ class TestAmberDrainLogRows:
         assert second == []
 
     async def test_both_cadences_flow_through(
-        self, amber_config: AmberConfig,
+        self,
+        amber_config: AmberConfig,
     ) -> None:
         """5-min and 30-min fetches both go to the drain with the right
         resolution tag."""
@@ -197,6 +202,21 @@ class TestAmberDrainLogRows:
         assert len(rows) == 2
         resolutions = sorted(r.resolution for r in rows)
         assert resolutions == [5, 30]
+
+
+class TestForecastLogIndexes:
+    def test_forecast_log_tables_have_fetched_at_index(self, store: TelemetryStore) -> None:
+        """Both re-fetch logs carry a fetched_at index so the dashboard's
+        range-scan reduce queries (/dashboard/price_forecast etc.) stay
+        bounded as the tables grow unbounded."""
+        names = {
+            row[0]
+            for row in store.connection.execute(
+                "SELECT index_name FROM duckdb_indexes()"
+            ).fetchall()
+        }
+        assert "idx_price_forecast_log_fetched_at" in names
+        assert "idx_pv_forecast_log_fetched_at" in names
 
 
 class TestStorePriceForecastLog:
@@ -240,7 +260,8 @@ class TestStorePriceForecastLog:
         assert result[5] == pytest.approx(6.5)
 
     def test_write_with_default_none_export_forecast(
-        self, store: TelemetryStore,
+        self,
+        store: TelemetryStore,
     ) -> None:
         """Old call sites that don't pass the new export_forecast_*
         kwargs must still work — fields default to None and DuckDB
@@ -332,25 +353,32 @@ class TestMultiIntervalSameFetch:
     multiple fetches as the forecast evolves. Test that we capture that."""
 
     async def test_successive_fetches_of_same_interval(
-        self, amber_config: AmberConfig, store: TelemetryStore,
+        self,
+        amber_config: AmberConfig,
+        store: TelemetryStore,
     ) -> None:
         start = "2026-04-15T12:00:00Z"
         # First fetch: ForecastInterval, predicted=30c
         payload_1 = [
-            _gen(start, interval_type="ForecastInterval",
-                 advanced={"low": 20, "predicted": 30, "high": 45}),
+            _gen(
+                start,
+                interval_type="ForecastInterval",
+                advanced={"low": 20, "predicted": 30, "high": 45},
+            ),
             _fi(start),
         ]
         # Second fetch, later: still ForecastInterval, revised to 40c
         payload_2 = [
-            _gen(start, interval_type="ForecastInterval",
-                 advanced={"low": 28, "predicted": 40, "high": 55}),
+            _gen(
+                start,
+                interval_type="ForecastInterval",
+                advanced={"low": 28, "predicted": 40, "high": 55},
+            ),
             _fi(start),
         ]
         # Third fetch: CurrentInterval, estimate=False (locked)
         payload_3 = [
-            _gen(start, interval_type="CurrentInterval",
-                 per_kwh=38.0, estimate=False),
+            _gen(start, interval_type="CurrentInterval", per_kwh=38.0, estimate=False),
             _fi(start),
         ]
 

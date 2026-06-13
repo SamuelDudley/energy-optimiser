@@ -220,6 +220,14 @@ PRICE_FORECAST_LOG_MIGRATIONS = [
     "ALTER TABLE price_forecast_log ADD COLUMN IF NOT EXISTS export_forecast_high      REAL",
 ]
 
+# fetched_at indexes on the append-only re-fetch logs. Run after the
+# table DDL on every startup; IF NOT EXISTS makes them idempotent.
+FORECAST_LOG_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_price_forecast_log_fetched_at "
+    "ON price_forecast_log (fetched_at)",
+    "CREATE INDEX IF NOT EXISTS idx_pv_forecast_log_fetched_at ON pv_forecast_log (fetched_at)",
+]
+
 # Settled per-5-min usage from Amber's /usage endpoint. Each row is one
 # billed interval on one channel; SUM(cost_cents) GROUP BY nem_date is
 # the net bill for that day. Fetched once a day for the previous NEM day
@@ -297,6 +305,16 @@ class TelemetryStore:
                 self._db.execute(stmt)
             except Exception:
                 logger.exception("Migration failed: %s", stmt)
+        # fetched_at indexes on the re-fetch logs. These tables grow
+        # unbounded (Amber/Solcast re-log the whole horizon every poll) and
+        # the dashboard reduce endpoints range-scan by fetched_at. IF NOT
+        # EXISTS keeps this idempotent on existing DBs; the one-time build
+        # at startup is bounded by table size.
+        for stmt in FORECAST_LOG_INDEXES:
+            try:
+                self._db.execute(stmt)
+            except Exception:
+                logger.exception("Index creation failed: %s", stmt)
         logger.info("DuckDB tables initialised (schema v%d)", CURRENT_SCHEMA_VERSION)
 
     def close(self) -> None:

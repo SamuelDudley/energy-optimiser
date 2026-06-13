@@ -21,6 +21,8 @@ from .handlers.dashboard import (
     dashboard_config,
     dashboard_index,
     dashboard_static,
+    price_forecast,
+    pv_forecast,
 )
 from .handlers.discovery import root, table_schema
 from .handlers.health import healthz, readyz
@@ -111,6 +113,11 @@ class APIServer:
         app.router.add_get("/dashboard", dashboard_index)
         app.router.add_get("/dashboard/static/{filename}", dashboard_static)
         app.router.add_get("/dashboard/config", dashboard_config)
+        # Server-side reduced forecast views: latest forecast per interval,
+        # so the dashboard fetches ~hundreds of rows instead of the raw
+        # ~14.5k-row/24h re-fetch log. Concrete paths — before /{table}.
+        app.router.add_get("/dashboard/price_forecast", price_forecast)
+        app.router.add_get("/dashboard/pv_forecast", pv_forecast)
         # Live snapshot push (replaces the per-15s /plan/current poll).
         # Authed via the same bearer-header path as every other endpoint;
         # the frontend uses fetch + ReadableStream (not EventSource) so

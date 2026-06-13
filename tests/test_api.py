@@ -23,6 +23,8 @@ from optimiser.api.handlers.dashboard import (
     dashboard_config,
     dashboard_index,
     dashboard_static,
+    price_forecast,
+    pv_forecast,
 )
 from optimiser.api.handlers.discovery import TABLE_DESCRIPTIONS, root, table_schema
 from optimiser.api.handlers.health import healthz, readyz
@@ -37,6 +39,7 @@ from optimiser.api.probe import API_CONFIG_KEY, SERVICE_PROBE_KEY
 from optimiser.api.server import _favicon
 from optimiser.config import APIConfig, BatteryConfig
 from optimiser.modes import ModeManager
+from optimiser.store import PRICE_FORECAST_LOG_DDL, PV_FORECAST_LOG_DDL
 
 TOKEN = "test-token-xyz"
 _PUBLIC = (
@@ -115,6 +118,8 @@ def _build_app(probe: _Probe, api_config: APIConfig | None = None) -> web.Applic
     app.router.add_get("/dashboard", dashboard_index)
     app.router.add_get("/dashboard/static/{filename}", dashboard_static)
     app.router.add_get("/dashboard/config", dashboard_config)
+    app.router.add_get("/dashboard/price_forecast", price_forecast)
+    app.router.add_get("/dashboard/pv_forecast", pv_forecast)
     app.router.add_get("/{table}/schema", table_schema)
     app.router.add_get("/{table}", table_rows)
     return app
@@ -542,6 +547,165 @@ def _seed_telemetry(conn: duckdb.DuckDBPyConnection, n: int = 5) -> None:
     for i in range(n):
         ts = f"2026-01-01 0{i}:00:00+00:00"
         conn.execute("INSERT INTO telemetry VALUES (?, ?, ?)", [ts, 50.0 + i, float(i)])
+
+
+def _insert_price_forecast(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    fetched_at: str,
+    resolution: int,
+    interval_start: str,
+    predicted: float | None,
+    low: float | None = 0.0,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO price_forecast_log
+            (fetched_at, resolution, interval_start, interval_end,
+             interval_type, forecast_predicted, forecast_low)
+        VALUES (?, ?, ?, ?, 'ForecastInterval', ?, ?)
+        """,
+        [fetched_at, resolution, interval_start, interval_start, predicted, low],
+    )
+
+
+class TestDashboardPriceForecast:
+    """`/dashboard/price_forecast` returns the server-side reduced view:
+    the latest fetched_at per (interval_start, resolution), then the best
+    resolution per interval_start (5-min beats 30-min). Mirrors what
+    dashboard.js used to do client-side over ~14.5k raw rows."""
+
+    async def test_requires_auth(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        conn.execute(PRICE_FORECAST_LOG_DDL)
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/price_forecast")
+            assert r.status == 401
+
+    async def test_dedupes_to_latest_per_interval_best_resolution(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        conn.execute(PRICE_FORECAST_LOG_DDL)
+        # Interval I1 (10:00): two 5-min fetches + one 30-min fetch.
+        # Latest 5-min fetch (09:30, predicted=11.0) must win — 5 beats 30.
+        _insert_price_forecast(
+            conn,
+            fetched_at="2026-01-01 09:00:00+00:00",
+            resolution=5,
+            interval_start="2026-01-01 10:00:00+00:00",
+            predicted=10.0,
+        )
+        _insert_price_forecast(
+            conn,
+            fetched_at="2026-01-01 09:30:00+00:00",
+            resolution=5,
+            interval_start="2026-01-01 10:00:00+00:00",
+            predicted=11.0,
+        )
+        _insert_price_forecast(
+            conn,
+            fetched_at="2026-01-01 09:45:00+00:00",
+            resolution=30,
+            interval_start="2026-01-01 10:00:00+00:00",
+            predicted=99.0,
+        )
+        # Interval I2 (10:30): only a 30-min fetch — kept at res 30.
+        _insert_price_forecast(
+            conn,
+            fetched_at="2026-01-01 09:30:00+00:00",
+            resolution=30,
+            interval_start="2026-01-01 10:30:00+00:00",
+            predicted=20.0,
+        )
+        # Interval I3 (11:00): band data all NULL — excluded entirely.
+        _insert_price_forecast(
+            conn,
+            fetched_at="2026-01-01 09:30:00+00:00",
+            resolution=5,
+            interval_start="2026-01-01 11:00:00+00:00",
+            predicted=None,
+            low=None,
+        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/price_forecast", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            rows = body["rows"]
+            # I3 dropped (null bands); I1 + I2 collapse to one row each.
+            assert body["count"] == 2
+            # DuckDB renders TIMESTAMPTZ in the session-local zone; compare
+            # instants, not the offset-bearing string representation.
+            assert [datetime.fromisoformat(row["interval_start"]) for row in rows] == [
+                datetime.fromisoformat("2026-01-01T10:00:00+00:00"),
+                datetime.fromisoformat("2026-01-01T10:30:00+00:00"),
+            ]
+            assert rows[0]["resolution"] == 5
+            assert rows[0]["forecast_predicted"] == 11.0
+            assert rows[1]["resolution"] == 30
+            assert rows[1]["forecast_predicted"] == 20.0
+
+    async def test_since_filters_on_fetched_at(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        conn.execute(PRICE_FORECAST_LOG_DDL)
+        _insert_price_forecast(
+            conn,
+            fetched_at="2026-01-01 08:00:00+00:00",
+            resolution=5,
+            interval_start="2026-01-01 10:00:00+00:00",
+            predicted=10.0,
+        )
+        _insert_price_forecast(
+            conn,
+            fetched_at="2026-01-01 09:00:00+00:00",
+            resolution=5,
+            interval_start="2026-01-01 10:30:00+00:00",
+            predicted=12.0,
+        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get(
+                "/dashboard/price_forecast?since=2026-01-01T08:30:00%2B00:00",
+                headers=_auth(),
+            )
+            body = await r.json()
+            # Only the 09:00 fetch survives the since filter.
+            assert body["count"] == 1
+            assert datetime.fromisoformat(
+                body["rows"][0]["interval_start"]
+            ) == datetime.fromisoformat("2026-01-01T10:30:00+00:00")
+
+
+class TestDashboardPVForecast:
+    """`/dashboard/pv_forecast` returns the latest fetched_at per period_end."""
+
+    async def test_dedupes_to_latest_per_period(self, tmp_path: Path) -> None:
+        conn = duckdb.connect()
+        conn.execute(PV_FORECAST_LOG_DDL)
+        # period_end 10:00 fetched twice — latest (09:30, 6.0) wins.
+        conn.execute(
+            "INSERT INTO pv_forecast_log (fetched_at, period_end, pv_estimate_kw) VALUES (?, ?, ?)",
+            ["2026-01-01 09:00:00+00:00", "2026-01-01 10:00:00+00:00", 5.0],
+        )
+        conn.execute(
+            "INSERT INTO pv_forecast_log (fetched_at, period_end, pv_estimate_kw) VALUES (?, ?, ?)",
+            ["2026-01-01 09:30:00+00:00", "2026-01-01 10:00:00+00:00", 6.0],
+        )
+        conn.execute(
+            "INSERT INTO pv_forecast_log (fetched_at, period_end, pv_estimate_kw) VALUES (?, ?, ?)",
+            ["2026-01-01 09:00:00+00:00", "2026-01-01 10:30:00+00:00", 7.0],
+        )
+        probe = _Probe(heartbeat_path=_fresh_heartbeat(tmp_path), db_connection=conn)
+        async with await _client(probe) as c:
+            r = await c.get("/dashboard/pv_forecast", headers=_auth())
+            assert r.status == 200
+            body = await r.json()
+            assert body["count"] == 2
+            assert [datetime.fromisoformat(row["period_end"]) for row in body["rows"]] == [
+                datetime.fromisoformat("2026-01-01T10:00:00+00:00"),
+                datetime.fromisoformat("2026-01-01T10:30:00+00:00"),
+            ]
+            assert body["rows"][0]["pv_estimate_kw"] == 6.0
 
 
 class TestTableQuery:

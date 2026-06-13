@@ -374,20 +374,26 @@ async function fetchLoadTelemetry(sinceISO, untilISO) {
   );
 }
 async function fetchPriceForecastLog(sinceISO, untilISO) {
-  // ~600 rows/hr (Amber polled every 60s with ~50 rows/round + 5-min poll
-  // every 5 min). 24h ≈ 14.5k rows. Server cap is 10000/page; allow up to
-  // 4 pages so the full window is covered with margin. The earlier
-  // 1000×6 default truncated 24h to roughly the first 10h, so the
-  // `export_forecast_*` columns (only populated since 2026-04-28)
-  // disappeared from the bucketed result on any window that started
-  // before they existed.
-  return await fetchTablePaged(
-    "price_forecast_log", sinceISO, untilISO, "fetched_at",
-    { limit: 10000, maxPages: 4 },
-  );
+  // Server-side reduced view. The raw price_forecast_log holds ~14.5k
+  // rows/24h (Amber re-logs the whole horizon every 60s), which used to
+  // be paged down the wire (~MBs) and deduped client-side. /dashboard/
+  // price_forecast now does that reduction in SQL — latest forecast per
+  // interval, best resolution — and returns the ~hundreds of rows the
+  // chart actually renders.
+  const params = new URLSearchParams();
+  if (sinceISO) params.set("since", sinceISO);
+  if (untilISO) params.set("until", untilISO);
+  const data = await apiFetch(`/dashboard/price_forecast?${params.toString()}`);
+  return data.rows || [];
 }
 async function fetchPVForecastLog(sinceISO, untilISO) {
-  return await fetchTablePaged("pv_forecast_log", sinceISO, untilISO, "fetched_at");
+  // Server-side reduced view: latest forecast per period_end. See
+  // fetchPriceForecastLog for the rationale.
+  const params = new URLSearchParams();
+  if (sinceISO) params.set("since", sinceISO);
+  if (untilISO) params.set("until", untilISO);
+  const data = await apiFetch(`/dashboard/pv_forecast?${params.toString()}`);
+  return data.rows || [];
 }
 async function fetchAmberUsage(sinceISO, untilISO) {
   // 576 rows/day × 2 days ≈ 1200 rows — single page covers the time-series
@@ -2229,12 +2235,15 @@ async function loadHistory() {
     if (tel.status === "fulfilled") state.history.rows = tel.value;
     else console.warn("telemetry fetch failed", tel.reason);
 
+    // Both forecast feeds arrive already reduced by the server (latest
+    // forecast per interval), so they're assigned straight through — the
+    // old bucketLatest* client-side dedup moved into SQL.
     if (priceLog.status === "fulfilled") {
-      state.history.priceForecast = bucketLatestPriceForecast(priceLog.value);
+      state.history.priceForecast = priceLog.value;
     } else console.warn("price_forecast_log fetch failed", priceLog.reason);
 
     if (pvLog.status === "fulfilled") {
-      state.history.pvForecast = bucketLatestPVForecast(pvLog.value);
+      state.history.pvForecast = pvLog.value;
     } else console.warn("pv_forecast_log fetch failed", pvLog.reason);
 
     if (amberUsage.status === "fulfilled") {
@@ -2268,46 +2277,12 @@ async function refreshLiveHistory({ force = false } = {}) {
   await redrawDailySpend();
 }
 
-// For each (interval_start, resolution), keep the latest fetched_at row
-// that still has band data populated. Bands are only populated on
-// ForecastInterval rows (not ActualInterval / CurrentInterval), so we
-// pick the most recent forecast made *while the interval was still in
-// the future* — that's what the LP planned against. 5-min beats 30-min
-// when both exist (5-min covers ~current+30min on Amber's 5-min API).
-function bucketLatestPriceForecast(rows) {
-  const buckets = new Map();   // key: "interval_start|resolution" → row
-  for (const r of rows) {
-    if (r.forecast_predicted == null && r.forecast_low == null) continue;
-    const key = `${r.interval_start}|${r.resolution}`;
-    const prev = buckets.get(key);
-    if (!prev || new Date(r.fetched_at) > new Date(prev.fetched_at)) {
-      buckets.set(key, r);
-    }
-  }
-  // Now pick the best resolution per interval_start: 5-min beats 30-min.
-  const byStart = new Map();
-  for (const r of buckets.values()) {
-    const prev = byStart.get(r.interval_start);
-    if (!prev || r.resolution < prev.resolution) byStart.set(r.interval_start, r);
-  }
-  return [...byStart.values()].sort((a, b) =>
-    new Date(a.interval_start) - new Date(b.interval_start)
-  );
-}
-
-function bucketLatestPVForecast(rows) {
-  const buckets = new Map();
-  for (const r of rows) {
-    const key = r.period_end;
-    const prev = buckets.get(key);
-    if (!prev || new Date(r.fetched_at) > new Date(prev.fetched_at)) {
-      buckets.set(key, r);
-    }
-  }
-  return [...buckets.values()].sort((a, b) =>
-    new Date(a.period_end) - new Date(b.period_end)
-  );
-}
+// NOTE: the per-interval forecast reduction (latest fetched_at per
+// interval, ForecastInterval-only, 5-min beats 30-min) that used to live
+// here as bucketLatestPriceForecast / bucketLatestPVForecast now runs
+// server-side in the /dashboard/price_forecast and /dashboard/pv_forecast
+// SQL — see api/handlers/dashboard.py. Kept this note so the "where did
+// the bucketing go?" question has an answer at the call site.
 
 async function loadConfig() {
   try {
