@@ -8,6 +8,7 @@ touched, and drive file mtimes directly.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -49,6 +50,7 @@ class TestHeartbeatAge:
         # Rewrite mtime to 120s ago
         old_mtime = time.time() - 120
         import os
+
         os.utime(p, (old_mtime, old_mtime))
         age = _heartbeat_age_s(p)
         assert age is not None
@@ -74,12 +76,13 @@ class TestTriggerFallback:
 
     async def test_happy_path_writes_four_registers_in_order(self) -> None:
         """Happy path fires four writes: u32 40032 (charge cap uncap) →
-        u16 40031 (mode) → u16 40038 (export=0) → u16 40029 (enable=1).
+        u16 40031 (mode) → u32 40038 (export=0) → u16 40029 (enable=1).
 
         Charge-cap write sits first because the uncapping protects mode 2
         from throttling surplus PV when it takes effect. Enable=1 sits
         last so the preceding mode + export are already in place when
-        remote EMS takes control.
+        remote EMS takes control. 40032 and 40038 are both U32 (FC16);
+        40031 and 40029 are U16 (FC6).
         """
         client = MagicMock()
         client.write_register = AsyncMock(return_value=_ok_result())
@@ -88,9 +91,9 @@ class TestTriggerFallback:
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is True
 
-        # U32 write (40032): one call, targeting the charge-cap address
+        # U32 (FC16) writes, in order: charge cap (40032) then export=0 (40038).
         u32_calls = client.write_registers.await_args_list
-        assert len(u32_calls) == 1
+        assert len(u32_calls) == 2
         assert u32_calls[0].kwargs["address"] == REG_ESS_MAX_CHARGING_LIMIT
         # Raw value 13000 splits high/low word into [0, 13000] for the
         # pymodbus write_registers call.
@@ -98,53 +101,82 @@ class TestTriggerFallback:
             (_MAX_CHARGE_RAW >> 16) & 0xFFFF,
             _MAX_CHARGE_RAW & 0xFFFF,
         ]
-        assert u32_calls[0].kwargs["device_id"] == 247
+        assert u32_calls[1].kwargs["address"] == REG_GRID_EXPORT_POWER_LIMIT
+        assert u32_calls[1].kwargs["values"] == [0, 0]
+        for c in u32_calls:
+            assert c.kwargs["device_id"] == 247
 
-        # U16 writes: three in order (mode, export, enable=1)
+        # U16 (FC6) writes: mode then enable=1.
         u16_calls = client.write_register.await_args_list
-        assert len(u16_calls) == 3
+        assert len(u16_calls) == 2
         assert u16_calls[0].kwargs["address"] == REG_REMOTE_EMS_CONTROL_MODE
         assert u16_calls[0].kwargs["value"] == MODE_MAXIMUM_SELF_CONSUMPTION
-        assert u16_calls[1].kwargs["address"] == REG_GRID_EXPORT_POWER_LIMIT
-        assert u16_calls[1].kwargs["value"] == 0
-        assert u16_calls[2].kwargs["address"] == REG_REMOTE_EMS_ENABLE
-        assert u16_calls[2].kwargs["value"] == 1
+        assert u16_calls[1].kwargs["address"] == REG_REMOTE_EMS_ENABLE
+        assert u16_calls[1].kwargs["value"] == 1
         for c in u16_calls:
             assert c.kwargs["device_id"] == 247
+
+    async def test_export_limit_written_as_u32_via_fc16(self) -> None:
+        """Register 40038 (grid export limit) is U32 — spec §7 row
+        `40038–39 … U32`. It must be written with write_registers (FC16,
+        two registers), NOT write_register (FC6): a single-register write
+        returns ILLEGAL DATA ADDRESS on the real inverter (observed 19/19
+        watchdog firings 2026-06-06/10). Mirrors the main service's
+        set_export_limit_kw() which uses the U32 path."""
+        client = MagicMock()
+        client.write_register = AsyncMock(return_value=_ok_result())
+        client.write_registers = AsyncMock(return_value=_ok_result())
+
+        ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
+        assert ok is True
+
+        # Export limit = 0 must be a two-register FC16 write to 40038.
+        export_calls = [
+            c
+            for c in client.write_registers.await_args_list
+            if c.kwargs["address"] == REG_GRID_EXPORT_POWER_LIMIT
+        ]
+        assert len(export_calls) == 1
+        assert export_calls[0].kwargs["values"] == [0, 0]
+        assert export_calls[0].kwargs["device_id"] == 247
+        # …and must NOT be attempted as a single-register FC6 write.
+        u16_addrs = [c.kwargs["address"] for c in client.write_register.await_args_list]
+        assert REG_GRID_EXPORT_POWER_LIMIT not in u16_addrs
 
     async def test_charge_cap_fails_falls_through_to_last_resort(
         self,
     ) -> None:
         """Even the charge-cap write failing is tolerated — the remaining
-        three u16 writes still attempt, and the last-resort disables
-        remote EMS if any explicit step fails."""
+        writes still attempt, and the last-resort disables remote EMS if
+        any explicit step fails."""
         client = MagicMock()
         client.write_register = AsyncMock(return_value=_ok_result())
-        client.write_registers = AsyncMock(return_value=_err_result())
+        # Two U32 (FC16) writes: charge cap fails, export succeeds.
+        client.write_registers = AsyncMock(side_effect=[_err_result(), _ok_result()])
 
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is True  # last-resort succeeded
-        # u32 tried once; u16 ran through mode/export/enable + last-resort
-        assert client.write_registers.await_count == 1
-        assert client.write_register.await_count == 4
+        # u32: cap + export (2). u16: mode + enable=1 + last-resort (3).
+        assert client.write_registers.await_count == 2
+        assert client.write_register.await_count == 3
 
     async def test_mode_write_fails_falls_through_to_last_resort(self) -> None:
         client = MagicMock()
+        # U16 (FC6) writes: mode, enable=1, then last-resort enable=0.
         client.write_register = AsyncMock(
             side_effect=[
-                _err_result(),  # mode
-                _ok_result(),  # export
+                _err_result(),  # mode fails
                 _ok_result(),  # enable=1
                 _ok_result(),  # last-resort enable=0
             ]
         )
-        client.write_registers = AsyncMock(return_value=_ok_result())
+        client.write_registers = AsyncMock(return_value=_ok_result())  # cap + export ok
 
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is True  # last-resort succeeded
 
         calls = client.write_register.await_args_list
-        assert len(calls) == 4
+        assert len(calls) == 3
         # Last write is the last-resort enable=0.
         assert calls[-1].kwargs["address"] == REG_REMOTE_EMS_ENABLE
         assert calls[-1].kwargs["value"] == 0
@@ -153,56 +185,53 @@ class TestTriggerFallback:
         self,
     ) -> None:
         client = MagicMock()
-        client.write_register = AsyncMock(
+        client.write_register = AsyncMock(return_value=_ok_result())
+        # Export (40038) is a U32/FC16 write — fail it via write_registers.
+        client.write_registers = AsyncMock(
             side_effect=[
-                _ok_result(),  # mode
+                _ok_result(),  # charge cap
                 _err_result(),  # export fails
-                _ok_result(),  # enable=1
-                _ok_result(),  # last-resort enable=0
             ]
         )
-        client.write_registers = AsyncMock(return_value=_ok_result())
 
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is True
-        assert client.write_register.await_count == 4
+        assert client.write_registers.await_count == 2
+        # u16: mode + enable=1 + last-resort = 3
+        assert client.write_register.await_count == 3
 
     async def test_enable_write_fails_falls_through_to_last_resort(
         self,
     ) -> None:
         client = MagicMock()
+        # U16 (FC6): mode, enable=1 (fails), last-resort enable=0.
         client.write_register = AsyncMock(
             side_effect=[
                 _ok_result(),  # mode
-                _ok_result(),  # export
                 _err_result(),  # enable=1 fails
                 _ok_result(),  # last-resort enable=0
             ]
         )
-        client.write_registers = AsyncMock(return_value=_ok_result())
+        client.write_registers = AsyncMock(return_value=_ok_result())  # cap + export ok
 
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is True
-        assert client.write_register.await_count == 4
+        assert client.write_register.await_count == 3
 
     async def test_modbus_raises_triggers_last_resort(self) -> None:
-        """Every Modbus call raises. Five logical writes (u32 cap, u16 mode,
-        u16 export, u16 enable=1, u16 last-resort), each retried once —
-        2 physical attempts per logical write. u32 is 1 logical × 2
-        physical = 2; u16 is 4 logical × 2 = 8."""
+        """Every Modbus call raises. Five logical writes, each retried once
+        (2 physical attempts per logical write). U32/FC16: cap + export =
+        2 logical × 2 = 4. U16/FC6: mode + enable=1 + last-resort = 3
+        logical × 2 = 6."""
         client = MagicMock()
-        client.write_register = AsyncMock(
-            side_effect=[ConnectionError("no route")] * 8
-        )
-        client.write_registers = AsyncMock(
-            side_effect=[ConnectionError("no route")] * 2
-        )
+        client.write_register = AsyncMock(side_effect=[ConnectionError("no route")] * 6)
+        client.write_registers = AsyncMock(side_effect=[ConnectionError("no route")] * 4)
         client.connect = AsyncMock(return_value=False)
 
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is False
-        assert client.write_registers.await_count == 2
-        assert client.write_register.await_count == 8
+        assert client.write_registers.await_count == 4
+        assert client.write_register.await_count == 6
 
     async def test_all_writes_fail_returns_false(self) -> None:
         client = MagicMock()
@@ -211,9 +240,9 @@ class TestTriggerFallback:
 
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is False
-        # u32 cap (1) + three explicit u16 + one last-resort = 5 total
-        assert client.write_registers.await_count == 1
-        assert client.write_register.await_count == 4
+        # u32: cap + export (2). u16: mode + enable=1 + last-resort (3).
+        assert client.write_registers.await_count == 2
+        assert client.write_register.await_count == 3
 
     async def test_last_resort_raises_returns_false(self) -> None:
         """Explicit path fails, then last-resort also raises — must not
@@ -221,21 +250,24 @@ class TestTriggerFallback:
         the last-resort raises so its retry-once path runs.
         """
         client = MagicMock()
+        # U16 (FC6): mode, enable=1, then last-resort (raises, retried once).
+        # Export is now a U32 write, so it's not in this side-effect list.
         client.write_register = AsyncMock(
             side_effect=[
-                _err_result(),           # mode
-                _err_result(),           # export
-                _err_result(),           # enable=1
-                ConnectionError("refused"),   # last-resort, attempt 1
-                ConnectionError("refused"),   # last-resort, attempt 2 (retry)
+                _err_result(),  # mode
+                _err_result(),  # enable=1
+                ConnectionError("refused"),  # last-resort, attempt 1
+                ConnectionError("refused"),  # last-resort, attempt 2 (retry)
             ]
         )
+        # U32 (FC16): charge cap + export both fail (isError, no retry).
         client.write_registers = AsyncMock(return_value=_err_result())
         client.connect = AsyncMock(return_value=False)
 
         ok = await _trigger_fallback(client, slave_id=247, max_charge_raw=_MAX_CHARGE_RAW)
         assert ok is False
-        assert client.write_register.await_count == 5
+        # mode (1) + enable=1 (1) + last-resort (2 attempts) = 4
+        assert client.write_register.await_count == 4
 
 
 class TestWriteRetry:
@@ -252,9 +284,7 @@ class TestWriteRetry:
         )
         client.connect = AsyncMock(return_value=True)
 
-        ok = await _write_register(
-            client, slave_id=247, address=40031, value=2, label="mode"
-        )
+        ok = await _write_register(client, slave_id=247, address=40031, value=2, label="mode")
         assert ok is True
         assert client.write_register.await_count == 2
         # Reconnect was called exactly once, between the two attempts.
@@ -267,9 +297,7 @@ class TestWriteRetry:
         )
         client.connect = AsyncMock(return_value=False)
 
-        ok = await _write_register(
-            client, slave_id=247, address=40031, value=2, label="mode"
-        )
+        ok = await _write_register(client, slave_id=247, address=40031, value=2, label="mode")
         assert ok is False
         assert client.write_register.await_count == 2
 
@@ -281,9 +309,7 @@ class TestWriteRetry:
         client.write_register = AsyncMock(return_value=_err_result())
         client.connect = AsyncMock(return_value=True)
 
-        ok = await _write_register(
-            client, slave_id=247, address=40031, value=2, label="mode"
-        )
+        ok = await _write_register(client, slave_id=247, address=40031, value=2, label="mode")
         assert ok is False
         assert client.write_register.await_count == 1
         assert client.connect.await_count == 0
@@ -336,10 +362,8 @@ class TestRunLoop:
             # Let the loop run for a few iterations.
             await asyncio.sleep(poll_seconds * iterations + 0.05)
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
         return mock_client
 
     async def test_fresh_heartbeat_does_not_fire(self, tmp_path: Path) -> None:
@@ -359,9 +383,7 @@ class TestRunLoop:
         # fired during the run.
         assert client.connect.await_count >= 1
 
-    async def test_run_survives_pre_connect_failure(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_run_survives_pre_connect_failure(self, tmp_path: Path) -> None:
         """If the inverter is unreachable at startup, the watchdog must
         keep running — the main service may still come up and freshen
         the heartbeat before a fallback is needed."""
@@ -374,9 +396,7 @@ class TestRunLoop:
         mock_client.write_register = AsyncMock(return_value=mock_result)
         mock_client.write_registers = AsyncMock(return_value=mock_result)
         # Pre-connect raises — simulates inverter offline at startup.
-        mock_client.connect = AsyncMock(
-            side_effect=ConnectionError("unreachable")
-        )
+        mock_client.connect = AsyncMock(side_effect=ConnectionError("unreachable"))
 
         from unittest.mock import patch
 
@@ -398,29 +418,22 @@ class TestRunLoop:
             )
             # Let a few poll iterations pass; task should still be alive.
             await asyncio.sleep(0.1)
-            assert not task.done(), (
-                "watchdog must not exit if pre-connect fails"
-            )
+            assert not task.done(), "watchdog must not exit if pre-connect fails"
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
-    async def test_stale_heartbeat_re_asserts_every_poll(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_stale_heartbeat_re_asserts_every_poll(self, tmp_path: Path) -> None:
         """Re-assertion model: each stale poll fires the full three-write
         fallback. Idempotent and defends against transient Modbus drops."""
         hb = tmp_path / "hb"
         hb.touch()
         old = time.time() - 600
         import os
+
         os.utime(hb, (old, old))
 
-        client = await self._run_briefly(
-            hb, stale_seconds=1.0, poll_seconds=0.02, iterations=4
-        )
+        client = await self._run_briefly(hb, stale_seconds=1.0, poll_seconds=0.02, iterations=4)
         # Each stale poll issues 3 writes on the happy path. After ~4
         # polls we expect at least 2 full fires (6 writes). Allow slack
         # for scheduler jitter.
@@ -430,7 +443,8 @@ class TestRunLoop:
         # Every third write should target REG_REMOTE_EMS_ENABLE with value 1
         # (the third write of each fallback fire is the enable=1 assertion).
         enable_writes = [
-            c for c in client.write_register.await_args_list
+            c
+            for c in client.write_register.await_args_list
             if c.kwargs["address"] == REG_REMOTE_EMS_ENABLE
         ]
         assert len(enable_writes) >= 2
@@ -497,14 +511,10 @@ class TestRunLoop:
             )
 
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
-    async def test_missing_file_within_grace_does_not_fire(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_missing_file_within_grace_does_not_fire(self, tmp_path: Path) -> None:
         hb = tmp_path / "nope"  # does not exist
         client = await self._run_briefly(
             hb,
@@ -551,9 +561,7 @@ class TestServiceTouchesHeartbeat:
         second_mtime = hb.stat().st_mtime
         assert second_mtime >= first_mtime
 
-    def test_touch_swallows_permission_errors(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_touch_swallows_permission_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from optimiser.service import Service
 
         # A path the test runner definitely can't write to. Service.touch

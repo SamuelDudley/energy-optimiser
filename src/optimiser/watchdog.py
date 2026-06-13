@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -69,7 +70,7 @@ from .hardware import PV_ARRAY_KW
 REG_REMOTE_EMS_ENABLE = 40029  # U16: 0 = disabled (local EMS), 1 = enabled
 REG_REMOTE_EMS_CONTROL_MODE = 40031  # U16: RemoteEMSControlMode
 REG_ESS_MAX_CHARGING_LIMIT = 40032  # U32: W (gain=1000 → raw kW × 1000)
-REG_GRID_EXPORT_POWER_LIMIT = 40038  # U16: kW * 1000 (0 = no export)
+REG_GRID_EXPORT_POWER_LIMIT = 40038  # U32 (40038–39): kW * 1000 (0 = no export)
 
 MODE_MAXIMUM_SELF_CONSUMPTION = 2  # RemoteEMSControlMode enum value
 
@@ -105,13 +106,16 @@ async def _write_register(
     """
     for attempt in range(1, WRITE_MAX_ATTEMPTS + 1):
         try:
-            result = await client.write_register(
-                address=address, value=value, device_id=slave_id
-            )
+            result = await client.write_register(address=address, value=value, device_id=slave_id)
         except Exception as exc:
             logger.warning(
                 "write %s (%d=%d) attempt %d/%d raised: %s",
-                label, address, value, attempt, WRITE_MAX_ATTEMPTS, exc,
+                label,
+                address,
+                value,
+                attempt,
+                WRITE_MAX_ATTEMPTS,
+                exc,
             )
             if attempt < WRITE_MAX_ATTEMPTS:
                 # Reconnect + back off before the retry.
@@ -119,30 +123,43 @@ async def _write_register(
                     connect_ok = await client.connect()
                     if not connect_ok:
                         logger.warning(
-                            "reconnect before retry of %s returned False", label,
+                            "reconnect before retry of %s returned False",
+                            label,
                         )
                 except Exception as reconnect_exc:
                     logger.warning(
                         "reconnect before retry of %s raised: %s",
-                        label, reconnect_exc,
+                        label,
+                        reconnect_exc,
                     )
                 await asyncio.sleep(WRITE_RETRY_BACKOFF_S)
                 continue
             logger.error(
                 "write %s (%d=%d) failed after %d attempts: last exc=%s",
-                label, address, value, WRITE_MAX_ATTEMPTS, exc,
+                label,
+                address,
+                value,
+                WRITE_MAX_ATTEMPTS,
+                exc,
             )
             return False
         if result.isError():
             logger.error(
                 "write %s (%d=%d) returned error: %s",
-                label, address, value, result,
+                label,
+                address,
+                value,
+                result,
             )
             return False
         if attempt > 1:
             logger.info(
                 "write %s (%d=%d) succeeded on attempt %d/%d",
-                label, address, value, attempt, WRITE_MAX_ATTEMPTS,
+                label,
+                address,
+                value,
+                attempt,
+                WRITE_MAX_ATTEMPTS,
             )
         return True
     return False  # unreachable (loop always returns); silences type checkers
@@ -171,24 +188,34 @@ async def _write_u32_register(
         except Exception as exc:
             logger.warning(
                 "write %s (%d=%d u32) attempt %d/%d raised: %s",
-                label, address, value, attempt, WRITE_MAX_ATTEMPTS, exc,
+                label,
+                address,
+                value,
+                attempt,
+                WRITE_MAX_ATTEMPTS,
+                exc,
             )
             if attempt < WRITE_MAX_ATTEMPTS:
-                try:
+                with contextlib.suppress(Exception):
                     await client.connect()
-                except Exception:
-                    pass
                 await asyncio.sleep(WRITE_RETRY_BACKOFF_S)
                 continue
             logger.error(
                 "write %s (%d=%d u32) failed after %d attempts: last exc=%s",
-                label, address, value, WRITE_MAX_ATTEMPTS, exc,
+                label,
+                address,
+                value,
+                WRITE_MAX_ATTEMPTS,
+                exc,
             )
             return False
         if result.isError():
             logger.error(
                 "write %s (%d=%d u32) returned error: %s",
-                label, address, value, result,
+                label,
+                address,
+                value,
+                result,
             )
             return False
         return True
@@ -232,7 +259,10 @@ async def _trigger_fallback(
         MODE_MAXIMUM_SELF_CONSUMPTION,
         "mode=MAXIMUM_SELF_CONSUMPTION",
     )
-    ok_export = await _write_register(
+    # 40038 is U32 (spec §7) — a two-register FC16 write, same as the main
+    # service's set_export_limit_kw(). A single-register FC6 write returns
+    # ILLEGAL DATA ADDRESS (observed 19/19 watchdog firings 2026-06-06/10).
+    ok_export = await _write_u32_register(
         client,
         slave_id,
         REG_GRID_EXPORT_POWER_LIMIT,
@@ -281,9 +311,7 @@ async def _trigger_fallback(
         )
         return True
 
-    logger.error(
-        "FALLBACK FAILED — unable to write any register on slave %d", slave_id
-    )
+    logger.error("FALLBACK FAILED — unable to write any register on slave %d", slave_id)
     return False
 
 
@@ -336,9 +364,7 @@ async def run(
     try:
         connect_ok = await client.connect()
         if connect_ok:
-            logger.info(
-                "Modbus pre-connect OK: %s:%d", sigenergy_host, sigenergy_port
-            )
+            logger.info("Modbus pre-connect OK: %s:%d", sigenergy_host, sigenergy_port)
         else:
             logger.warning(
                 "Modbus pre-connect returned False — will retry per-write "
@@ -346,7 +372,8 @@ async def run(
             )
     except Exception as exc:
         logger.warning(
-            "Modbus pre-connect raised: %s — will retry per-write", exc,
+            "Modbus pre-connect raised: %s — will retry per-write",
+            exc,
         )
 
     startup_time = time.time()
@@ -360,9 +387,7 @@ async def run(
         if age is None:
             elapsed = time.time() - startup_time
             if elapsed < grace_seconds:
-                logger.debug(
-                    "heartbeat not yet present (%.0fs into grace)", elapsed
-                )
+                logger.debug("heartbeat not yet present (%.0fs into grace)", elapsed)
                 stale = False
             else:
                 if not was_stale:
@@ -371,9 +396,7 @@ async def run(
                         elapsed,
                     )
                 else:
-                    logger.debug(
-                        "heartbeat still missing (%.0fs) — re-asserting", elapsed
-                    )
+                    logger.debug("heartbeat still missing (%.0fs) — re-asserting", elapsed)
                 stale = True
         elif age > stale_seconds:
             if not was_stale:
@@ -387,9 +410,7 @@ async def run(
             stale = True
         else:
             if was_stale:
-                logger.info(
-                    "heartbeat recovered (%.1fs old) — re-arming", age
-                )
+                logger.info("heartbeat recovered (%.1fs old) — re-arming", age)
             stale = False
 
         if stale:
@@ -439,9 +460,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--heartbeat",
-        default=os.environ.get(
-            "EO_WATCHDOG_HEARTBEAT", "/var/lib/energy-optimiser/heartbeat"
-        ),
+        default=os.environ.get("EO_WATCHDOG_HEARTBEAT", "/var/lib/energy-optimiser/heartbeat"),
         help="Path to the heartbeat file the main service touches each tick.",
     )
     parser.add_argument(
@@ -494,9 +513,7 @@ def main() -> None:
     parser.add_argument(
         "--max-charge-raw",
         type=int,
-        default=_getenv_int(
-            "EO_WATCHDOG_MAX_CHARGE_RAW", int(round(PV_ARRAY_KW * 1000))
-        ),
+        default=_getenv_int("EO_WATCHDOG_MAX_CHARGE_RAW", int(round(PV_ARRAY_KW * 1000))),
         help=(
             "Value to write to reg 40032 (ESS_MAX_CHARGING_LIMIT) on "
             "fallback. Raw = kW × 1000. Default reads hardware.PV_ARRAY_KW "
