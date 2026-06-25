@@ -50,6 +50,25 @@ _STATIC_FILES: dict[str, str] = {
     "chart-utils.js": "application/javascript",
     "dashboard.js": "application/javascript",
     "ops.js": "application/javascript",
+    # vendored uPlot
+    "uplot.esm.js": "application/javascript",
+    "uplot.min.css": "text/css",
+    # new ESM modules (created in later tasks; 404 until they exist)
+    "time-utils.js": "application/javascript",
+    "classify.js": "application/javascript",
+    "price-merge.js": "application/javascript",
+    "derive.js": "application/javascript",
+    "timeline.js": "application/javascript",
+    "bands.js": "application/javascript",
+    "chart-core.js": "application/javascript",
+    "shapes.js": "application/javascript",
+    "ribbon.js": "application/javascript",
+    "panels.js": "application/javascript",
+    "cursor.js": "application/javascript",
+    "spend-chart.js": "application/javascript",
+    "ops-charts.js": "application/javascript",
+    "spike-detect.js": "application/javascript",
+    "spike-labels.js": "application/javascript",
 }
 
 

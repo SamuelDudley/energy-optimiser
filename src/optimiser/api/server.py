@@ -58,6 +58,23 @@ _PUBLIC_PATHS = (
     "/dashboard/static/chart-utils.js",
     "/dashboard/static/dashboard.js",
     "/dashboard/static/ops.js",
+    "/dashboard/static/uplot.esm.js",
+    "/dashboard/static/uplot.min.css",
+    "/dashboard/static/time-utils.js",
+    "/dashboard/static/classify.js",
+    "/dashboard/static/price-merge.js",
+    "/dashboard/static/derive.js",
+    "/dashboard/static/timeline.js",
+    "/dashboard/static/bands.js",
+    "/dashboard/static/chart-core.js",
+    "/dashboard/static/shapes.js",
+    "/dashboard/static/ribbon.js",
+    "/dashboard/static/panels.js",
+    "/dashboard/static/cursor.js",
+    "/dashboard/static/spend-chart.js",
+    "/dashboard/static/ops-charts.js",
+    "/dashboard/static/spike-detect.js",
+    "/dashboard/static/spike-labels.js",
 )
 
 
