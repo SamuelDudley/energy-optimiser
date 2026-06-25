@@ -35,6 +35,7 @@ import uPlot from "./uplot.esm.js";
 import { cursorDragOpts, makeSyncHub, registry } from "./chart-core.js";
 import { shapesPlugin } from "./shapes.js";
 import { ribbonPlugin } from "./ribbon.js";
+import { spikeLabelsPlugin } from "./spike-labels.js";
 import {
   DECISION_COLORS, DECISION_LABELS, MODE_COLORS, MODE_LABELS,
 } from "./classify.js";
@@ -131,7 +132,14 @@ function pricePanel(model, getState) {
     series, dataFn,
     scaleY: { distr: 4, asinh: 30 },
     yAxisCfg, bands,
-    plugins: [shapesPlugin({ getState, kind: "price" })],
+    plugins: [
+      shapesPlugin({ getState, kind: "price" }),
+      // Refinement 1g: spike peak/trough markers with $ value labels.
+      // seriesIdxImport=5 and seriesIdxExport=7 match the data[] positions
+      // after the x prepend:  0=x, 1=importLo, 2=importHi, 3=exportLo,
+      // 4=exportHi, 5=importRealised, 6=importPredicted, 7=exportRealised.
+      spikeLabelsPlugin({ seriesIdxImport: 5, seriesIdxExport: 7 }),
+    ],
   };
 }
 
