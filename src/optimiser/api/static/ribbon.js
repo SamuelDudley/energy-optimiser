@@ -33,24 +33,29 @@ export function ribbonPlugin({ unionX, getCats, colorOf, labelOf, glyphOf, toolt
         if (!cats || cats.length === 0) return;
 
         const ctx = u.ctx;
-        const { left, top, width, height } = u.bbox;
+        const { top, height } = u.bbox;
 
-        for (let i = 0; i < cats.length; ) {
-          const j = runEnd(cats, i);
-          const x0 = Math.round(u.valToPos(unionX[i], "x", true));
-          const x1 = Math.round(u.valToPos(unionX[Math.min(j, unionX.length - 1)], "x", true));
+        ctx.save();
+        try {
+          for (let i = 0; i < cats.length; ) {
+            const j = runEnd(cats, i);
+            const x0 = Math.round(u.valToPos(unionX[i], "x", true));
+            const x1 = Math.round(u.valToPos(unionX[Math.min(j, unionX.length - 1)], "x", true));
 
-          ctx.fillStyle = colorOf(cats[i]);
-          ctx.fillRect(x0, top, Math.max(1, x1 - x0), height);
+            ctx.fillStyle = colorOf(cats[i]);
+            ctx.fillRect(x0, top, Math.max(1, x1 - x0), height);
 
-          if (x1 - x0 > 18 * devicePixelRatio && glyphOf) {
-            ctx.fillStyle = "#0d1117";
-            ctx.font = `${10 * devicePixelRatio}px sans-serif`;
-            ctx.textBaseline = "middle";
-            ctx.fillText(glyphOf(cats[i]), x0 + 3 * devicePixelRatio, top + height / 2);
+            if (x1 - x0 > 18 * devicePixelRatio && glyphOf) {
+              ctx.fillStyle = "#0d1117";
+              ctx.font = `${10 * devicePixelRatio}px sans-serif`;
+              ctx.textBaseline = "middle";
+              ctx.fillText(glyphOf(cats[i]), x0 + 3 * devicePixelRatio, top + height / 2);
+            }
+
+            i = j;
           }
-
-          i = j;
+        } finally {
+          ctx.restore();
         }
       }],
 
