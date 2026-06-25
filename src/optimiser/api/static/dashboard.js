@@ -38,6 +38,7 @@ import {
 import { buildUnionX, alignSeries } from "./timeline.js";
 import { bandColumns } from "./bands.js";
 import { buildTsFigure } from "./panels.js";
+import { wireCursor } from "./cursor.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -1111,6 +1112,10 @@ let tsFigure = null;
 // Snapshot of which conditional series were present at build time, so we can
 // detect a membership change and trigger a rebuild rather than crash uPlot.
 let tsMembership = null;
+// Latest model built by buildModel(), kept here so wireCursor's getModel
+// closure can read decisionCats/modeCats at any cursor position without
+// recomputing the full model on every hover event.
+let currentModel = null;
 
 function membershipKey(model) {
   return [
@@ -1164,6 +1169,9 @@ function redrawTSFigure() {
   const model = buildModel();
   if (!model) return;
 
+  // Keep the latest model accessible to wireCursor's getModel closure.
+  currentModel = model;
+
   const key = membershipKey(model);
   if (tsFigure && tsMembership !== key) {
     // Conditional-series membership changed — rebuild from scratch.
@@ -1177,6 +1185,10 @@ function redrawTSFigure() {
     tsMembership = key;
     tsXRangeKey = null;
     state.built.ts = true;
+    // Wire the cursor hooks on every (re)build. wireCursor is idempotent per
+    // instance — reinstalling on rebuild is fine because destroy() wipes the
+    // old instances.
+    wireCursor(tsFigure.instances, () => currentModel, { setCursor, nearestSlotAt });
     applyTsXRange(true);
   } else {
     tsFigure.update(model);
@@ -1195,21 +1207,6 @@ function redrawCursorLine() {
     cursorSec: cursorT ? toEpochSec(cursorT) : null,
     nowSec: nowT && !isHistorical() ? toEpochSec(nowT) : null,
   });
-}
-
-function onPlotlyHover(ev) {
-  const p = ev.points && ev.points[0];
-  if (!p) return;
-  const x = p.x;
-  if (!x) return;
-  const t = nearestSlotAt(new Date(x));
-  setCursor(t, { pinned: true });
-}
-
-function onPlotlyClick(ev) {
-  // Click pins (same as hover but clearer intent). Double-click via the
-  // mode-bar autoscale is handled by Plotly; we don't override it.
-  onPlotlyHover(ev);
 }
 
 // ── Sankey ─────────────────────────────────────────────────────────

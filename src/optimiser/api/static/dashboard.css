@@ -107,6 +107,57 @@ header.strip {
 #cursor-now-btn:hover { border-color: var(--accent); }
 #cursor-now-btn[disabled] { opacity: 0.4; cursor: default; }
 
+/* ── Cursor chips (decision + mode) ──────────────────────────────── */
+.cursor-chips-block { flex: 0 0 auto; }
+.cursor-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 2px;
+}
+.decision-chip,
+.mode-chip {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+
+/* ── Multi-panel cursor readout column ───────────────────────────── */
+.cursor-readout-block {
+  flex: 0 0 auto;
+  /* Hide on narrow viewports where space is very tight */
+}
+table.cursor-readout {
+  border-collapse: collapse;
+  font-size: 11px;
+  margin-top: 2px;
+  line-height: 1.35;
+}
+table.cursor-readout td {
+  padding: 0 4px 0 0;
+  vertical-align: top;
+  white-space: nowrap;
+}
+table.cursor-readout .readout-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 10px;
+  padding-right: 6px;
+}
+table.cursor-readout .readout-value {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
 /* Range picker bar — sits below the status strip, above the charts. */
 .range-bar {
   display: flex;
@@ -364,6 +415,10 @@ main {
      status bar) plus a "LIVE" chip duplicated by the tab-bar mode
      indicator. JS adds `.pinned` when the user scrubs to a historical
      timestamp, at which point we surface it inline at the end of row 1. */
+  /* Hide the readout column and chip block on mobile — the strip is already
+     cramped; these only make sense when hovering a chart on a wider screen. */
+  .cursor-readout-block,
+  .cursor-chips-block { display: none; }
   .status-block.right { display: none; }
   .status-block.right.pinned {
     display: flex;
