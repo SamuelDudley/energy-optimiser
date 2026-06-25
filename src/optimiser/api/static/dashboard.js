@@ -24,7 +24,7 @@
 import { SLOT_MS, nearestSlotAt, toNemDate, toEpochSec } from "./time-utils.js";
 import {
   DECISION, MODE, MODE_COLORS,
-  DEADBAND_KW, MODE_SWITCH_HYSTERESIS_KW,
+  DEADBAND_KW,
   decisionFor, decisionFromTelemetry, modeFromSlot, modeFromTelemetry,
 } from "./classify.js";
 import {
@@ -203,10 +203,6 @@ function toPlotlyTime(d) {
   const offMs = date.getTimezoneOffset() * 60_000;
   return new Date(+date - offMs).toISOString().replace(/Z$/, "");
 }
-function toPlotlyTimeArr(arr) {
-  return arr.map(toPlotlyTime);
-}
-
 // NEM date (UTC+10, never DST) for a given instant. Used to align the
 // daily-spend cursor: spend bars are bucketed by nem_date in the API, so
 // the time-series cursor maps to a spend bar by adding 10h and taking

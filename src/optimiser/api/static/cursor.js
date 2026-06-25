@@ -122,7 +122,12 @@ export function wireCursor(instances, getModel, { setCursor, nearestSlotAt }) {
   let rowEls = null;  // array of { labelCell, valueCell } per panel
 
   function ensureRows() {
-    if (rowEls || !readoutEl) return;
+    if (!readoutEl) return;
+    // Clear any rows left over from a previous wireCursor() call (figure
+    // rebuilds re-invoke wireCursor but #cursor-readout is outside the figure
+    // and is never reset by the caller, so without this the table grows 8
+    // rows per rebuild).
+    readoutEl.replaceChildren();
     rowEls = [];
     for (const { spec } of panelMap) {
       const tr = document.createElement("tr");
