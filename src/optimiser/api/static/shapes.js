@@ -19,6 +19,21 @@ export function shapesPlugin({ getState, kind }) {
           ctx.beginPath(); ctx.setLineDash(dash || []); ctx.strokeStyle = color;
           ctx.lineWidth = 1; ctx.moveTo(left, y); ctx.lineTo(left + width, y); ctx.stroke();
         };
+        // Future-region tint: fill x ∈ [nowSec, right-edge] with a very
+        // faint overlay so the forecast/plan area reads as epistemically
+        // different from measured reality. Drawn first so it sits below
+        // buy/sell rects, hlines, and series. Gate: nowSec present (which
+        // is already null in historical mode — dashboard.js never sets it
+        // when isHistorical() is true, so no separate historical flag needed).
+        if (st.nowSec != null) {
+          const nx = Math.round(u.valToPos(st.nowSec, "x", true));
+          const x0 = Math.max(nx, left);
+          const x1 = left + width;
+          if (x1 > x0) {
+            ctx.fillStyle = "rgba(88,166,255,0.03)";
+            ctx.fillRect(x0, top, x1 - x0, height);
+          }
+        }
         if (kind === "price") {
           for (const r of st.regions || []) {
             const x0 = Math.round(u.valToPos(r.x0, "x", true));
