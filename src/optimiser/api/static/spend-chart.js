@@ -133,14 +133,19 @@ export function buildSpendChart(el) {
   // ── uPlot opts ────────────────────────────────────────────────
   function buildOpts(width, height) {
     const narrow = isNarrow();
+    // left gutter sized to match the ts-figure panels (FIXED_GUTTER 52 minus
+    // the ~4px container-offset diff) so the spend plot left-aligns with them;
+    // right padding matches the ts panels' 28 so right edges align too.
     const margin = narrow
-      ? { left: 40, right: 8,  top: 22, bottom: 32 }
-      : { left: 54, right: 16, top: 26, bottom: 44 };
+      ? { left: 30, right: 6,  top: 18, bottom: 30 }
+      : { left: 48, right: 28, top: 26, bottom: 44 };
 
     return {
       width,
       height,
-      padding: [margin.top, margin.right, 0, margin.left],
+      // padding-left is 0 — the y-axis `size` (margin.left) reserves the gutter.
+      // Setting BOTH double-counted it (96px) and pushed the plot far right.
+      padding: [margin.top, margin.right, 0, 0],
       scales: {
         x: {
           time: false,
@@ -163,23 +168,28 @@ export function buildSpendChart(el) {
           grid:  { stroke: GRID },
           ticks: { stroke: ZERO_CLR, size: 3 },
           font:  "11px sans-serif",
-          // splits = indices, values = date labels
+          // splits = indices, values = date labels. Cap the number of labels
+          // (~5 narrow / ~9 wide) so 60 days of bars don't crush the axis into
+          // an unreadable wall of overlapping dates.
           splits: (u) => {
             const n = state.labels.length;
-            // On narrow viewports show ~every other label to avoid overlap
-            const stride = narrow && n > 14 ? 2 : 1;
+            if (n === 0) return [];
+            const maxLabels = narrow ? 5 : 9;
+            const stride = Math.max(1, Math.ceil(n / maxLabels));
             const out = [];
             for (let i = 0; i < n; i += stride) out.push(i);
+            if (out[out.length - 1] !== n - 1) out.push(n - 1);
             return out;
           },
           values: (u, splits) =>
             splits.map((i) => {
               const lbl = state.labels[i];
               if (!lbl) return "";
-              // Shorten to MM-DD on narrow to save space
-              return narrow ? lbl.slice(5) : lbl;
+              // MM-DD always (the year is redundant across a 60-day window).
+              return lbl.slice(5);
             }),
           size: margin.bottom,
+          space: narrow ? 54 : 70,
         },
         {
           // y axis
@@ -187,11 +197,14 @@ export function buildSpendChart(el) {
           stroke: TICK_CLR,
           grid:  { stroke: GRID },
           ticks: { stroke: ZERO_CLR, size: 3 },
-          font:  "12px sans-serif",
-          label: "AUD / day",
-          labelFont: "11px sans-serif",
-          labelStroke: "#7d8590",
+          font:  "11px sans-serif",
+          // No axis label (it inflated the gutter ~84px and broke left-alignment
+          // with the ts panels). The "AUD/day" unit lives in the panel header.
           size: margin.left,
+          // Wider tick spacing → coarser, cleaner increments ($5 steps, not $2.50).
+          space: 46,
+          values: (u, splits) => splits.map((v) =>
+            v == null ? "" : "$" + (Number.isInteger(v) ? v : v.toFixed(1))),
           // add zero line by drawing it in the grid
           // (uPlot doesn't have a zeroline option, handled in draw hook instead)
         },

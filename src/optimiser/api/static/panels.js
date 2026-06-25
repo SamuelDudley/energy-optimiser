@@ -32,7 +32,7 @@
  * If membership genuinely needs to change, the caller rebuilds (destroy + new).
  */
 import uPlot from "./uplot.esm.js";
-import { cursorDragOpts, makeSyncHub, registry } from "./chart-core.js";
+import { cursorDragOpts, makeSyncHub, registry, isNarrow } from "./chart-core.js";
 import { shapesPlugin } from "./shapes.js";
 import { ribbonPlugin } from "./ribbon.js";
 import { spikeLabelsPlugin } from "./spike-labels.js";
@@ -47,10 +47,14 @@ const FONT_FAMILY =
   "sans-serif";
 const AXIS_FONT = "12px " + FONT_FAMILY;
 
-// Fixed left-gutter (px) — identical on every panel so the synced crosshair
-// lands at the same screen-x across the stack (spec §3.1, §6 item 1). Sized to
-// the widest arcsinh price tick ("1500") plus the date tick.
-const FIXED_GUTTER = 52;
+// Left-gutter (px) — identical on every panel so the synced crosshair lands at
+// the same screen-x across the stack (spec §3.1, §6 item 1). Narrower on mobile
+// so the plot data runs closer to edge-to-edge. Evaluated at build time.
+const GUTTER_WIDE = 52, GUTTER_NARROW = 30;
+const gutter = () => (isNarrow() ? GUTTER_NARROW : GUTTER_WIDE);
+// Right padding covers the bottom panel's x-label overflow so all right edges
+// align. Minimal on mobile (edge-to-edge).
+const padRight = () => (isNarrow() ? 6 : 28);
 
 const GRID_STROKE = "#21262d";
 const TICK_STROKE = "#21262d";
@@ -58,7 +62,15 @@ const AXIS_STROKE = "#c9d1d9";
 
 // arcsinh price ticks (refinement 1d) — named splits filtered to the live
 // [min,max]. uPlot's auto distr:4 ticks are decades and miss 0/30 + negatives.
-const PRICE_SPLITS = [-40, 0, 10, 30, 100, 300, 1000, 1500];
+// Avoid a split at exactly the asinh threshold (30) — uPlot emits a null split
+// there which would render blank. The 30 level is marked by the threshold line.
+const PRICE_SPLITS = [-40, -10, 0, 5, 10, 20, 50, 100, 300, 1000, 1500];
+
+// Panel name shown as a small overlay label top-left of each panel (item 1).
+const PANEL_TITLE = {
+  prices: "PRICE c/kWh", ribbon: "DECISION", mode: "MODE",
+  solar: "PV kW", soc: "SOC %", load: "LOAD kW", grid: "GRID kW", cost: "COST c/h",
+};
 
 const baseAxis = (extra = {}) => ({
   stroke: AXIS_STROKE,
@@ -72,9 +84,13 @@ const baseAxis = (extra = {}) => ({
 const xAxisHidden = () => ({ scale: "x", show: false, size: 0 });
 const xAxisShown = () => baseAxis({ scale: "x", size: 34, space: 60 });
 
-const yAxis = (extra = {}) => baseAxis({ scale: "y", size: FIXED_GUTTER, ...extra });
-// A y-axis that occupies the gutter but draws nothing (ribbon lanes).
-const yAxisBlank = () => ({ scale: "y", show: false, size: FIXED_GUTTER });
+const yAxis = (extra = {}) => baseAxis({ scale: "y", size: gutter(), ...extra });
+// A y-axis that RESERVES the gutter (so ribbon lanes line up with data panels)
+// but draws no ticks/grid/labels. show:false would NOT reserve the space.
+const yAxisBlank = () => ({
+  scale: "y", size: gutter(), stroke: "transparent",
+  grid: { show: false }, ticks: { show: false }, values: () => [],
+});
 
 // ── series factory helpers ─────────────────────────────────────────────────
 
@@ -114,8 +130,8 @@ function pricePanel(model, getState) {
   // import: fill between hi(local1->2) and lo(local0->1).
   // export: fill between hi(local3->4) and lo(local2->3).
   const bands = [
-    { series: [2, 1], fill: "rgba(240,136,62,0.15)" },
-    { series: [4, 3], fill: "rgba(86,211,100,0.15)" },
+    { series: [2, 1], fill: "rgba(240,136,62,0.28)" },
+    { series: [4, 3], fill: "rgba(86,211,100,0.28)" },
   ];
   const yAxisCfg = yAxis({
     splits: (u, _a, min, max) => PRICE_SPLITS.filter((v) => v >= min && v <= max),
@@ -181,7 +197,7 @@ function pvPanel(model, getState) {
       points: { show: true, size: 4, stroke: "#f2cc60", fill: "rgba(0,0,0,0)", width: 1 },
     });
   }
-  const bands = [{ series: [2, 1], fill: "rgba(242,204,96,0.22)" }];
+  const bands = [{ series: [2, 1], fill: "rgba(242,204,96,0.34)" }];
   const dataFn = (m) => {
     const pv = m.pv;
     const cols = [pv.bandLo, pv.bandHi, pv.p50, pv.measured];
@@ -201,6 +217,7 @@ function socPanel(model, getState) {
   return {
     series, dataFn,
     scaleY: { range: [0, 100] },
+    yAxisCfg: yAxis({ splits: [0, 25, 50, 75, 100] }),
     plugins: [shapesPlugin({ getState, kind: "soc" })],
   };
 }
@@ -279,6 +296,10 @@ function makePanel({ el, unionX, spec, model, showTime, peers, hub }) {
   const opts = {
     width: (el && el.clientWidth) || 600,
     height: (el && el.clientHeight) || 80,
+    // Uniform padding so every panel's plot area starts/ends at the same x
+    // (left handled by the fixed y-gutter; right padding covers the bottom
+    // panel's x-label overflow so all right edges align for the synced crosshair).
+    padding: [6, padRight(), 0, 0],
     scales: {
       x: { time: true },
       y: spec.scaleY || {},
@@ -377,6 +398,16 @@ export function buildTsFigure(rootEl, model) {
       canvas.setAttribute("role", "img");
       canvas.setAttribute("aria-label", PANEL_ARIA_LABEL[id] || id);
     }
+    // Panel name label (item 1) — small overlay top-left of the plot, with a
+    // faint dark pill so it stays legible over both the chart bg and ribbons.
+    el.style.position = "relative";
+    let title = el.querySelector(".panel-title");
+    if (!title) {
+      title = document.createElement("div");
+      title.className = "panel-title";
+      el.appendChild(title);
+    }
+    title.textContent = PANEL_TITLE[id] || id;
     registry.register(`ts-${id}`, u);
     instances.push(u);
     specs.push(spec);

@@ -606,10 +606,13 @@ function renderCursorReadout() {
   document.getElementById("cursor-time").textContent = fmtTime(t);
   document.getElementById("cursor-mode").textContent = state.cursor.pinned ? "pinned" : "live";
   document.getElementById("cursor-now-btn").disabled = !state.cursor.pinned;
-  // Toggle .pinned on the cursor block so mobile CSS can show it only
-  // when scrubbing — in live mode it's redundant with the tab-bar chip.
-  const block = document.getElementById("cursor-now-btn").closest(".status-block");
+  // Toggle .pinned on the cursor strip so the mode label accents when scrubbing.
+  const block = document.getElementById("cursor-now-btn").closest(".cursor-strip");
   if (block) block.classList.toggle("pinned", !!state.cursor.pinned);
+  // Refresh the panel-values readout + chips for the EFFECTIVE cursor slot
+  // (now when unpinned, the pinned slot when scrubbing) — so it's populated
+  // at "now" and shows predicted prices for future slots.
+  if (tsCursor) tsCursor.renderAt(toEpochSec(t));
 }
 
 // ── Loads + events ────────────────────────────────────────────────
@@ -1016,6 +1019,7 @@ function computeXRange() {
 // pinned-cursor state survive. Membership of conditional series is fixed at
 // build time; if it must change we tear down and rebuild (see below).
 let tsFigure = null;
+let tsCursor = null;   // wireCursor() controller — exposes renderAt(effectiveCursorSec)
 // uPlot spend chart instance (built once, updated via .update()).
 let spendChart = null;
 // Snapshot of which conditional series were present at build time, so we can
@@ -1097,11 +1101,16 @@ function redrawTSFigure() {
     // Wire the cursor hooks on every (re)build. wireCursor is idempotent per
     // instance — reinstalling on rebuild is fine because destroy() wipes the
     // old instances.
-    wireCursor(tsFigure.instances, () => currentModel, { setCursor, nearestSlotAt });
+    tsCursor = wireCursor(tsFigure.instances, () => currentModel, { setCursor, nearestSlotAt });
     applyTsXRange(true);
+    // Populate the readout/chips for the current effective cursor right away
+    // (renderCursorReadout may have run before tsCursor existed).
+    tsCursor.renderAt(toEpochSec(effectiveCursor()));
   } else {
     tsFigure.update(model);
     applyTsXRange(false);
+    // Keep the readout in sync with the freshened data on each live update.
+    if (tsCursor) tsCursor.renderAt(toEpochSec(effectiveCursor()));
   }
 }
 

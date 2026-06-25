@@ -33,6 +33,13 @@ html, body {
   font-size: 14px;
 }
 
+/* The header + the thin cursor strip stick together as one block so the
+   decision/mode chips + panel-values readout stay visible while scrolling. */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
 header.strip {
   display: flex;
   flex-wrap: wrap;
@@ -41,10 +48,45 @@ header.strip {
   padding: 12px 20px;
   background: var(--bg-elev);
   border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  z-index: 10;
 }
+
+/* ── Thin cursor strip (below the header, sticky via .topbar) ─────────── */
+.cursor-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 20px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.2;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: thin;
+}
+.cursor-strip-now { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.cursor-strip-now #cursor-now-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cursor-strip-now #cursor-now-btn:hover:not(:disabled) { border-color: var(--accent); }
+.cursor-strip-now #cursor-now-btn:disabled { opacity: 0.4; cursor: default; }
+.cstrip-time { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
+.cstrip-mode { color: var(--text-dim); font-size: 11px; }
+.cursor-strip.pinned .cstrip-mode { color: var(--accent); }
+.cstrip-sep { width: 1px; align-self: stretch; background: var(--border); flex: 0 0 auto; }
+.cursor-strip-chips { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.cursor-readout-strip { display: flex; align-items: center; gap: 14px; flex: 1 1 auto; min-width: 0; }
+.cursor-readout-strip .ro-cell { display: inline-flex; align-items: baseline; gap: 5px; flex: 0 0 auto; }
+.cursor-readout-strip .ro-k {
+  font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-dim);
+}
+.cursor-readout-strip .ro-v { font-variant-numeric: tabular-nums; color: var(--text); }
 
 .status-block { line-height: 1.2; flex: 0 0 auto; }
 .status-block.right { text-align: right; margin-left: auto; }
@@ -167,9 +209,6 @@ table.cursor-readout .readout-value {
   background: var(--bg-elev);
   border-bottom: 1px solid var(--border);
   font-size: 13px;
-  position: sticky;
-  top: 0;
-  z-index: 9;
 }
 .range-bar .range-label {
   font-size: 11px;
@@ -271,6 +310,22 @@ main {
   touch-action: pan-y;
 }
 #ts-figure .uplot-panel { width: 100%; min-height: 0; }
+/* Panel name overlay (item 1) — top-left over the plot, faint dark pill so it
+   stays legible over the chart bg and the coloured decision/mode ribbons. */
+#ts-figure .panel-title {
+  position: absolute;
+  top: 7px;
+  left: 56px;
+  font: 600 9.5px/1 var(--font, system-ui, sans-serif);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #9aa4af;
+  background: rgba(13, 17, 23, 0.62);
+  padding: 1px 4px;
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 3;
+}
 #ts-figure .ribbon-tooltip {
   position: absolute;
   top: 0;
@@ -407,38 +462,12 @@ main {
      status bar) plus a "LIVE" chip duplicated by the tab-bar mode
      indicator. JS adds `.pinned` when the user scrubs to a historical
      timestamp, at which point we surface it inline at the end of row 1. */
-  /* Hide the readout column and chip block on mobile — the strip is already
-     cramped; these only make sense when hovering a chart on a wider screen. */
-  .cursor-readout-block,
-  .cursor-chips-block { display: none; }
-  .status-block.right { display: none; }
-  .status-block.right.pinned {
-    display: flex;
-    width: auto;
-    text-align: left;
-    align-items: center;
-    flex-direction: row;
-    gap: 5px;
-  }
-  .status-block.right .status-label { display: none; }
-  .status-block.right .status-value { font-size: 13px; }
-  .status-block.right .status-sub {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-  /* Snap-to-now becomes an icon-only button on mobile — only visible
-     in pinned mode (its parent block is hidden in live mode). */
-  .status-block.right #cursor-now-btn {
-    margin-top: 0;
-    padding: 1px 5px;
-    font-size: 0;
-    line-height: 1.4;
-  }
-  .status-block.right #cursor-now-btn::before {
-    content: "↺";
-    font-size: 12px;
-  }
+  /* Cursor strip stays visible on mobile but compact; it scrolls
+     horizontally (overflow-x:auto) if the panel-values overrun the width. */
+  .cursor-strip { padding: 4px 12px; gap: 8px; font-size: 11px; }
+  .cursor-readout-strip { gap: 10px; }
+  .cursor-readout-strip .ro-k { font-size: 9px; }
+  .cursor-strip-now #cursor-now-btn { font-size: 10px; padding: 2px 6px; }
 
   /* Tile row uses a 4-column grid that mirrors the parent strip's
      columns so PV / BATTERY / GRID / LOAD line up under the row-1
@@ -521,16 +550,18 @@ main {
   main {
     grid-template-columns: 1fr;
     gap: 8px;
-    padding: 6px 4px;
+    padding: 6px 0;
   }
-  /* Tighten panel padding so the plot area gets the screen width.
-     Most panels use 12px → 4px; the chart panels were already 4–8 px
-     so we drop them to 2 px to claw back every pixel we can. */
+  /* Edge-to-edge charts on mobile: zero horizontal padding on the chart
+     containers so the only inset is the (narrowed) y-gutter itself. */
   .panel { padding: 6px 4px; }
-  .panel-charts { padding: 2px 2px 0 2px; }
-  .panel-spend { padding: 4px 2px 0 2px; }
+  .panel-charts { padding: 2px 0 0 0; }
+  .panel-spend { padding: 4px 0 0 0; }
   .panel-loads { padding: 8px; }    /* text content — keep readable margin */
   .panel-events { padding: 8px; }
+  /* Narrower y-gutter on mobile (30px, set in panels.js) → move the panel
+     name label in to sit just past it. */
+  #ts-figure .panel-title { left: 34px; }
 
   .panel-charts,
   .panel-spend,

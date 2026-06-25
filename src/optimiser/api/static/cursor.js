@@ -53,7 +53,9 @@ const PANEL_READOUT = [
   { panel: "load",     label: "Load",     unit: "kW",    scanFromEnd: true },
   // grid: inverter (local 0, data[1])
   // Layout: [inverter(1), shelly?(2 if present), planned]
-  { panel: "grid",     label: "Grid",     unit: "kW",    dataIdx: 1, altIdx: null },
+  // grid: inverter (data[1]) preferred; planned is the LAST column but its index
+  // shifts with the optional Shelly series, so fall back via an end-scan.
+  { panel: "grid",     label: "Grid",     unit: "kW",    dataIdx: 1, altIdx: null, endAlt: true },
   // cost: realised (local 0, data[1])
   // Layout: [realised(1), planned(2), settled?(3)]
   { panel: "cost",     label: "Cost",     unit: "c/h",   dataIdx: 1, altIdx: 2 },
@@ -68,27 +70,46 @@ function fmtValue(v, dp = 1) {
   return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 }
 
-// Pick the best non-null value at idx from u.data. If idx is null/undefined,
-// return null.  Falls back to altIdx when the primary is null (forecast/planned).
-function pickVal(u, idx, altIdx) {
-  if (idx == null || u.cursor.idx == null) return null;
-  const v = u.data[idx]?.[u.cursor.idx];
-  if (v != null && Number.isFinite(v)) return v;
-  if (altIdx != null) {
-    const v2 = u.data[altIdx]?.[u.cursor.idx];
-    if (v2 != null && Number.isFinite(v2)) return v2;
+// Nearest non-null value to rowIdx within ±span (closest distance wins). Used
+// as a fallback for SPARSE forecast columns: e.g. the 30-min Amber price
+// forecast only has values at its own timestamps, so it's null at the in-between
+// 5-min grid points the cursor can land on. This surfaces the forecast in effect.
+function nearestNonNull(col, rowIdx, span) {
+  if (!col) return null;
+  for (let d = 1; d <= span; d++) {
+    const b = col[rowIdx - d];
+    if (b != null && Number.isFinite(b)) return b;
+    const f = col[rowIdx + d];
+    if (f != null && Number.isFinite(f)) return f;
   }
   return null;
 }
 
-// Scan u.data from the right to find the last non-band series column that
-// has a value at cursor.idx (used for the LOAD envelope which is always last
-// after a variable-length set of stack columns).
-function pickValFromEnd(u, skipLast = 0) {
-  if (u.cursor.idx == null) return null;
+// Pick the best value at rowIdx: exact primary (realised/measured) → exact
+// altIdx (predicted/planned) → NEAREST altIdx (for sparse forecast grids).
+// Realised is only looked up exactly (never nearest) so a future slot never
+// shows a stale past realised value.
+function pickVal(u, idx, altIdx, rowIdx, span = 12) {
+  if (idx == null || rowIdx == null) return null;
+  const v = u.data[idx]?.[rowIdx];
+  if (v != null && Number.isFinite(v)) return v;
+  if (altIdx != null) {
+    const col = u.data[altIdx];
+    const v2 = col?.[rowIdx];
+    if (v2 != null && Number.isFinite(v2)) return v2;
+    return nearestNonNull(col, rowIdx, span);
+  }
+  return null;
+}
+
+// Scan u.data from the right to find the last non-band series column that has a
+// value at rowIdx (the LOAD envelope is always last after a variable number of
+// stack columns).
+function pickValFromEnd(u, skipLast, rowIdx) {
+  if (rowIdx == null) return null;
   const len = u.data.length;
   for (let i = len - 1 - skipLast; i >= 1; i--) {
-    const v = u.data[i]?.[u.cursor.idx];
+    const v = u.data[i]?.[rowIdx];
     if (v != null && Number.isFinite(v)) return v;
   }
   return null;
@@ -123,52 +144,45 @@ export function wireCursor(instances, getModel, { setCursor, nearestSlotAt }) {
 
   function ensureRows() {
     if (!readoutEl) return;
-    // Clear any rows left over from a previous wireCursor() call (figure
+    // Clear any cells left over from a previous wireCursor() call (figure
     // rebuilds re-invoke wireCursor but #cursor-readout is outside the figure
-    // and is never reset by the caller, so without this the table grows 8
-    // rows per rebuild).
+    // and is never reset by the caller, so without this it grows per rebuild).
     readoutEl.replaceChildren();
     rowEls = [];
     for (const { spec } of panelMap) {
-      const tr = document.createElement("tr");
-      const td1 = document.createElement("td");
-      const td2 = document.createElement("td");
-      td1.className = "readout-label";
-      td2.className = "readout-value";
-      td1.textContent = spec.label;
-      td2.textContent = "—";
-      tr.appendChild(td1);
-      tr.appendChild(td2);
-      readoutEl.appendChild(tr);
-      rowEls.push({ labelCell: td1, valueCell: td2 });
+      // Decision/Mode are shown as coloured chips in the strip, not as a
+      // readout cell — push null so updateReadout skips them.
+      if (spec.catField) { rowEls.push(null); continue; }
+      const cell = document.createElement("span");
+      cell.className = "ro-cell";
+      const k = document.createElement("span");
+      k.className = "ro-k";
+      k.textContent = spec.label;
+      const v = document.createElement("span");
+      v.className = "ro-v";
+      v.textContent = "—";
+      cell.appendChild(k);
+      cell.appendChild(v);
+      readoutEl.appendChild(cell);
+      rowEls.push({ valueCell: v });
     }
   }
 
-  function updateReadout(cursorIdx) {
+  function updateReadout(rowIdx) {
     ensureRows();
     if (!rowEls) return;
 
-    const model = getModel();
-
     for (let i = 0; i < panelMap.length; i++) {
+      if (!rowEls[i]) continue;   // ribbon/mode → shown as chips, no cell
       const { spec, u } = panelMap[i];
       const cell = rowEls[i].valueCell;
-      if (cursorIdx == null) { cell.textContent = "—"; continue; }
-
-      // Panels driven by category arrays (ribbons) — no numeric value.
-      if (spec.catField) {
-        const cats = model ? (spec.catField === "decision" ? model.decisionCats : model.modeCats) : null;
-        const cat = (cats && cursorIdx < cats.length) ? cats[cursorIdx] : null;
-        const labels = spec.catField === "decision" ? DECISION_LABELS : MODE_LABELS;
-        cell.textContent = cat != null ? (labels[cat] ?? "—") : "—";
-        continue;
-      }
+      if (rowIdx == null) { cell.textContent = "—"; continue; }
 
       // PRICE panel — show import & export with true c/kWh (1a), prefer
-      // realised values (measured), fall back to predicted.
+      // realised values (measured), fall back to predicted (future slots).
       if (spec.importIdx != null) {
-        const imp = pickVal(u, spec.importIdx, spec.importPredIdx);
-        const exp = pickVal(u, spec.exportIdx, spec.exportPredIdx);
+        const imp = pickVal(u, spec.importIdx, spec.importPredIdx, rowIdx);
+        const exp = pickVal(u, spec.exportIdx, spec.exportPredIdx, rowIdx);
         const impStr = imp != null ? fmtValue(imp, 1) : "—";
         const expStr = exp != null ? fmtValue(exp, 1) : "—";
         cell.textContent = `imp ${impStr} / exp ${expStr}`;
@@ -179,13 +193,15 @@ export function wireCursor(instances, getModel, { setCursor, nearestSlotAt }) {
       if (spec.scanFromEnd) {
         // The last two data columns in loadPanel are measuredEnv, plannedEnv.
         // Try measuredEnv first (second-to-last), then plannedEnv (last).
-        const v = pickValFromEnd(u, 1) ?? pickValFromEnd(u, 0);
+        const v = pickValFromEnd(u, 1, rowIdx) ?? pickValFromEnd(u, 0, rowIdx);
         cell.textContent = v != null ? `${fmtValue(v, 2)} ${spec.unit}` : "—";
         continue;
       }
 
-      // All other panels — use dataIdx with altIdx fallback.
-      const v = pickVal(u, spec.dataIdx, spec.altIdx);
+      // All other panels — use dataIdx with altIdx fallback; grid also scans
+      // from the end for its (conditionally-positioned) planned column.
+      let v = pickVal(u, spec.dataIdx, spec.altIdx, rowIdx);
+      if (v == null && spec.endAlt) v = pickValFromEnd(u, 0, rowIdx);
       if (v != null) {
         cell.textContent = spec.unit ? `${fmtValue(v, 2)} ${spec.unit}` : fmtValue(v, 2);
       } else {
@@ -231,40 +247,48 @@ export function wireCursor(instances, getModel, { setCursor, nearestSlotAt }) {
     }
   }
 
-  // Install the hook on every instance. Each instance fires independently
-  // but they all share the same synced cursor.idx (via uPlot.sync).
-  // We only need ONE instance to drive the pin + readout — we pick the
-  // first one; the rest just guard against double-pin.
-  let lastPinnedIdx = null;
+  // renderAt: drive the readout + chips from the EFFECTIVE cursor slot (now when
+  // unpinned, the pinned slot when scrubbing) so they stay populated even when
+  // the mouse isn't over a plot — and so a future slot shows PREDICTED prices
+  // (pickVal falls back to the predicted column when realised is null there).
+  const primary = instances[0];
+  function findRowIdx(timeSec) {
+    if (timeSec == null || !primary || !primary.data[0] || !primary.data[0].length) return null;
+    const xs = primary.data[0];
+    const target = Math.round(nearestSlotAt(new Date(timeSec * 1000)).getTime() / 1000);
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < xs.length; i++) {
+      const d = Math.abs(xs[i] - target);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+  function renderAt(effectiveCursorSec) {
+    const rowIdx = findRowIdx(effectiveCursorSec);
+    updateReadout(rowIdx);
+    updateChips(rowIdx);
+  }
 
+  // Hover PINS the cursor; the readout is refreshed via renderAt (called by the
+  // dashboard on every cursor/snapshot change), so it survives the mouse leaving
+  // the plot and reflects "now" when unpinned.
+  let lastPinnedIdx = null;
   for (let pi = 0; pi < instances.length; pi++) {
     const u = instances[pi];
     const isPrimary = pi === 0;
-
     (u.hooks.setCursor ||= []).push(() => {
+      if (!isPrimary) return;
       const idx = u.cursor.idx;
-
-      // Primary instance drives the pin + full readout update.
-      if (isPrimary) {
-        if (idx != null) {
-          // Compute the wall-clock slot from the cursor position.
-          const tSec = u.posToVal(u.cursor.left, "x");
-          if (Number.isFinite(tSec)) {
-            const slot = nearestSlotAt(new Date(tSec * 1000));
-            // Avoid redundant setCursor calls when the index didn't change.
-            if (idx !== lastPinnedIdx) {
-              lastPinnedIdx = idx;
-              setCursor(slot, { pinned: true });
-            }
-          }
-        }
-        // When idx is null (mouse left the plot), do nothing — cursor stays
-        // pinned at the last slot (matches the no-unhover behaviour in the spec).
-
-        // Always update the readout to reflect current idx (may be null).
-        updateReadout(idx);
-        updateChips(idx);
+      if (idx == null) return;   // mouse left — keep the pinned readout intact
+      const tSec = u.posToVal(u.cursor.left, "x");
+      if (!Number.isFinite(tSec)) return;
+      const slot = nearestSlotAt(new Date(tSec * 1000));
+      if (idx !== lastPinnedIdx) {
+        lastPinnedIdx = idx;
+        setCursor(slot, { pinned: true });  // → dashboard re-renders via renderAt
       }
     });
   }
+
+  return { renderAt };
 }

@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/dashboard/static/uplot.min.css" />
 </head>
 <body>
+  <div class="topbar">
   <header id="status-strip" class="strip">
     <div class="status-block">
       <div class="status-label">Service</div>
@@ -41,24 +42,24 @@
         <div class="tile-value">—</div>
       </div>
     </div>
-    <div class="status-block cursor-chips-block">
-      <div class="status-label">Decision / Mode</div>
-      <div class="cursor-chips">
-        <span id="decision-chip" class="decision-chip">—</span>
-        <span id="mode-chip" class="mode-chip">—</span>
-      </div>
-    </div>
-    <div class="status-block cursor-readout-block">
-      <div class="status-label">Panel values at cursor</div>
-      <table id="cursor-readout" class="cursor-readout"></table>
-    </div>
-    <div class="status-block right">
-      <div class="status-label">Cursor</div>
-      <div id="cursor-time" class="status-value">—</div>
-      <div id="cursor-mode" class="status-sub">live</div>
-      <button id="cursor-now-btn" type="button">Snap to now</button>
-    </div>
   </header>
+  <!-- Thin sticky strip below the header: cursor time/now, decision/mode chips,
+       and the live panel-values-at-cursor readout. Stays visible on scroll. -->
+  <div id="cursor-strip" class="cursor-strip">
+    <div class="cursor-strip-now">
+      <button id="cursor-now-btn" type="button" title="Snap cursor to now">⟲ now</button>
+      <span id="cursor-time" class="cstrip-time">—</span>
+      <span id="cursor-mode" class="cstrip-mode">live</span>
+    </div>
+    <span class="cstrip-sep" aria-hidden="true"></span>
+    <div class="cursor-strip-chips">
+      <span id="decision-chip" class="decision-chip">—</span>
+      <span id="mode-chip" class="mode-chip">—</span>
+    </div>
+    <span class="cstrip-sep" aria-hidden="true"></span>
+    <div id="cursor-readout" class="cursor-readout-strip"></div>
+  </div>
+  </div><!-- /.topbar -->
 
   <nav id="range-bar" class="range-bar" aria-label="Date range">
     <span class="range-label">View</span>
