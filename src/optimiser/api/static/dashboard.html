@@ -6,9 +6,6 @@
   <title>Energy Optimiser — Dashboard</title>
   <link rel="stylesheet" href="/dashboard/static/dashboard.css" />
   <link rel="stylesheet" href="/dashboard/static/uplot.min.css" />
-  <!-- Plotly via CDN. To run offline, vendor plotly-2.x.min.js into
-       /dashboard/static and update _STATIC_FILES + this src. -->
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 </head>
 <body>
   <header id="status-strip" class="strip">
@@ -248,7 +245,6 @@
 
   <footer id="error-bar" class="error-bar hidden"></footer>
 
-  <script src="/dashboard/static/chart-utils.js"></script>
   <script type="module" src="/dashboard/static/dashboard.js"></script>
   <script type="module" src="/dashboard/static/ops.js"></script>
 </body>

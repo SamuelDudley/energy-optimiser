@@ -38,6 +38,7 @@ import { bandColumns } from "./bands.js";
 import { buildTsFigure } from "./panels.js";
 import { wireCursor } from "./cursor.js";
 import { buildSpendChart } from "./spend-chart.js";
+import { isNarrow, onBreakpointChange } from "./chart-core.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -105,11 +106,11 @@ const HOVER_LABEL = {
 // in lockstep with panel padding. `automargin: true` on each y-axis
 // means these are minimums; Plotly will grow them if a long tick label
 // (e.g. "1234") would otherwise clip.
-// Thin alias around the shared helper in chart-utils.js — keeps existing
+// Thin alias around the shared helper in chart-core.js — keeps existing
 // call sites untouched while the breakpoint and matchMedia plumbing live
-// in one place. New chart code should call `eoChart.isNarrow()` directly.
+// in one place.
 function isNarrowViewport() {
-  return window.eoChart ? window.eoChart.isNarrow() : false;
+  return isNarrow();
 }
 
 // ── State ──────────────────────────────────────────────────────────
@@ -1585,9 +1586,8 @@ async function main() {
 
   // When the viewport crosses the mobile breakpoint (rotation, resize),
   // re-run the layout for each plot so the chart-margin and dragmode
-  // overrides flip in/out cleanly. Plotly's `responsive: true` only
-  // resizes — it doesn't re-evaluate the narrow-viewport branch.
-  window.eoChart.onBreakpointChange(() => {
+  // overrides flip in/out cleanly.
+  onBreakpointChange(() => {
     if (state.built.ts) redrawTSFigure();
     if (spendChart) redrawDailySpend();
   });

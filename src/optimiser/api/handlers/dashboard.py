@@ -47,7 +47,6 @@ _STATIC_DIR = _resolve_static_dir()
 
 _STATIC_FILES: dict[str, str] = {
     "dashboard.css": "text/css",
-    "chart-utils.js": "application/javascript",
     "dashboard.js": "application/javascript",
     "ops.js": "application/javascript",
     # vendored uPlot

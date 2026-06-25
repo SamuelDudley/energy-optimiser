@@ -55,7 +55,6 @@ _PUBLIC_PATHS = (
     "/favicon.ico",
     "/dashboard",
     "/dashboard/static/dashboard.css",
-    "/dashboard/static/chart-utils.js",
     "/dashboard/static/dashboard.js",
     "/dashboard/static/ops.js",
     "/dashboard/static/uplot.esm.js",
