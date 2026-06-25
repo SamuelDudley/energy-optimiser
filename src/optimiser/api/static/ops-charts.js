@@ -102,11 +102,43 @@ function baseBarOpts(containerId, width, height, extra) {
  *   6. Hand-built unified tooltip via setCursor hook.
  *   7. y-scale starts at 0 (rangemode: tozero equivalent).
  */
+// On-chart overlay legend (top-right) with click-to-toggle. Replaces uPlot's
+// built-in legend, which renders below the canvas and overflowed the fixed-
+// height ops containers. `items` = [[seriesIdx, label, color], ...].
+function addOverlayLegend(el, u, items) {
+  const old = el.querySelector(".chart-legend");
+  if (old) old.remove();
+  if (!items || !items.length) return;
+  const legend = document.createElement("div");
+  legend.className = "chart-legend";
+  for (const [idx, label, color] of items) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "chart-legend-item";
+    item.innerHTML = `<span class="sw" style="background:${color}"></span>${label}`;
+    item.addEventListener("click", () => {
+      const show = !u.series[idx].show;
+      u.setSeries(idx, { show });
+      item.classList.toggle("off", !show);
+    });
+    legend.appendChild(item);
+  }
+  el.appendChild(legend);
+}
+
 function buildSolveSeries(containerId, solveData) {
   const el = typeof document !== "undefined" && document.getElementById(containerId);
   if (!el) return null;
 
   const rows = (solveData && Array.isArray(solveData.series)) ? solveData.series : [];
+
+  // Empty-state (e.g. no solves in the window, or the snapshot file couldn't be
+  // parsed) — show a message instead of an empty plot with a misleading axis.
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="muted">no solves in window</div>';
+    registry.unregister(containerId);
+    return null;
+  }
 
   // Group points by status
   const byStatus = {};
@@ -196,7 +228,7 @@ function buildSolveSeries(containerId, solveData) {
         paths:  () => null, // suppress line path entirely
       })),
     ],
-    legend: { show: true, live: false },
+    legend: { show: false },   // custom overlay legend added after construction
     cursor: {
       show: true,
       // no drag (ops charts are small; mobile compat)
@@ -285,6 +317,7 @@ function buildSolveSeries(containerId, solveData) {
   const cvs0 = u.ctx && u.ctx.canvas;
   if (cvs0) { cvs0.setAttribute("role", "img"); cvs0.setAttribute("aria-label", "Solve time series, ms"); }
   registry.register(containerId, u);
+  addOverlayLegend(el, u, statusKeys.map((s, i) => [i + 1, s, STATUS_COLOR[s] || "#8b949e"]));
   return u;
 }
 
@@ -299,8 +332,9 @@ function buildHistogram(containerId, solveData) {
   if (!el) return null;
 
   const buckets = (solveData && Array.isArray(solveData.histogram)) ? solveData.histogram : [];
+  const totalCount = buckets.reduce((s, b) => s + (b.count || 0), 0);
 
-  if (buckets.length === 0) {
+  if (buckets.length === 0 || totalCount === 0) {
     el.innerHTML = '<div class="muted">no solves in window</div>';
     registry.unregister(containerId);
     return null;
@@ -582,15 +616,17 @@ function buildModbusWrites(containerId, modbusData) {
         points: { show: false },
       },
     ],
-    legend: { show: true, live: false },
+    legend: { show: false },   // custom overlay legend added after construction
   });
 
   el.innerHTML = "";
+  el.style.position = "relative";
   const u = new uPlot(opts, [xData, okData, errData], el);
   // v1 a11y hygiene (spec §10.2).
   const cvs3 = u.ctx && u.ctx.canvas;
   if (cvs3) { cvs3.setAttribute("role", "img"); cvs3.setAttribute("aria-label", "Modbus write health by register"); }
   registry.register(containerId, u);
+  addOverlayLegend(el, u, [[1, "ok", COLOR_OK], [2, "err", COLOR_ERR]]);
   return u;
 }
 

@@ -259,6 +259,9 @@ function showTab(name) {
   });
   $("energy-view").hidden = name !== "energy";
   $("ops-view").hidden = name !== "ops";
+  // The cursor strip (decision/mode + panel-values-at-cursor) is specific to
+  // the Energy time-series; hide it on Ops so the ops charts get the space.
+  document.body.classList.toggle("ops-active", name === "ops");
 
   if (name === "ops") {
     // First visit: do an immediate refresh and start the timers.

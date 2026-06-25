@@ -242,11 +242,10 @@ export function buildSpendChart(el) {
           points:  { show: true, size: 5, fill: PURPLE, stroke: PURPLE },
         },
       ],
-      legend: {
-        show: true,
-        live: false,    // don't update legend values on hover (we use custom tooltip)
-        // native click-to-toggle series.show provides the legend parity
-      },
+      // Built-in legend disabled — it renders below the canvas and overflowed
+      // the fixed-height container. A custom top-right overlay legend (with
+      // click-to-toggle) is built in _create() instead.
+      legend: { show: false },
       cursor: {
         // Disable selection drag on spend chart (it's categorical, not temporal)
         drag: { x: false, y: false, setScale: false },
@@ -291,6 +290,27 @@ export function buildSpendChart(el) {
       canvas.setAttribute("aria-label", "Daily spend, AUD per day");
     }
     registry.register("spend-figure", u);
+    buildLegend();
+  }
+
+  // Custom overlay legend (top-right, inside the chart) with click-to-toggle.
+  function buildLegend() {
+    if (el.querySelector(".chart-legend")) return;
+    const legend = document.createElement("div");
+    legend.className = "chart-legend";
+    [[1, "import cost", ORANGE], [2, "export revenue", GREEN], [3, "net", PURPLE]].forEach(([idx, label, color]) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "chart-legend-item";
+      item.innerHTML = `<span class="sw" style="background:${color}"></span>${label}`;
+      item.addEventListener("click", () => {
+        const show = !u.series[idx].show;
+        u.setSeries(idx, { show });
+        item.classList.toggle("off", !show);
+      });
+      legend.appendChild(item);
+    });
+    el.appendChild(legend);
   }
 
   _create();

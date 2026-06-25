@@ -60,11 +60,13 @@ const GRID_STROKE = "#21262d";
 const TICK_STROKE = "#21262d";
 const AXIS_STROKE = "#c9d1d9";
 
-// arcsinh price ticks (refinement 1d) — named splits filtered to the live
-// [min,max]. uPlot's auto distr:4 ticks are decades and miss 0/30 + negatives.
-// Avoid a split at exactly the asinh threshold (30) — uPlot emits a null split
-// there which would render blank. The 30 level is marked by the threshold line.
-const PRICE_SPLITS = [-40, -10, 0, 5, 10, 20, 50, 100, 300, 1000, 1500];
+// Named tick splits for the arcsinh (distr:4) axes, filtered to the live
+// [min,max]. Denser than uPlot's auto decade ticks. NEVER include a split at
+// exactly the scale's asinh threshold — uPlot emits a null split there which
+// renders blank (the threshold level is marked by the reference line instead).
+const PRICE_SPLITS = [-40, -20, -10, -5, 0, 5, 10, 15, 20, 40, 60, 80, 100, 150, 300, 600, 1000, 1500];  // asinh 30
+const COST_SPLITS  = [-2000, -1000, -500, -200, -100, -50, -20, -10, 0, 10, 20, 50, 100, 200, 500, 1000, 2000];  // asinh 30
+const GRID_SPLITS  = [-13, -10, -7, -5, -3, -1, 0, 1, 3, 5, 7, 10, 13];  // asinh 2
 
 // Panel name shown as a small overlay label top-left of each panel (item 1).
 const PANEL_TITLE = {
@@ -80,11 +82,37 @@ const baseAxis = (extra = {}) => ({
   ...extra,
 });
 
-// A hidden x-axis (non-bottom panels). Bottom (COST) panel shows time labels.
-const xAxisHidden = () => ({ scale: "x", show: false, size: 0 });
-const xAxisShown = () => baseAxis({ scale: "x", size: 34, space: 60 });
+// Non-bottom panels: draw the vertical TIME gridlines (so you can read the time
+// at any panel, not just the bottom) but reserve no height + show no labels.
+const X_SPACE = 52;  // min px between time ticks — same on every panel so the
+                     // gridlines line up with the bottom panel's time labels.
+const xAxisHidden = () => ({
+  scale: "x", show: true, size: 0, gap: 0,
+  ticks: { show: false }, values: () => [],
+  grid: { stroke: GRID_STROKE, width: 1 },
+  space: X_SPACE,
+});
+// Bottom (COST) panel shows the time labels.
+const xAxisShown = () => baseAxis({ scale: "x", size: 34, space: X_SPACE });
 
 const yAxis = (extra = {}) => baseAxis({ scale: "y", size: gutter(), ...extra });
+// A y-axis with explicit named ticks (for the arcsinh price/cost/grid panels),
+// filtered to the visible range, null-safe so a threshold-coincident split
+// never prints "null".
+const namedAxis = (splits) => yAxis({
+  splits: (u, _a, min, max) => splits.filter((v) => v >= min && v <= max),
+  values: (u, sp) => sp.map((v) => (v == null || !Number.isFinite(v)) ? "" : String(v)),
+});
+// Tight range for the arcsinh scales. uPlot's default asinh range-padding is
+// generous in value-space (it pads a small amount in asinh-space, which maps to
+// a big value-space gap at the top), leaving the data squashed in the lower
+// third. This pads ~8% of the value span so the data fills the panel — and
+// still follows a genuine spike upward, since the range tracks the data max.
+function asinhRange(u, dataMin, dataMax) {
+  if (dataMin == null || dataMax == null) return [dataMin, dataMax];
+  const pad = (dataMax - dataMin) * 0.08 || 1;
+  return [dataMin - pad, dataMax + pad];
+}
 // A y-axis that RESERVES the gutter (so ribbon lanes line up with data panels)
 // but draws no ticks/grid/labels. show:false would NOT reserve the space.
 const yAxisBlank = () => ({
@@ -133,10 +161,7 @@ function pricePanel(model, getState) {
     { series: [2, 1], fill: "rgba(240,136,62,0.28)" },
     { series: [4, 3], fill: "rgba(86,211,100,0.28)" },
   ];
-  const yAxisCfg = yAxis({
-    splits: (u, _a, min, max) => PRICE_SPLITS.filter((v) => v >= min && v <= max),
-    values: (u, splits) => splits.map((v) => (v == null || !Number.isFinite(v)) ? "" : String(v)),
-  });
+  const yAxisCfg = namedAxis(PRICE_SPLITS);
   const dataFn = (m) => {
     const p = m.price;
     return [
@@ -146,7 +171,7 @@ function pricePanel(model, getState) {
   };
   return {
     series, dataFn,
-    scaleY: { distr: 4, asinh: 30 },
+    scaleY: { distr: 4, asinh: 30, range: asinhRange },
     yAxisCfg, bands,
     plugins: [
       shapesPlugin({ getState, kind: "price" }),
@@ -176,7 +201,8 @@ function ribbonPanel(key, getCats, tooltipEl) {
         getCats,
         colorOf: (c) => colors[c] ?? "#21262d",
         labelOf: (c) => labels[c] ?? "—",
-        glyphOf: (c) => (labels[c] ?? "").replace(/^(charge|discharge|idle|mode \d+) ?·? ?/, "").slice(0, 3) || "·",
+        // No inline glyphs — they were cramped/unreadable on the thin lane.
+        // The colour + the decision/mode chip + the hover tooltip convey it.
         tooltipEl,
       }),
     ],
@@ -263,7 +289,9 @@ function gridPanel(model, getState) {
   };
   return {
     series, dataFn,
-    scaleY: {},
+    // arcsinh: ±2 kW reads ~linear, larger charge/export bursts compress.
+    scaleY: { distr: 4, asinh: 2, range: asinhRange },
+    yAxisCfg: namedAxis(GRID_SPLITS),
     plugins: [shapesPlugin({ getState, kind: "grid" })],
   };
 }
@@ -284,7 +312,9 @@ function costPanel(model, getState) {
   };
   return {
     series, dataFn,
-    scaleY: {},
+    // arcsinh: ±30 c/h reads ~linear, spike-driven cost compresses.
+    scaleY: { distr: 4, asinh: 30, range: asinhRange },
+    yAxisCfg: namedAxis(COST_SPLITS),
     plugins: [shapesPlugin({ getState, kind: "cost" })],
   };
 }
@@ -299,7 +329,10 @@ function makePanel({ el, unionX, spec, model, showTime, peers, hub }) {
     // Uniform padding so every panel's plot area starts/ends at the same x
     // (left handled by the fixed y-gutter; right padding covers the bottom
     // panel's x-label overflow so all right edges align for the synced crosshair).
-    padding: [6, padRight(), 0, 0],
+    // top/bottom padding insets the extreme y-ticks from the panel edges so an
+    // upper panel's bottom label (e.g. PV "0") doesn't collide with the lower
+    // panel's top label (e.g. SOC "100").
+    padding: [9, padRight(), 8, 0],
     scales: {
       x: { time: true },
       y: spec.scaleY || {},

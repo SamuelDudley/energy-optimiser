@@ -81,6 +81,8 @@ header.strip {
 .cursor-strip.pinned .cstrip-mode { color: var(--accent); }
 .cstrip-sep { width: 1px; align-self: stretch; background: var(--border); flex: 0 0 auto; }
 .cursor-strip-chips { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+/* The cursor strip is Energy-tab-specific — hide it on the Ops tab. */
+body.ops-active .cursor-strip { display: none; }
 .cursor-readout-strip { display: flex; align-items: center; gap: 14px; flex: 1 1 auto; min-width: 0; }
 .cursor-readout-strip .ro-cell { display: inline-flex; align-items: baseline; gap: 5px; flex: 0 0 auto; }
 .cursor-readout-strip .ro-k {
@@ -305,7 +307,7 @@ main {
   height: var(--ts-figure-h);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
   position: relative;
   touch-action: pan-y;
 }
@@ -342,7 +344,33 @@ main {
 }
 
 .panel-spend  { grid-column: 1 / span 2; padding: 8px 8px 0 8px; }
-#spend-figure { width: 100%; height: var(--spend-figure-h); }
+#spend-figure { width: 100%; height: var(--spend-figure-h); position: relative; }
+
+/* On-chart overlay legend (top-right) for the spend + ops bar charts. Replaces
+   uPlot's built-in legend, which rendered below the canvas and overflowed the
+   fixed-height containers. Click an item to toggle that series. */
+.chart-legend {
+  position: absolute;
+  top: 4px;
+  right: 12px;
+  display: flex;
+  gap: 8px;
+  z-index: 4;
+}
+.chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(13, 17, 23, 0.66);
+  border: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.chart-legend-item .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: 0 0 auto; }
+.chart-legend-item.off { opacity: 0.4; text-decoration: line-through; }
 
 .panel-loads  { grid-column: 1 / span 1; }
 .panel-events { grid-column: 2 / span 1; }
