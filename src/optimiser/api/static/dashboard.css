@@ -19,7 +19,6 @@
   --planned: #8b949e;
 
   --ts-figure-h: 1120px;
-  --sankey-figure-h: 460px;
   --spend-figure-h: 320px;
 }
 
@@ -287,11 +286,6 @@ main {
   white-space: nowrap;
 }
 
-/* Daily Sankey spans the full row — the per-tick cursor Sankey was
-   removed, so today's totals can use the full panel width. */
-.panel-sankey-today  { grid-column: 1 / span 2; }
-#sankey-today-figure { width: 100%; height: var(--sankey-figure-h); }
-
 .panel-spend  { grid-column: 1 / span 2; padding: 8px 8px 0 8px; }
 #spend-figure { width: 100%; height: var(--spend-figure-h); }
 
@@ -348,7 +342,6 @@ main {
 @media (max-width: 1100px) {
   :root {
     --ts-figure-h: 940px;
-    --sankey-figure-h: 360px;
     --spend-figure-h: 280px;
   }
 }
@@ -357,7 +350,6 @@ main {
 @media (max-width: 760px) {
   :root {
     --ts-figure-h: 820px;
-    --sankey-figure-h: 320px;
     --spend-figure-h: 260px;
   }
 
@@ -541,7 +533,6 @@ main {
   .panel-events { padding: 8px; }
 
   .panel-charts,
-  .panel-sankey-today,
   .panel-spend,
   .panel-loads,
   .panel-events {

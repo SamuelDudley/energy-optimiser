@@ -17,9 +17,7 @@
 //
 // Layout: one Plotly figure (#ts-figure) holds 6 stacked subplots that
 // share a single x-axis: prices, decision ribbon, solar, SOC, grid,
-// cost. A second figure (#sankey-today-figure) holds the today/range
-// energy-flow Sankey, summed from telemetry. Status strip and loads /
-// events are plain DOM.
+// cost. Status strip and loads / events are plain DOM.
 
 "use strict";
 
@@ -52,50 +50,6 @@ const FUTURE_HORIZON_MS = 48 * 3600 * 1000;          // x-axis right edge
 const HISTORY_REFRESH_MS = 150_000;
 
 const TOKEN_LS_KEY = "eo_dashboard_token";
-
-// Sankey nodes. Index order matters — referenced by source/target.
-// Labels are made distinct (Plotly groups same-labelled nodes oddly in
-// some layouts, and "Battery" appears as both a source and a sink).
-//
-// `x`/`y` are explicit so the solver always renders sources on the
-// left and sinks on the right with a fixed top-to-bottom order:
-//   LEFT  (top → bottom): PV, Battery, Grid
-//   RIGHT (top → bottom): Battery, House, Grid
-// `arrangement: "fixed"` (set in buildSankeyTrace) makes Plotly honour
-// these exactly. Coordinates avoid 0 and 1 because nodes drawn at the
-// extreme borders are clipped to single-pixel slivers.
-const SANKEY_NODES = [
-  { name: "PV",                      x: 0.01, y: 0.05 }, // 0
-  { name: "Grid (import)",           x: 0.01, y: 0.95 }, // 1
-  { name: "Battery (discharging)",   x: 0.01, y: 0.50 }, // 2 — source side
-  { name: "House",                   x: 0.99, y: 0.50 }, // 3
-  { name: "Battery (charging)",      x: 0.99, y: 0.05 }, // 4 — sink side
-  { name: "Grid (export)",           x: 0.99, y: 0.95 }, // 5
-];
-const SANKEY_NODE_COLORS = [
-  "#f2cc60",  // PV
-  "#f0883e",  // grid in
-  "#79c0ff",  // batt out
-  "#c9d1d9",  // house
-  "#79c0ff",  // batt in
-  "#56d364",  // grid out
-];
-// Each link entry: [sourceIdx, targetIdx, color, label]
-const SANKEY_LINK_DEFS = [
-  [0, 3, "rgba(242,204, 96, 0.45)", "PV → House"],
-  [0, 4, "rgba(242,204, 96, 0.45)", "PV → Battery"],
-  [0, 5, "rgba(242,204, 96, 0.45)", "PV → Export"],
-  [1, 3, "rgba(240,136, 62, 0.45)", "Grid → House"],
-  [1, 4, "rgba(240,136, 62, 0.45)", "Grid → Battery"],
-  [2, 3, "rgba(121,192,255, 0.45)", "Battery → House"],
-  [2, 5, "rgba(121,192,255, 0.45)", "Battery → Export"],
-];
-
-// Below this kW magnitude, treat a flow as numerical noise and hide it
-// from the Sankey. Conservative — small flows shouldn't dominate the
-// view but should still be visible. 30 W is below the inverter's
-// readability for most channels.
-const SANKEY_NOISE_KW = 0.03;
 
 // Service-state value (string, from /readyz) → CSS class for the badge.
 const STATE_CLASS = {
@@ -187,7 +141,7 @@ const state = {
   // the past, no snapshot forward overlay, x-axis fixed to the range.
   range: null,
   activePreset: "live",
-  built: { ts: false, sankeyToday: false, spend: false },
+  built: { ts: false, spend: false },
 };
 
 function isHistorical() { return state.range != null; }
@@ -422,51 +376,6 @@ function ensureToken() {
   }
   state.token = t.trim();
   return true;
-}
-
-// ── Data: priority-cascade disambiguation for measured Sankey ──────
-
-function disambiguateFlows({ pv, batt, grid, load }) {
-  // pv ≥ 0, batt signed (+ charge / − discharge), grid signed (+ import
-  // / − export), load ≥ 0. If any required input is null, return null —
-  // we won't synthesise a balance from incomplete signals.
-  if (pv == null || batt == null || grid == null || load == null) return null;
-  if (![pv, batt, grid, load].every(Number.isFinite)) return null;
-
-  let pvRem = Math.max(pv, 0);
-  let loadRem = Math.max(load, 0);
-  const out = {
-    pv_to_load: 0, pv_to_batt: 0, pv_to_export: 0,
-    grid_to_load: 0, grid_to_batt: 0,
-    batt_to_load: 0, batt_to_export: 0,
-  };
-
-  // 1) PV → Load
-  out.pv_to_load = Math.min(pvRem, loadRem);
-  pvRem  -= out.pv_to_load;
-  loadRem -= out.pv_to_load;
-
-  // 2) Charge path (battery is a sink): PV first, then grid.
-  if (batt > 0) {
-    out.pv_to_batt = Math.min(pvRem, batt);
-    pvRem -= out.pv_to_batt;
-    out.grid_to_batt = Math.max(0, batt - out.pv_to_batt);
-  }
-
-  // 3) Discharge path (battery is a source): house load first, then export.
-  if (batt < 0) {
-    const dis = -batt;
-    out.batt_to_load = Math.min(dis, loadRem);
-    loadRem -= out.batt_to_load;
-    out.batt_to_export = Math.max(0, dis - out.batt_to_load);
-  }
-
-  // 4) Grid serves remaining load.
-  out.grid_to_load = Math.max(0, loadRem);
-  // 5) PV exports whatever's left.
-  out.pv_to_export = Math.max(0, pvRem);
-
-  return out;
 }
 
 // ── Cursor model ───────────────────────────────────────────────────
@@ -1212,160 +1121,6 @@ function redrawCursorLine() {
   });
 }
 
-// ── Sankey ─────────────────────────────────────────────────────────
-
-// Plotly Sankey collapses links with value=0, which would make absent
-// flows disappear. We always emit all 7 link defs (so every source ↔
-// sink relationship is visible at all times, growing/shrinking rather
-// than appearing/disappearing) by clamping to a tiny epsilon when the
-// real flow is sub-noise. The label/hover still shows the actual value
-// (which is rendered as 0.00 below the noise floor).
-const SANKEY_LINK_EPSILON = 1e-3;
-
-function buildSankeyTrace(flows, unit = "kW", precision = 2) {
-  const valuesByDef = [
-    flows.pv_to_load,
-    flows.pv_to_batt,
-    flows.pv_to_export,
-    flows.grid_to_load,
-    flows.grid_to_batt,
-    flows.batt_to_load,
-    flows.batt_to_export,
-  ];
-  const sources = [], targets = [], values = [], colors = [], labels = [];
-  for (let i = 0; i < SANKEY_LINK_DEFS.length; i++) {
-    const raw = valuesByDef[i];
-    const real = (raw != null && Number.isFinite(raw) && raw > 0) ? raw : 0;
-    const [s, t, c, lbl] = SANKEY_LINK_DEFS[i];
-    sources.push(s); targets.push(t);
-    values.push(Math.max(real, SANKEY_LINK_EPSILON));
-    colors.push(c);
-    labels.push(`${lbl}: ${real.toFixed(precision)} ${unit}`);
-  }
-  return {
-    type: "sankey",
-    // `fixed` honours the explicit node.x / node.y exactly — no
-    // re-ordering by the solver. This keeps the vertical layout stable
-    // (left: PV / Battery / Grid; right: Battery / House / Grid) so the
-    // diagram is comparable across ticks and across the cursor / today
-    // figures, regardless of which links are dominant in any given tick.
-    arrangement: "fixed",
-    orientation: "h",
-    node: {
-      label: SANKEY_NODES.map((n) => n.name),
-      color: SANKEY_NODE_COLORS,
-      x: SANKEY_NODES.map((n) => n.x),
-      y: SANKEY_NODES.map((n) => n.y),
-      pad: 18, thickness: 16,
-      line: { color: "#0e1116", width: 0.5 },
-    },
-    link: {
-      source: sources, target: targets, value: values,
-      color: colors, label: labels,
-      hovertemplate: "%{label}<extra></extra>",
-    },
-  };
-}
-
-function sankeyLayout() {
-  const narrow = isNarrowViewport();
-  return {
-    margin: narrow
-      ? { l: 4, r: 4, t: 4, b: 4 }
-      : { l: 12, r: 12, t: 12, b: 12 },
-    paper_bgcolor: "#161b22",
-    font: { color: "#e8edf2", size: 12, family: FONT_FAMILY },
-  };
-}
-
-// Sum disambiguated kW flows over today's telemetry rows (since local
-// midnight) → kWh per link. Each row covers `telemetry_write_interval_s`
-// (5 min by default), so dt is ~constant per row; this is fine for a
-// rolling daily total even if the service was restarted mid-day.
-// Returns null if no rows lie in today's window.
-function dailyFlowsKWh() {
-  const rows = state.history.rows || [];
-  if (!rows.length) return null;
-  // Window: in historical mode use the picked range; live mode uses
-  // local midnight → now.
-  let sinceMs, untilMs;
-  if (state.range) {
-    sinceMs = +state.range.from;
-    untilMs = +state.range.to;
-  } else {
-    const now = new Date();
-    const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    sinceMs = +localMidnight;
-    untilMs = +now;
-  }
-
-  const totals = {
-    pv_to_load: 0, pv_to_batt: 0, pv_to_export: 0,
-    grid_to_load: 0, grid_to_batt: 0,
-    batt_to_load: 0, batt_to_export: 0,
-  };
-  let counted = 0;
-  // Step through the rows; each row's dt is the gap to the *next* row,
-  // capped at 5 min so a missing-row gap doesn't inflate today's total.
-  // The final row uses (now - r.ts) clamped the same way, so totals
-  // track real time without an artificial trailing zero.
-  const MAX_DT_H = 5 / 60;       // 5 minutes
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    const tMs = +new Date(r.ts);
-    if (tMs < sinceMs || tMs >= untilMs) continue;
-    const tNextMs = (i + 1 < rows.length) ? +new Date(rows[i + 1].ts) : untilMs;
-    const dtH = Math.min(MAX_DT_H, Math.max(0, (tNextMs - tMs) / 3600_000));
-    if (dtH <= 0) continue;
-    const flows = disambiguateFlows({
-      pv: r.pv_kw, batt: r.battery_kw,
-      grid: r.grid_kw, load: r.house_load_kw,
-    });
-    if (!flows) continue;
-    for (const k of Object.keys(totals)) totals[k] += flows[k] * dtH;
-    counted++;
-  }
-  if (counted === 0) return null;
-  return { flows: totals, counted };
-}
-
-async function redrawDailySankey() {
-  const div = document.getElementById("sankey-today-figure");
-  const subtitle = document.getElementById("sankey-today-subtitle");
-  if (!div) return;
-  const result = dailyFlowsKWh();
-  // Update the panel heading: "Today" in live mode, "Range" in historical.
-  const headingEl = document.getElementById("sankey-today-heading");
-  if (headingEl) headingEl.textContent = state.range ? "Range total" : "Today";
-
-  if (!result) {
-    subtitle.textContent = state.range
-      ? "no telemetry in range" : "no telemetry yet today";
-    if (state.built.sankeyToday) Plotly.purge(div);
-    state.built.sankeyToday = false;
-    return;
-  }
-  // Total energy in (PV generation + grid import) is a reasonable
-  // single-number summary for the subtitle.
-  const f = result.flows;
-  const pvTotal = f.pv_to_load + f.pv_to_batt + f.pv_to_export;
-  const gridIn = f.grid_to_load + f.grid_to_batt;
-  const gridOut = f.pv_to_export + f.batt_to_export;
-  const prefix = state.range
-    ? `${fmtRangeShort(state.range)} · `
-    : "since 00:00 · ";
-  subtitle.textContent =
-    `${prefix}PV ${pvTotal.toFixed(1)} kWh · ` +
-    `import ${gridIn.toFixed(1)} kWh · export ${gridOut.toFixed(1)} kWh`;
-  const trace = buildSankeyTrace(f, "kWh", 1);
-  Plotly.purge(div);
-  await Plotly.newPlot(div, [trace], sankeyLayout(), {
-    responsive: true, displaylogo: false,
-  });
-  state.built.sankeyToday = true;
-  window.eoChart.registerPlot("sankey-today-figure");
-}
-
 // ── Daily spend panel ──────────────────────────────────────────────
 
 function redrawDailySpend() {
@@ -1440,7 +1195,6 @@ async function applySnapshot(snap) {
   // refresh because they reflect live operational state.
   if (!isHistorical()) {
     await redrawTSFigure();
-    await redrawDailySankey();
     await redrawDailySpend();
   }
 }
@@ -1643,7 +1397,6 @@ async function refreshLiveHistory({ force = false } = {}) {
   if (!force && Date.now() - state.history.loadedAt < HISTORY_REFRESH_MS) return;
   await loadHistory();
   await redrawTSFigure();
-  await redrawDailySankey();
   await redrawDailySpend();
 }
 
@@ -1785,7 +1538,6 @@ async function applyRange(range, presetName = null) {
   // (status strip, loads) keep showing live state regardless of mode.
   renderCursorReadout();
   await redrawTSFigure();
-  await redrawDailySankey();
   await redrawDailySpend();
 }
 
@@ -1838,7 +1590,6 @@ async function main() {
   window.eoChart.onBreakpointChange(() => {
     if (state.built.ts) redrawTSFigure();
     if (spendChart) redrawDailySpend();
-    if (state.built.sankeyToday) redrawDailySankey();
   });
 
   if (!ensureToken()) return;
