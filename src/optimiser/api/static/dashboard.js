@@ -39,6 +39,7 @@ import { buildUnionX, alignSeries } from "./timeline.js";
 import { bandColumns } from "./bands.js";
 import { buildTsFigure } from "./panels.js";
 import { wireCursor } from "./cursor.js";
+import { buildSpendChart } from "./spend-chart.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -1109,6 +1110,8 @@ function computeXRange() {
 // pinned-cursor state survive. Membership of conditional series is fixed at
 // build time; if it must change we tear down and rebuild (see below).
 let tsFigure = null;
+// uPlot spend chart instance (built once, updated via .update()).
+let spendChart = null;
 // Snapshot of which conditional series were present at build time, so we can
 // detect a membership change and trigger a rebuild rather than crash uPlot.
 let tsMembership = null;
@@ -1365,7 +1368,7 @@ async function redrawDailySankey() {
 
 // ── Daily spend panel ──────────────────────────────────────────────
 
-async function redrawDailySpend() {
+function redrawDailySpend() {
   const div = document.getElementById("spend-figure");
   const subtitle = document.getElementById("spend-subtitle");
   if (!div) return;
@@ -1373,20 +1376,18 @@ async function redrawDailySpend() {
   const rows = state.history.dailySpend || [];
   if (rows.length === 0) {
     subtitle.textContent = "no settled bill data yet";
-    if (state.built.spend) Plotly.purge(div);
-    state.built.spend = false;
+    if (spendChart) {
+      spendChart.destroy();
+      spendChart = null;
+      state.built.spend = false;
+    }
     return;
   }
 
   // /daily_spend returns DESC by nem_date; we want ASC for the bar chart
   // so the most recent day is at the right.
   const asc = [...rows].sort((a, b) => a.nem_date.localeCompare(b.nem_date));
-  const dates = asc.map((r) => r.nem_date);
-  const importCost   = asc.map((r) => r.import_cost_aud);
-  // Show export revenue as a NEGATIVE bar: visually below zero, the
-  // savings dipping the day's bar down toward (or past) zero.
-  const exportRev    = asc.map((r) => r.export_revenue_aud != null ? -r.export_revenue_aud : null);
-  const netCost      = asc.map((r) => r.net_cost_aud);
+  const netCost = asc.map((r) => r.net_cost_aud);
 
   // Subtitle: 30-day net total (or whatever's available) + average.
   const netVals = netCost.filter((v) => v != null && Number.isFinite(v));
@@ -1395,114 +1396,22 @@ async function redrawDailySpend() {
   subtitle.textContent =
     `${asc.length} days · net $${total.toFixed(2)} · avg $${avg.toFixed(2)}/day`;
 
-  const traces = [
-    {
-      type: "bar",
-      x: dates,
-      y: importCost,
-      name: "import cost",
-      marker: { color: "#f0883e" },
-      hovertemplate: "%{x}<br>import cost $%{y:.2f}<extra></extra>",
-    },
-    {
-      type: "bar",
-      x: dates,
-      y: exportRev,
-      name: "export revenue",
-      marker: { color: "#56d364" },
-      hovertemplate: "%{x}<br>export revenue $%{customdata:.2f}<extra></extra>",
-      customdata: asc.map((r) => r.export_revenue_aud ?? 0),
-    },
-    {
-      type: "scatter",
-      mode: "lines+markers",
-      x: dates,
-      y: netCost,
-      name: "net (bill)",
-      line: { color: "#bc8cff", width: 2 },
-      marker: { color: "#bc8cff", size: 5 },
-      hovertemplate: "%{x}<br>net $%{y:.2f}<extra></extra>",
-    },
-  ];
-
-  const narrow = isNarrowViewport();
-  const layout = {
-    margin: narrow
-      ? { l: 32, r: 4,  t: 22, b: 32 }
-      : { l: 50, r: 16, t: 26, b: 40 },
-    paper_bgcolor: "#161b22",
-    plot_bgcolor: "#161b22",
-    font: { color: "#e8edf2", family: FONT_FAMILY, size: 12 },
-    // Categorical x-axis — "zoom" is the desktop default; on narrow we
-    // disable drag so vertical touch-scroll keeps the page moving.
-    ...window.eoChart.mobileLayoutFragment({ desktopDrag: "zoom" }),
-    barmode: "relative",
-    showlegend: true,
-    legend: {
-      orientation: "h", x: 0, y: 1.10,
-      font: { family: FONT_FAMILY, size: 11, color: "#c9d1d9" },
-    },
-    hovermode: "x unified",
-    hoverlabel: HOVER_LABEL,
-    shapes: spendCursorShapes(dates),
-    xaxis: {
-      type: "category",
-      gridcolor: "#21262d",
-      tickfont: { size: 11, color: "#c9d1d9" },
-      tickcolor: "#444c56",
-      ticklen: 3,
-      automargin: true,
-    },
-    yaxis: {
-      title: { text: "AUD / day", font: { size: 11, color: "#7d8590" }, standoff: 6 },
-      gridcolor: "#21262d",
-      zeroline: true,
-      zerolinecolor: "#444c56",
-      tickfont: { size: 12, color: "#c9d1d9" },
-      tickcolor: "#444c56",
-      ticklen: 3,
-      automargin: true,
-    },
-  };
-
-  if (!state.built.spend) {
-    await Plotly.newPlot(div, traces, layout, window.eoChart.mobileConfig());
+  // Build the uPlot chart once; subsequent calls just update data.
+  if (!spendChart) {
+    spendChart = buildSpendChart(div);
     state.built.spend = true;
-    window.eoChart.registerPlot("spend-figure");
-  } else {
-    await Plotly.react(div, traces, layout);
   }
+
+  const cursorNemDate = toNemDate(effectiveCursor());
+  spendChart.update(asc, cursorNemDate);
 }
 
-// Translucent overlay highlighting the spend bar that matches the
-// time-series cursor's NEM date. `dates` is the list of category
-// labels (YYYY-MM-DD) currently on the x-axis; the shape is anchored
-// at the matching category, padded ±0.45 either side so it covers the
-// bar group without bleeding into neighbours.
-function spendCursorShapes(dates) {
-  const cursorT = effectiveCursor();
-  if (!cursorT || !dates || !dates.length) return [];
-  const target = toNemDate(cursorT);
-  const idx = dates.indexOf(target);
-  if (idx < 0) return [];
-  return [{
-    type: "rect", xref: "x", yref: "paper",
-    x0: idx - 0.45, x1: idx + 0.45, y0: 0, y1: 1,
-    fillcolor: "rgba(88,166,255,0.12)",
-    line: { color: "#58a6ff", width: 1 },
-    layer: "above",
-  }];
-}
-
-// Cheap cursor-only relayout — called from setCursor. Avoids rebuilding
-// traces (a full redraw of dailySpend is dozens of bars + a line).
+// Cheap cursor-only highlight update — called from setCursor. Avoids
+// rebuilding data (a full update is dozens of bars + a line).
 function redrawSpendCursor() {
-  if (!state.built.spend) return;
-  const div = document.getElementById("spend-figure");
-  const rows = state.history.dailySpend || [];
-  const asc = [...rows].sort((a, b) => a.nem_date.localeCompare(b.nem_date));
-  const dates = asc.map((r) => r.nem_date);
-  Plotly.relayout(div, { shapes: spendCursorShapes(dates) });
+  if (!spendChart) return;
+  const cursorNemDate = toNemDate(effectiveCursor());
+  spendChart.setHighlight(cursorNemDate);
 }
 
 // ── Live snapshot stream + auto-refresh ────────────────────────────
@@ -1928,7 +1837,7 @@ async function main() {
   // resizes — it doesn't re-evaluate the narrow-viewport branch.
   window.eoChart.onBreakpointChange(() => {
     if (state.built.ts) redrawTSFigure();
-    if (state.built.spend) redrawDailySpend();
+    if (spendChart) redrawDailySpend();
     if (state.built.sankeyToday) redrawDailySankey();
   });
 
