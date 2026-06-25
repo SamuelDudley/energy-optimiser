@@ -1593,8 +1593,14 @@ async function main() {
   // re-run the layout for each plot so the chart-margin and dragmode
   // overrides flip in/out cleanly.
   onBreakpointChange(() => {
-    if (state.built.ts) redrawTSFigure();
-    if (spendChart) redrawDailySpend();
+    // Force a full rebuild so the narrow-aware y-gutters / margins re-evaluate
+    // (they're read from isNarrow() at build time; update() alone won't change
+    // them). Breakpoint crosses are rare (rotation / window resize), so the
+    // teardown cost is fine.
+    if (tsFigure) { tsFigure.destroy(); tsFigure = null; tsMembership = null; state.built.ts = false; }
+    if (spendChart) { spendChart.destroy(); spendChart = null; state.built.spend = false; }
+    redrawTSFigure();
+    redrawDailySpend();
   });
 
   if (!ensureToken()) return;
