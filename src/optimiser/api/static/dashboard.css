@@ -208,7 +208,33 @@ main {
   grid-column: 1 / span 2;
   padding: 4px 4px 0 4px;
 }
-#ts-figure { width: 100%; height: var(--ts-figure-h); }
+/* #ts-figure is the flex column the panels.js assembler fills with one
+   .uplot-panel child per PANEL_LAYOUT entry. Each child's flex-grow is set
+   from the panel's height fraction so the column fills --ts-figure-h. */
+#ts-figure {
+  width: 100%;
+  height: var(--ts-figure-h);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: relative;
+  touch-action: pan-y;
+}
+#ts-figure .uplot-panel { width: 100%; min-height: 0; }
+#ts-figure .ribbon-tooltip {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  background: #161b22;
+  border: 1px solid #444c56;
+  color: #e8edf2;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 5;
+  white-space: nowrap;
+}
 
 /* Daily Sankey spans the full row — the per-tick cursor Sankey was
    removed, so today's totals can use the full panel width. */

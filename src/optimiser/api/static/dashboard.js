@@ -35,6 +35,9 @@ import {
 import {
   LOAD_PALETTE, colorForLoadId, hexToRgba, marginalCost,
 } from "./derive.js";
+import { buildUnionX, alignSeries } from "./timeline.js";
+import { bandColumns } from "./bands.js";
+import { buildTsFigure } from "./panels.js";
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -779,59 +782,27 @@ function escapeHtml(s) {
 
 // ── Time-series figure ────────────────────────────────────────────
 
-function panelDomains() {
-  // Returns { id: [yLow, yHigh] } with PANEL_GAP between panels.
-  // Panels listed top-to-bottom; domain values are 0=bottom, 1=top.
-  const totalGaps = (PANEL_LAYOUT.length - 1) * PANEL_GAP;
-  const totalH = PANEL_LAYOUT.reduce((a, p) => a + p.height, 0);
-  const scale = (1 - totalGaps) / totalH;
-  let cursor = 1;
-  const domains = {};
-  for (const p of PANEL_LAYOUT) {
-    const h = p.height * scale;
-    const top = cursor;
-    const bot = cursor - h;
-    domains[p.id] = [bot, top];
-    cursor = bot - PANEL_GAP;
-  }
-  return domains;
-}
 
-function buildTraces() {
+// ── uPlot model builder ────────────────────────────────────────────────────
+//
+// Build the `model` consumed by buildTsFigure (panels.js). Mirrors the data
+// SOURCES of buildTraces() exactly (same state/snapshot/history fields, same
+// merge/coalesce/marginalCost helpers), but emits columns aligned to ONE
+// shared unionX (epoch seconds) via alignSeries — never Plotly traces. All
+// panel instances render against model.unionX; never per-panel-trim x.
+//
+// Returns null when there is nothing to render (mirrors buildTraces' early
+// returns), so the caller can skip the figure build.
+function buildModel() {
   const snap = state.snapshot;
   const hist = state.history.rows;
-  // In historical mode the snapshot's forward_trajectory / price_forecast
-  // / pv_forecast all describe "now + 48h" — irrelevant to a past range
-  // and confusing if rendered. We require a snapshot in live mode (so the
-  // time-series traces have a current frame of reference); historical
-  // mode renders from telemetry alone.
-  if (!isHistorical() && !snap) return [];
-  if (isHistorical() && hist.length === 0) return [];
+  if (!isHistorical() && !snap) return null;
+  if (isHistorical() && hist.length === 0) return null;
 
-  // ── Past series (from telemetry) ──
-  // Timestamps are converted to local-naive at trace boundary. Past +
-  // future arrays are kept aligned by index — the conversion is the
-  // last step before they go to Plotly.
-  const pastTs = hist.map((r) => toPlotlyTime(r.ts));
-  const importPast  = hist.map((r) => r.import_price);
-  const exportPast  = hist.map((r) => r.export_price);
-  const pvPast      = hist.map((r) => r.pv_kw);
-  const socPast     = hist.map((r) => r.soc_pct);
-  const loadPast    = hist.map((r) => r.house_load_kw);
-  const gridImpPast = hist.map((r) => r.grid_kw != null ? Math.max(0,  r.grid_kw) : null);
-  const gridExpPast = hist.map((r) => r.grid_kw != null ? Math.max(0, -r.grid_kw) : null);
-  const costPast    = hist.map((r) => marginalCost(r.import_price, r.export_price, r.grid_kw));
-
-  // ── Future series (from snapshot) ──
-  // Empty in historical mode — the snapshot's forward arrays describe
-  // "now + 48h" and would either render outside the fixed x-range or
-  // (worse) drag the x-range into the live present.
+  // ── Future side (snapshot forward trajectory) ──
   const fwd = isHistorical() ? [] : (snap?.lp_solution?.forward_trajectory || []);
-  const slotTs = fwd.map((s) => toPlotlyTime(s.slot_start));
 
-  // Past forecasts (from /price_forecast_log + /pv_forecast_log) get
-  // joined with the snapshot's current+future arrays. The latest-forecast
-  // bucketing happens in loadHistory(); here we just concatenate.
+  // ── Merged forecasts (price + PV) — past log + snapshot future ──
   const pastPriceFC = state.history.priceForecast;
   const futurePriceFC = isHistorical() ? [] : (snap?.price_forecast || []);
   const priceFCMerged = mergePriceForecasts(pastPriceFC, futurePriceFC);
@@ -840,418 +811,264 @@ function buildTraces() {
   const futurePVFC = isHistorical() ? [] : (snap?.pv_forecast || []);
   const pvFCMerged = mergePVForecasts(pastPVFC, futurePVFC);
 
-  const priceTsFut = priceFCMerged.map((p) => toPlotlyTime(p.start));
-  const importFut  = priceFCMerged.map((p) => coalesce(p.forecast_predicted, p.import_per_kwh));
-  const exportFut  = priceFCMerged.map((p) => coalesce(p.export_forecast_predicted, p.export_per_kwh));
+  // ── Build the single ascending union-x (epoch seconds) ──
+  // Sources: past telemetry ts, future slot starts, merged price/pv forecast
+  // starts, pv-actual period_ends, settled-cost ts.
+  const settledCost = aggregateAmberUsageCostsPerSlotSec(state.history.amberUsage);
+  const unionX = buildUnionX(
+    hist.map((r) => toEpochSec(r.ts)),
+    fwd.map((s) => toEpochSec(s.slot_start)),
+    priceFCMerged.map((p) => toEpochSec(p.start)),
+    pvFCMerged.map((p) => toEpochSec(p.start)),
+    pastPVFC.map((p) => toEpochSec(p.period_end)),
+    settledCost.xSec,
+  );
 
-  const pvTsFut = pvFCMerged.map((p) => toPlotlyTime(p.start));
-  const pvP50 = pvFCMerged.map((p) => p.pv_estimate_kw);
-  const pvP10 = pvFCMerged.map((p) => p.pv_estimate10_kw);
-  const pvP90 = pvFCMerged.map((p) => p.pv_estimate90_kw);
-  // PV measured (from pv_forecast_log.actual_kw, backfilled by Solcast's
-  // estimated-actuals job). Falls back to telemetry pv_kw averaged into
-  // 30-min buckets — but that backfill isn't always run, so just use
-  // actual_kw where present.
-  const pvActualPast = pastPVFC.map((p) => p.actual_kw);
-  const pvActualPastTs = pastPVFC.map((p) => toPlotlyTime(p.period_end));
+  // ── PRICE panel ──
+  // Realised (telemetry) import/export; predicted (merged forecast) import/export.
+  const importRealised = alignSeries(unionX, hist, (r) => toEpochSec(r.ts), (r) => r.import_price);
+  const exportRealised = alignSeries(unionX, hist, (r) => toEpochSec(r.ts), (r) => r.export_price);
+  const importPredicted = alignSeries(
+    unionX, priceFCMerged, (p) => toEpochSec(p.start),
+    (p) => coalesce(p.forecast_predicted, p.import_per_kwh));
+  const exportPredicted = alignSeries(
+    unionX, priceFCMerged, (p) => toEpochSec(p.start),
+    (p) => coalesce(p.export_forecast_predicted, p.export_per_kwh));
+  const importBand = bandColumns(priceFCMerged, "forecast_low", "forecast_high",
+    unionX, (p) => toEpochSec(p.start));
+  const exportBand = bandColumns(priceFCMerged, "export_forecast_low", "export_forecast_high",
+    unionX, (p) => toEpochSec(p.start));
 
-  const socFut = fwd.map((s) => s.soc_pct_end);
-  const gridImpFut = fwd.map((s) => s.grid_import_kw ?? null);
-  const gridExpFut = fwd.map((s) => -(s.grid_export_kw ?? 0)); // negative for symmetry
-  // Reconstruct planned house+managed load from the slot's energy balance.
-  // System balance: pv_to_house + bat_discharge + grid_import - grid_to_battery
-  //                 - (grid_export - pv_to_export)  ==  house_base + load_total
-  // Battery share of export = grid_export - pv_to_export, subtracted because
-  // that part of the discharge leaves the meter, it doesn't serve load.
-  const loadFut = fwd.map((s) => {
+  // ── PV panel ──
+  const pvP50 = alignSeries(unionX, pvFCMerged, (p) => toEpochSec(p.start), (p) => p.pv_estimate_kw);
+  const pvMeasured = alignSeries(unionX, hist, (r) => toEpochSec(r.ts), (r) => r.pv_kw);
+  const pvBand = bandColumns(pvFCMerged, "pv_estimate10_kw", "pv_estimate90_kw",
+    unionX, (p) => toEpochSec(p.start));
+  // PV actual (Solcast estimated-actuals) keyed by period_end. Conditional —
+  // null column if all-null (panels.js drops the markers series at build time).
+  const pvActualAligned = alignSeries(unionX, pastPVFC, (p) => toEpochSec(p.period_end), (p) => p.actual_kw);
+  const pvActual = pvActualAligned.some((v) => v != null) ? pvActualAligned : null;
+
+  // ── SOC panel ──
+  const socMeasured = alignSeries(unionX, hist, (r) => toEpochSec(r.ts), (r) => r.soc_pct);
+  const socPlanned = alignSeries(unionX, fwd, (s) => toEpochSec(s.slot_start), (s) => s.soc_pct_end);
+  const floorPct = (() => {
+    const f = state.config?.battery?.soc_floor_pct;
+    return f != null && Number.isFinite(f) ? f : null;
+  })();
+
+  // ── LOAD panel ──
+  // Per-managed-load stacked areas. IDs sorted lexically for deterministic
+  // stacking; OBSERVABLE-category ids excluded (they belong on GRID).
+  const loadRows = state.history.loadTelemetry || [];
+  const observableIds = new Set();
+  for (const r of loadRows) {
+    if ((r.category || "").toLowerCase() === "observable") observableIds.add(r.load_id);
+  }
+  // Past per-load value indexed by epoch-sec → { id: power_kw }.
+  const pastLoadByX = new Map();
+  const pastLoadIds = new Set();
+  for (const r of loadRows) {
+    if (observableIds.has(r.load_id)) continue;
+    pastLoadIds.add(r.load_id);
+    const x = toEpochSec(r.ts);
+    if (x == null) continue;
+    if (!pastLoadByX.has(x)) pastLoadByX.set(x, {});
+    pastLoadByX.get(x)[r.load_id] = r.power_kw;
+  }
+  // Future per-load value indexed by epoch-sec → { id: load_kw }.
+  const futLoadByX = new Map();
+  const futLoadIds = new Set();
+  for (const s of fwd) {
+    if (!s.load_kw) continue;
+    const x = toEpochSec(s.slot_start);
+    if (x == null) continue;
+    const m = {};
+    for (const k of Object.keys(s.load_kw)) {
+      if (observableIds.has(k)) continue;
+      futLoadIds.add(k);
+      m[k] = s.load_kw[k];
+    }
+    futLoadByX.set(x, m);
+  }
+  // Union of all (past+future) managed-load ids, sorted lexically.
+  const allLoadIds = [...new Set([...pastLoadIds, ...futLoadIds])].sort();
+  // Per-id raw column (0 where the load is present-in-range but idle, null
+  // outside its data window so the stepped area doesn't bridge past↔future).
+  const perIdRaw = new Map();
+  for (const id of allLoadIds) {
+    perIdRaw.set(id, unionX.map((x) => {
+      const past = pastLoadByX.get(x);
+      if (past) {
+        const v = past[id];
+        return v != null && Number.isFinite(v) ? v : 0;
+      }
+      const fut = futLoadByX.get(x);
+      if (fut && Object.prototype.hasOwnProperty.call(fut, id)) {
+        const v = fut[id];
+        return v != null && Number.isFinite(v) ? v : 0;
+      }
+      // x belongs to a future slot but this load has no entry there, or x is
+      // outside any load row entirely → null (gap).
+      if (fut) return 0;
+      return null;
+    }));
+  }
+  // Cumulative stacked columns (running sum in sorted-id order).
+  const stacks = [];
+  const running = unionX.map(() => null);
+  for (const id of allLoadIds) {
+    const raw = perIdRaw.get(id);
+    const cum = unionX.map((_x, i) => {
+      const v = raw[i];
+      if (v == null) return running[i]; // keep prior running (may be null)
+      running[i] = (running[i] == null ? 0 : running[i]) + v;
+      return running[i];
+    });
+    stacks.push({ id, color: colorForLoadId(id), cum });
+  }
+  // Measured envelope = max(house_load, Σ managed) at each past ts.
+  const loadMeasuredEnv = alignSeries(unionX, hist, (r) => toEpochSec(r.ts), (r) => {
+    const m = r.house_load_kw;
+    if (m == null || !Number.isFinite(m)) return null;
+    const x = toEpochSec(r.ts);
+    const past = pastLoadByX.get(x) || {};
+    let sumManaged = 0;
+    for (const id of allLoadIds) {
+      const v = past[id];
+      if (v != null && Number.isFinite(v)) sumManaged += v;
+    }
+    return Math.max(m, sumManaged);
+  });
+  // Planned envelope from the slot energy balance, clamped ≥ Σ managed-planned.
+  const loadPlannedEnv = alignSeries(unionX, fwd, (s) => toEpochSec(s.slot_start), (s) => {
     const pvToHouse = s.pv_to_house_kw ?? 0;
     const batDischarge = Math.max(0, -(s.battery_kw ?? 0));
     const gridImp = s.grid_import_kw ?? 0;
     const gridToBat = s.grid_to_battery_kw ?? 0;
     const gridExp = s.grid_export_kw ?? 0;
     const pvToExp = s.pv_to_export_kw ?? 0;
-    return pvToHouse + batDischarge + gridImp - gridToBat - (gridExp - pvToExp);
+    const f = pvToHouse + batDischarge + gridImp - gridToBat - (gridExp - pvToExp);
+    let sumManaged = 0;
+    if (s.load_kw) {
+      for (const id of allLoadIds) {
+        const v = s.load_kw[id];
+        if (v != null && Number.isFinite(v)) sumManaged += v;
+      }
+    }
+    if (f == null || !Number.isFinite(f)) return sumManaged > 0 ? sumManaged : null;
+    return Math.max(f, sumManaged);
   });
-  const costFut = fwd.map((s) => {
+
+  // ── GRID panel ──
+  const gridInverter = alignSeries(unionX, hist, (r) => toEpochSec(r.ts), (r) => r.grid_kw);
+  const gridShellyAligned = alignSeries(unionX, hist, (r) => toEpochSec(r.ts), (r) => r.grid_kw_shelly);
+  const gridShelly = gridShellyAligned.some((v) => v != null) ? gridShellyAligned : null;
+  const gridPlanned = alignSeries(unionX, fwd, (s) => toEpochSec(s.slot_start), (s) => {
+    const imp = s.grid_import_kw;
+    const exp = s.grid_export_kw ?? 0;
+    if (imp == null) return null;
+    return imp - exp; // net: import positive, export negative
+  });
+
+  // ── COST panel ──
+  const costRealised = alignSeries(unionX, hist, (r) => toEpochSec(r.ts),
+    (r) => marginalCost(r.import_price, r.export_price, r.grid_kw));
+  const costPlanned = alignSeries(unionX, fwd, (s) => toEpochSec(s.slot_start), (s) => {
     const ip = pickPriceAt(futurePriceFC, s.slot_start, "import");
     const ep = pickPriceAt(futurePriceFC, s.slot_start, "export");
     if (ip == null || ep == null) return null;
     return ip * (s.grid_import_kw ?? 0) - ep * (s.grid_export_kw ?? 0);
   });
-
-  // ── Decision ribbon (heatmap) ──
-  // x are slot starts; y has two values to give the heatmap rectangular
-  // height; z is one row of category indices, one per slot.
-  const ribbonZ = fwd.map((s) => decisionFor(s));
-  const ribbonZPast = hist.map((r) => decisionFromTelemetry(r));
-  const ribbonX = [...pastTs, ...slotTs];
-  const ribbonZRow = [...ribbonZPast, ...ribbonZ];
-
-  // ── Mode ribbon (heatmap) ──
-  // Same x as the decision ribbon but a finer-grained categorisation
-  // along the physical-mode axis: distinguishes mode 2 idle from mode 2
-  // PV-charge, and mode 5 (PV-present) from mode 6 (no PV).
-  const modeZPast = hist.map((r) => modeFromTelemetry(r));
-  const modeZFut  = fwd.map((s) => modeFromSlot(s));
-  const modeZRow  = [...modeZPast, ...modeZFut];
-
-  const traces = [];
-
-  // Prices (yaxis y) — bands drawn first (behind), then the predicted /
-  // realised lines. Each contiguous run of valid (low, high) is its own
-  // `fill: "toself"` polygon trace: forward along LOW, back along HIGH.
-  // One trace per run rather than null-separated runs in a single trace
-  // because Plotly's `toself` closes the polygon across `(null, null)`
-  // separators rather than treating each segment as a distinct closed
-  // shape, which produced visible vertical wedges at run boundaries.
-  for (const poly of bandPolygons(priceFCMerged, "forecast_low", "forecast_high")) {
-    traces.push({
-      x: poly.x, y: poly.y,
-      type: "scatter", mode: "lines",
-      line: { width: 0, color: "rgba(0,0,0,0)" }, fill: "toself",
-      fillcolor: "rgba(240,136,62,0.15)",
-      hoverinfo: "skip", showlegend: false,
-      yaxis: "y", name: "import band",
-    });
-  }
-  for (const poly of bandPolygons(priceFCMerged, "export_forecast_low", "export_forecast_high")) {
-    traces.push({
-      x: poly.x, y: poly.y,
-      type: "scatter", mode: "lines",
-      line: { width: 0, color: "rgba(0,0,0,0)" }, fill: "toself",
-      fillcolor: "rgba(86,211,100,0.15)",
-      hoverinfo: "skip", showlegend: false,
-      yaxis: "y", name: "export band",
-    });
-  }
-  // Three lines per side now:
-  //   • realised — telemetry import_price/export_price (past only)
-  //   • predicted (history) — what Amber forecast at planning time (past)
-  //   • predicted (future) — same field, but from the snapshot
-  // Realised is solid and primary; predicted is a thin dotted overlay so
-  // calibration drift is visible without dominating the panel.
-  traces.push({
-    x: pastTs, y: importPast,
-    type: "scatter", mode: "lines",
-    line: { color: "#f0883e", width: 1.6 },
-    yaxis: "y", name: "import realised", connectgaps: false,
-  });
-  traces.push({
-    x: priceTsFut, y: importFut,
-    type: "scatter", mode: "lines",
-    line: { color: "#f0883e", width: 1.0, dash: "dot" },
-    yaxis: "y", name: "import predicted", connectgaps: false,
-  });
-  traces.push({
-    x: pastTs, y: exportPast,
-    type: "scatter", mode: "lines",
-    line: { color: "#56d364", width: 1.6 },
-    yaxis: "y", name: "export realised", connectgaps: false,
-  });
-  traces.push({
-    x: priceTsFut, y: exportFut,
-    type: "scatter", mode: "lines",
-    line: { color: "#56d364", width: 1.0, dash: "dot" },
-    yaxis: "y", name: "export predicted", connectgaps: false,
-  });
-
-  // Decision ribbon (yaxis y2) — heatmap. Build a stepped colorscale:
-  // each category gets a color held constant across its z-range so
-  // Plotly doesn't interpolate between adjacent categories. Z values are
-  // the exact category indices; zmin/zmax bracket the full range.
-  const decisionVals = Object.values(DECISION);
-  const dMin = 0, dMax = decisionVals.length - 1;
-  const colorscale = [];
-  for (let i = 0; i < decisionVals.length; i++) {
-    const lo = i / decisionVals.length;
-    const hi = (i + 1) / decisionVals.length;
-    const c = DECISION_COLORS[decisionVals[i]];
-    colorscale.push([lo, c]);
-    colorscale.push([hi, c]);
-  }
-  traces.push({
-    x: ribbonX,
-    y: [0, 1],
-    z: [ribbonZRow],
-    type: "heatmap",
-    colorscale,
-    showscale: false,
-    hoverinfo: "text",
-    text: [ribbonZRow.map((v, i) => `${fmtTime(ribbonX[i])} — ${DECISION_LABELS[v] ?? "—"}`)],
-    yaxis: "y2",
-    name: "decision",
-    zmin: dMin, zmax: dMax,
-  });
-
-  // Mode ribbon (yaxis y9) — same heatmap technique with the mode-code
-  // categories. Independent colorscale so the colour vocabulary doesn't
-  // leak from one ribbon to the other.
-  const modeVals = Object.values(MODE);
-  const mMin = 0, mMax = modeVals.length - 1;
-  const modeColorscale = [];
-  for (let i = 0; i < modeVals.length; i++) {
-    const lo = i / modeVals.length;
-    const hi = (i + 1) / modeVals.length;
-    const c = MODE_COLORS[modeVals[i]];
-    modeColorscale.push([lo, c]);
-    modeColorscale.push([hi, c]);
-  }
-  traces.push({
-    x: ribbonX,
-    y: [0, 1],
-    z: [modeZRow],
-    type: "heatmap",
-    colorscale: modeColorscale,
-    showscale: false,
-    hoverinfo: "text",
-    text: [modeZRow.map((v, i) => `${fmtTime(ribbonX[i])} — ${MODE_LABELS[v] ?? "—"}`)],
-    yaxis: "y9",
-    name: "mode",
-    zmin: mMin, zmax: mMax,
-  });
-
-  // Solar (yaxis y3).
-  // P10–P90 confidence band: rendered as `fill: "toself"` polygons so a
-  // partial-null run on either bound (e.g. P10 missing, P90 present)
-  // doesn't kill the whole band — same technique as the price bands.
-  // Each contiguous run becomes one closed polygon: forward along P10,
-  // back along P90.
-  for (const poly of bandPolygons(pvFCMerged, "pv_estimate10_kw", "pv_estimate90_kw")) {
-    traces.push({
-      x: poly.x, y: poly.y,
-      type: "scatter", mode: "lines",
-      line: { width: 0, color: "rgba(0,0,0,0)" }, fill: "toself",
-      fillcolor: "rgba(242,204,96,0.22)",
-      hoverinfo: "skip", showlegend: false,
-      yaxis: "y3", name: "PV P10–P90",
-    });
-  }
-  // Faint dashed bound lines so the band edges are visible even on a
-  // light fill. Half-width of the P50 line.
-  traces.push({
-    x: pvTsFut, y: pvP10, type: "scatter", mode: "lines",
-    line: { color: "rgba(242,204,96,0.45)", width: 0.8, dash: "dot" },
-    hoverinfo: "skip", showlegend: false,
-    yaxis: "y3", name: "PV P10", connectgaps: false,
-  });
-  traces.push({
-    x: pvTsFut, y: pvP90, type: "scatter", mode: "lines",
-    line: { color: "rgba(242,204,96,0.45)", width: 0.8, dash: "dot" },
-    hoverinfo: "skip", showlegend: false,
-    yaxis: "y3", name: "PV P90", connectgaps: false,
-  });
-  traces.push({
-    x: pvTsFut, y: pvP50, type: "scatter", mode: "lines",
-    line: { color: "#f2cc60", width: 1.6, dash: "dot" },
-    yaxis: "y3", name: "PV P50",
-  });
-  traces.push({
-    x: pastTs, y: pvPast, type: "scatter", mode: "lines",
-    line: { color: "#f2cc60", width: 1.6 },
-    yaxis: "y3", name: "PV measured", connectgaps: false,
-  });
-  // Solcast estimated-actuals (30-min) — only renders cells where the
-  // backfill job has populated actual_kw. If all-null, this trace is
-  // empty and silently absent. Distinct dot marker so it's separable
-  // from the inverter-side measured line.
-  if (pvActualPast.some((v) => v != null)) {
-    traces.push({
-      x: pvActualPastTs, y: pvActualPast,
-      type: "scatter", mode: "markers",
-      marker: { color: "#f2cc60", size: 4, symbol: "circle-open" },
-      yaxis: "y3", name: "PV actual (Solcast)",
-    });
+  // Settled cost keyed by epoch sec (already c/h via ×12).
+  let costSettled = null;
+  if (settledCost.xSec.length > 0) {
+    const byX = new Map();
+    for (let i = 0; i < settledCost.xSec.length; i++) byX.set(settledCost.xSec[i], settledCost.y[i]);
+    const aligned = unionX.map((x) => (byX.has(x) ? byX.get(x) : null));
+    if (aligned.some((v) => v != null)) costSettled = aligned;
   }
 
-  // SOC (yaxis y4).
-  traces.push({
-    x: pastTs, y: socPast, type: "scatter", mode: "lines",
-    line: { color: "#79c0ff", width: 1.8 },
-    yaxis: "y4", name: "SOC measured", connectgaps: false,
-  });
-  traces.push({
-    x: slotTs, y: socFut, type: "scatter", mode: "lines",
-    line: { color: "#79c0ff", width: 1.6, dash: "dot" },
-    yaxis: "y4", name: "SOC planned",
-  });
-
-  // Load panel (yaxis y7). Single panel that stacks per-managed-load
-  // contribution beneath the total-load envelope:
-  //
-  //   past   — measured per-load (load_telemetry.power_kw) stacked, with
-  //            the realised total (telemetry.house_load_kw) drawn on top
-  //            as a solid envelope. Implicit gap above the stack reads
-  //            as unmanaged baseload.
-  //   future — LP-committed per-load (fwd[].load_kw[id]) stacked solid,
-  //            against a dotted total = LP's expected load. Solid stack
-  //            beneath dotted ceiling reads as "committed vs forecast"
-  //            without a legend.
-  //
-  // OBSERVABLE-category load_ids (e.g. the grid CT) are measurement-only
-  // and belong on the GRID panel, not here — filtered out.
-  //
-  // Total envelope is clamped up to sum-managed at each point: the inverter
-  // and Shelly instrumentation occasionally drift, and we never want the
-  // stack to poke through the line.
-  const loadRows = state.history.loadTelemetry || [];
-  const observableIds = new Set();
-  for (const r of loadRows) {
-    if ((r.category || "").toLowerCase() === "observable") {
-      observableIds.add(r.load_id);
-    }
+  // ── Ribbons (decision + mode) ──
+  // Single category per unionX slot: realised from telemetry where a past row
+  // exists, else planned from the slot, else UNKNOWN.
+  const pastDecisionByX = new Map();
+  const pastModeByX = new Map();
+  for (const r of hist) {
+    const x = toEpochSec(r.ts);
+    if (x == null) continue;
+    pastDecisionByX.set(x, decisionFromTelemetry(r));
+    pastModeByX.set(x, modeFromTelemetry(r));
   }
-
-  // Past pivot keyed by ms-since-epoch (robust to ISO formatting drift
-  // across the two source tables).
-  const pastByTs = new Map();
-  const pastLoadIds = new Set();
-  for (const r of loadRows) {
-    if (observableIds.has(r.load_id)) continue;
-    pastLoadIds.add(r.load_id);
-    const k = +new Date(r.ts);
-    if (!pastByTs.has(k)) pastByTs.set(k, {});
-    pastByTs.get(k)[r.load_id] = r.power_kw;
-  }
-  const sortedPastIds = [...pastLoadIds].sort();
-  const pastKeyAt = hist.map((r) => +new Date(r.ts));
-
-  // Past stacked managed traces. shape: "hv" so each managed renders as
-  // step blocks consistent with relay on/off semantics.
-  for (const loadId of sortedPastIds) {
-    const y = pastKeyAt.map((k) => {
-      const row = pastByTs.get(k);
-      const v = row ? row[loadId] : undefined;
-      return v != null && Number.isFinite(v) ? v : 0;
-    });
-    const c = colorForLoadId(loadId);
-    traces.push({
-      x: pastTs, y,
-      type: "scatter", mode: "lines",
-      stackgroup: "load-past",
-      line: { color: c, width: 1, shape: "hv" },
-      fillcolor: hexToRgba(c, 0.5),
-      yaxis: "y7", name: `${loadId} measured`,
-    });
-  }
-  // Past total envelope, clamped to ≥ sum-managed.
-  const loadPastClamped = loadPast.map((m, i) => {
-    const k = pastKeyAt[i];
-    const row = pastByTs.get(k) || {};
-    let sumManaged = 0;
-    for (const id of sortedPastIds) {
-      const v = row[id];
-      if (v != null && Number.isFinite(v)) sumManaged += v;
-    }
-    if (m == null || !Number.isFinite(m)) return null;
-    return Math.max(m, sumManaged);
-  });
-  traces.push({
-    x: pastTs, y: loadPastClamped,
-    type: "scatter", mode: "lines",
-    line: { color: "#ff9e64", width: 1.6 },
-    yaxis: "y7", name: "load measured", connectgaps: false,
-  });
-
-  // Future planned-load union. Sort same way for deterministic stacking.
-  const plannedLoadIds = new Set();
+  const futDecisionByX = new Map();
+  const futModeByX = new Map();
   for (const s of fwd) {
-    if (!s.load_kw) continue;
-    for (const k of Object.keys(s.load_kw)) {
-      if (observableIds.has(k)) continue;
-      plannedLoadIds.add(k);
-    }
+    const x = toEpochSec(s.slot_start);
+    if (x == null) continue;
+    futDecisionByX.set(x, decisionFor(s));
+    futModeByX.set(x, modeFromSlot(s));
   }
-  const sortedFutIds = [...plannedLoadIds].sort();
-
-  for (const loadId of sortedFutIds) {
-    const y = fwd.map((s) => {
-      const v = s.load_kw && s.load_kw[loadId];
-      return v != null && Number.isFinite(v) ? v : 0;
-    });
-    const c = colorForLoadId(loadId);
-    traces.push({
-      x: slotTs, y,
-      type: "scatter", mode: "lines",
-      stackgroup: "load-future",
-      line: { color: c, width: 1, dash: "dot", shape: "hv" },
-      fillcolor: hexToRgba(c, 0.32),
-      yaxis: "y7", name: `${loadId} planned`,
-    });
-  }
-  // Future total envelope (dotted), clamped to ≥ sum-managed-planned.
-  const loadFutClamped = fwd.map((s, i) => {
-    let sumManaged = 0;
-    for (const id of sortedFutIds) {
-      const v = s.load_kw && s.load_kw[id];
-      if (v != null && Number.isFinite(v)) sumManaged += v;
-    }
-    const f = loadFut[i];
-    if (f == null || !Number.isFinite(f)) {
-      return sumManaged > 0 ? sumManaged : null;
-    }
-    return Math.max(f, sumManaged);
+  const decisionCats = unionX.map((x) => {
+    if (pastDecisionByX.has(x)) return pastDecisionByX.get(x);
+    if (futDecisionByX.has(x)) return futDecisionByX.get(x);
+    return DECISION.UNKNOWN;
   });
-  traces.push({
-    x: slotTs, y: loadFutClamped,
-    type: "scatter", mode: "lines",
-    line: { color: "#ff9e64", width: 1.4, dash: "dot" },
-    yaxis: "y7", name: "load planned", connectgaps: false,
+  const modeCats = unionX.map((x) => {
+    if (pastModeByX.has(x)) return pastModeByX.get(x);
+    if (futModeByX.has(x)) return futModeByX.get(x);
+    return MODE.UNKNOWN;
   });
 
-  // Grid (yaxis y5) — import positive, export negative.
-  // Two measured sources: the inverter's house-meter register (Modbus
-  // 30004; sensor on the same bus that runs the LP) and the Shelly Pro
-  // EM ch1 CT clamp (independent path; cross-check). Same sign convention.
-  traces.push({
-    x: pastTs, y: hist.map((r) => r.grid_kw),
-    type: "scatter", mode: "lines",
-    line: { color: "#c9d1d9", width: 1.4 },
-    yaxis: "y5", name: "grid measured (inverter)", connectgaps: false,
-  });
-  if (hist.some((r) => r.grid_kw_shelly != null)) {
-    traces.push({
-      x: pastTs, y: hist.map((r) => r.grid_kw_shelly),
-      type: "scatter", mode: "lines",
-      line: { color: "#7ee787", width: 1.0 },
-      yaxis: "y5", name: "grid measured (Shelly)", connectgaps: false,
-    });
+  // ── Shapes: buy/sell regions, now-line, cursor ──
+  const regions = [];
+  for (const s of fwd) {
+    const x0 = toEpochSec(s.slot_start);
+    const x1 = toEpochSec(new Date(+new Date(s.slot_start) + SLOT_MS));
+    if (x0 == null || x1 == null) continue;
+    if ((s.grid_to_battery_kw ?? 0) > DEADBAND_KW) regions.push({ x0, x1, kind: "charge" });
+    if ((s.grid_export_kw ?? 0) > DEADBAND_KW) regions.push({ x0, x1, kind: "export" });
   }
-  traces.push({
-    x: slotTs, y: gridImpFut.map((v, i) => v != null ? v + gridExpFut[i] : null),
-    type: "scatter", mode: "lines",
-    line: { color: "#c9d1d9", width: 1.4, dash: "dot" },
-    yaxis: "y5", name: "grid planned (net)", connectgaps: false,
-  });
+  const nowT = nowFromSnapshot();
+  const nowSec = nowT && !isHistorical() ? toEpochSec(nowT) : null;
+  const cursorT = effectiveCursor();
+  const cursorSec = cursorT ? toEpochSec(cursorT) : null;
 
-  // Cost (yaxis y6).
-  traces.push({
-    x: pastTs, y: costPast,
-    type: "scatter", mode: "lines",
-    line: { color: "#bc8cff", width: 1.4 },
-    yaxis: "y6", name: "cost realised c/h", connectgaps: false,
-  });
-  traces.push({
-    x: slotTs, y: costFut,
-    type: "scatter", mode: "lines",
-    line: { color: "#bc8cff", width: 1.4, dash: "dot" },
-    yaxis: "y6", name: "cost planned c/h", connectgaps: false,
-  });
-  // Settled per-5-min cost from amber_usage. Overlaid as a step line so
-  // the operator can see the bill-level reality alongside the in-tick
-  // marginal estimate. Only covers fully-settled NEM days, so the trace
-  // tail ends ~yesterday-NEM-midnight (= 14:00Z yesterday). Convert
-  // c/5-min → c/h by ×12 to share the y-axis.
-  const settledCost = aggregateAmberUsageCostsPerSlot(state.history.amberUsage);
-  if (settledCost.x.length > 0) {
-    traces.push({
-      x: settledCost.x, y: settledCost.y,
-      type: "scatter", mode: "lines",
-      line: { color: "#ffd700", width: 1.2, shape: "hv" },
-      yaxis: "y6", name: "cost settled c/h", connectgaps: false,
-    });
+  return {
+    unionX,
+    price: {
+      importRealised, importPredicted, exportRealised, exportPredicted,
+      bands: {
+        importLo: importBand.lo, importHi: importBand.hi,
+        exportLo: exportBand.lo, exportHi: exportBand.hi,
+      },
+    },
+    pv: { p50: pvP50, measured: pvMeasured, actual: pvActual, bandLo: pvBand.lo, bandHi: pvBand.hi },
+    soc: { measured: socMeasured, planned: socPlanned, floorPct },
+    load: { stacks, measuredEnv: loadMeasuredEnv, plannedEnv: loadPlannedEnv },
+    grid: { inverter: gridInverter, shelly: gridShelly, planned: gridPlanned },
+    cost: { realised: costRealised, planned: costPlanned, settled: costSettled },
+    decisionCats, modeCats,
+    nowSec, cursorSec, regions, thresholdC: 30,
+  };
+}
+
+// Aggregate amber_usage rows into one net-cost-per-slot column, keyed by
+// epoch SECONDS (for unionX alignment). c/5-min → c/h via ×12. Returns
+// parallel xSec/y arrays sorted ascending. (Seconds variant of the legacy
+// aggregateAmberUsageCostsPerSlot below, which returns Plotly-time strings.)
+function aggregateAmberUsageCostsPerSlotSec(rows) {
+  if (!rows || rows.length === 0) return { xSec: [], y: [] };
+  const byTs = new Map();
+  for (const r of rows) {
+    if (r.cost_cents == null) continue;
+    const cur = byTs.get(r.ts) ?? 0;
+    byTs.set(r.ts, cur + r.cost_cents);
   }
-
-  return traces;
+  const sorted = [...byTs.entries()].sort((a, b) => +new Date(a[0]) - +new Date(b[0]));
+  return {
+    xSec: sorted.map(([ts]) => toEpochSec(ts)),
+    y: sorted.map(([, c]) => c * 12),
+  };
 }
 
 // Aggregate amber_usage rows into one net-cost-per-slot trace. Sum
@@ -1275,245 +1092,109 @@ function aggregateAmberUsageCostsPerSlot(rows) {
   };
 }
 
-// Convert a /price_forecast_log row (past) to PriceInterval-shape so the
-// trace builders treat past + future uniformly. Field renames:
-//   per_kwh         → import_per_kwh
-//   interval_start  → start
-//   interval_end    → end
-// Build closed polygons for `fill: "toself"` band traces. One polygon
-// per contiguous run of intervals where both bounds are non-null,
-// returned as an array — caller renders one trace per polygon. Each
-// polygon walks forward along LOW then back along HIGH so the closing
-// edge is implicit. Returning separate polygons rather than a single
-// (null, null)-separated trace because Plotly's `toself` closes the
-// path across the separator instead of treating each segment as a
-// distinct shape, which produced visible self-crossing artifacts at
-// run boundaries.
-function bandPolygons(intervals, lowKey, highKey) {
-  const polys = [];
-  let runX = [], runLo = [], runHi = [];
-  const flushRun = () => {
-    if (runX.length < 2) {
-      // A single-point polygon is a degenerate vertical line — skip.
-      runX = []; runLo = []; runHi = [];
-      return;
-    }
-    const x = [], y = [];
-    for (let i = 0; i < runX.length; i++) { x.push(runX[i]); y.push(runLo[i]); }
-    for (let i = runX.length - 1; i >= 0; i--) { x.push(runX[i]); y.push(runHi[i]); }
-    polys.push({ x, y });
-    runX = []; runLo = []; runHi = [];
-  };
-  for (const p of intervals) {
-    const L = p[lowKey], H = p[highKey];
-    if (L != null && H != null) {
-      runX.push(toPlotlyTime(p.start));
-      runLo.push(L);
-      runHi.push(H);
-    } else {
-      flushRun();
-    }
-  }
-  flushRun();
-  return polys;
-}
-
-
-// marginalCost imported from derive.js
-
-function buildLayout() {
-  const domains = panelDomains();
-  const xRange = computeXRange();
-  const cursorT = effectiveCursor();
-
-  const shapes = [];
-  // Buy/sell shading on the prices subplot. Coordinates pass through
-  // toPlotlyTime so the rectangle sits at the right local-time x.
-  const fwd = state.snapshot?.lp_solution?.forward_trajectory || [];
-  for (const s of fwd) {
-    const t0 = toPlotlyTime(s.slot_start);
-    const t1 = toPlotlyTime(new Date(+new Date(s.slot_start) + SLOT_MS));
-    if ((s.grid_to_battery_kw ?? 0) > DEADBAND_KW) {
-      shapes.push({
-        type: "rect", xref: "x", yref: "y domain",
-        x0: t0, x1: t1, y0: 0, y1: 1,
-        fillcolor: "rgba(210,153,34,0.10)",
-        line: { width: 0 }, layer: "below",
-      });
-    }
-    if ((s.grid_export_kw ?? 0) > DEADBAND_KW) {
-      shapes.push({
-        type: "rect", xref: "x", yref: "y domain",
-        x0: t0, x1: t1, y0: 0, y1: 1,
-        fillcolor: "rgba(63,185,80,0.10)",
-        line: { width: 0 }, layer: "below",
-      });
-    }
-  }
-
-  // SOC floor line (yaxis y4).
-  const floor = state.config?.battery?.soc_floor_pct;
-  if (floor != null && Number.isFinite(floor)) {
-    shapes.push({
-      type: "line", xref: "paper", yref: "y4",
-      x0: 0, x1: 1, y0: floor, y1: floor,
-      line: { color: "#f85149", width: 1, dash: "dash" },
-    });
-  }
-  // Grid zero-line for the grid panel (helps read +import/−export).
-  shapes.push({
-    type: "line", xref: "paper", yref: "y5",
-    x0: 0, x1: 1, y0: 0, y1: 0,
-    line: { color: "#444c56", width: 0.6 },
-  });
-  // Cost zero-line.
-  shapes.push({
-    type: "line", xref: "paper", yref: "y6",
-    x0: 0, x1: 1, y0: 0, y1: 0,
-    line: { color: "#444c56", width: 0.6 },
-  });
-
-  // "Now" marker — vertical line at the snapshot timestamp (local time).
-  // Hidden in historical mode: "now" lives outside (or anachronistically
-  // inside) the fixed range, and the green dotted line is associated
-  // with the live planning horizon, not with arbitrary timestamps.
-  const nowT = nowFromSnapshot();
-  if (nowT && !isHistorical()) {
-    const nowLocal = toPlotlyTime(nowT);
-    shapes.push({
-      type: "line", xref: "x", yref: "paper",
-      x0: nowLocal, x1: nowLocal, y0: 0, y1: 1,
-      line: { color: "#56d364", width: 1, dash: "dot" },
-      layer: "below",
-    });
-  }
-  // Cursor — single vline spanning all subplots.
-  if (cursorT) {
-    const cursorLocal = toPlotlyTime(cursorT);
-    shapes.push({
-      type: "line", xref: "x", yref: "paper",
-      x0: cursorLocal, x1: cursorLocal, y0: 0, y1: 1,
-      line: { color: "#58a6ff", width: 1.4 },
-      name: "cursor",
-    });
-  }
-
-  // Per-panel labels rendered horizontally at the top-left of each
-  // domain (above the y-axis tick numbers). Replaces the rotated
-  // y-axis titles that were small and hard to scan.
-  const livePrices = currentLivePrices();
-  const annotations = [];
-  for (const p of PANEL_LAYOUT) {
-    const label = p.label;
-    if (!label) continue;
-    let text = p.units
-      ? `<b>${label}</b>  <span style="color:#7d8590">${p.units}</span>`
-      : `<b>${label}</b>`;
-    if (p.id === "prices" && livePrices) {
-      const fmt = (v) => (v == null ? "—" : v.toFixed(1));
-      text +=
-        `  <span style="color:#7d8590">·</span>  ` +
-        `<span style="color:#f0883e">imp ${fmt(livePrices.importCpkwh)}</span>` +
-        `  <span style="color:#56d364">exp ${fmt(livePrices.exportCpkwh)}</span>`;
-    }
-    annotations.push({
-      xref: "paper",
-      yref: `${p.axis} domain`,
-      x: 0,
-      y: 1,
-      xanchor: "left",
-      yanchor: "bottom",
-      yshift: 2,
-      text,
-      showarrow: false,
-      font: { family: FONT_FAMILY, size: 11, color: "#c9d1d9" },
-      align: "left",
-    });
-  }
-
-  const narrow = isNarrowViewport();
-  return {
-    margin: narrow
-      ? { l: 28, r: 6,  t: 22, b: 36 }
-      : { l: 44, r: 20, t: 26, b: 44 },
-    paper_bgcolor: "#161b22",
-    plot_bgcolor: "#161b22",
-    font: { color: "#e8edf2", family: FONT_FAMILY, size: 12 },
-    showlegend: false,
-    hovermode: "x unified",
-    hoverlabel: HOVER_LABEL,
-    // Desktop: drag pans. Mobile: disable drag entirely so vertical
-    // touch-scroll over the figure scrolls the page instead of moving
-    // the x-axis around. Shared helper — see chart-utils.js.
-    ...window.eoChart.mobileLayoutFragment({ desktopDrag: "pan" }),
-    shapes,
-    annotations,
-    xaxis: {
-      type: "date",
-      gridcolor: "#21262d",
-      zeroline: false,
-      range: xRange,
-      domain: [0, 1],
-      anchor: "y6",
-      tickfont: { size: 12, color: "#c9d1d9" },
-      tickcolor: "#444c56",
-      ticklen: 4,
-      automargin: true,
-    },
-    yaxis:  axis(domains.prices),
-    yaxis2: axis(domains.ribbon, { showticklabels: false, showgrid: false, fixedrange: true, range: [0, 1] }),
-    yaxis3: axis(domains.solar),
-    yaxis4: axis(domains.soc, { range: [0, 100] }),
-    yaxis5: axis(domains.grid),
-    yaxis6: axis(domains.cost),
-    yaxis7: axis(domains.load),
-    yaxis9: axis(domains.mode, { showticklabels: false, showgrid: false, fixedrange: true, range: [0, 1] }),
-  };
-}
-
-function axis(domain, extra = {}) {
-  return Object.assign({
-    domain,
-    gridcolor: "#21262d",
-    zeroline: false,
-    tickfont: { size: 12, color: "#c9d1d9" },
-    tickcolor: "#444c56",
-    ticklen: 3,
-    automargin: true,
-  }, extra);
-}
-
 function computeXRange() {
   if (state.range) {
-    return [toPlotlyTime(state.range.from), toPlotlyTime(state.range.to)];
+    return [toEpochSec(state.range.from), toEpochSec(state.range.to)];
   }
   const now = nowFromSnapshot();
   if (!now) return undefined;
   const lo = new Date(+now - HISTORY_LOOKBACK_MS);
   const hi = new Date(+now + FUTURE_HORIZON_MS);
-  return [toPlotlyTime(lo), toPlotlyTime(hi)];
+  return [toEpochSec(lo), toEpochSec(hi)];
 }
 
-async function redrawTSFigure() {
+// The assembled uPlot figure (8 synced panels). Built once on first redraw;
+// subsequent redraws call .update(model) — never a full rebuild — so zoom and
+// pinned-cursor state survive. Membership of conditional series is fixed at
+// build time; if it must change we tear down and rebuild (see below).
+let tsFigure = null;
+// Snapshot of which conditional series were present at build time, so we can
+// detect a membership change and trigger a rebuild rather than crash uPlot.
+let tsMembership = null;
+
+function membershipKey(model) {
+  return [
+    model.pv.actual != null,
+    model.grid.shelly != null,
+    model.cost.settled != null,
+    (model.load.stacks || []).map((s) => s.id).join(","),
+  ].join("|");
+}
+
+// Create one child .uplot-panel div per PANEL_LAYOUT entry inside #ts-figure
+// (the flex column). Heights come from PANEL_LAYOUT[i].height fractions via
+// flex-grow so the column fills the configured --ts-figure-h.
+function assembleTsContainers(root) {
+  root.innerHTML = "";
+  for (const p of PANEL_LAYOUT) {
+    const div = document.createElement("div");
+    div.className = "uplot-panel";
+    div.dataset.panel = p.id;
+    div.style.flexGrow = String(p.height);
+    div.style.flexBasis = "0";
+    root.appendChild(div);
+  }
+  // Shared tooltip element for the two ribbon lanes (hit-test readout).
+  const tip = document.createElement("div");
+  tip.className = "ribbon-tooltip";
+  tip.style.display = "none";
+  root.appendChild(tip);
+}
+
+// Tracks the active x-range so we re-apply setScale('x') only when the range
+// preset/window actually changes — not on every live snapshot (which would
+// stomp a user's manual zoom).
+let tsXRangeKey = null;
+
+function applyTsXRange(force) {
+  if (!tsFigure) return;
+  const xr = computeXRange();
+  if (!xr || xr[0] == null || xr[1] == null) return;
+  const key = `${xr[0]}|${xr[1]}`;
+  if (!force && key === tsXRangeKey) return;
+  tsXRangeKey = key;
+  for (const u of tsFigure.instances) {
+    u.setScale("x", { min: xr[0], max: xr[1] });
+  }
+}
+
+function redrawTSFigure() {
   const div = document.getElementById("ts-figure");
-  const traces = buildTraces();
-  const layout = buildLayout();
-  if (!state.built.ts) {
-    await Plotly.newPlot(div, traces, layout, window.eoChart.mobileConfig());
+  if (!div) return;
+  const model = buildModel();
+  if (!model) return;
+
+  const key = membershipKey(model);
+  if (tsFigure && tsMembership !== key) {
+    // Conditional-series membership changed — rebuild from scratch.
+    tsFigure.destroy();
+    tsFigure = null;
+  }
+
+  if (!tsFigure) {
+    assembleTsContainers(div);
+    tsFigure = buildTsFigure(div, model);
+    tsMembership = key;
+    tsXRangeKey = null;
     state.built.ts = true;
-    window.eoChart.registerPlot("ts-figure");
-    div.on("plotly_hover", onPlotlyHover);
-    div.on("plotly_click", onPlotlyClick);
+    applyTsXRange(true);
   } else {
-    await Plotly.react(div, traces, layout);
+    tsFigure.update(model);
+    applyTsXRange(false);
   }
 }
 
 function redrawCursorLine() {
-  if (!state.built.ts) return;
-  const div = document.getElementById("ts-figure");
-  const layout = buildLayout();
-  Plotly.relayout(div, { shapes: layout.shapes });
+  if (!state.built.ts || !tsFigure) return;
+  // Cheap cursor-only repaint (spec §5.7): update just the shapes-plugin
+  // cursor/now state and redraw — no data rebuild, so zoom + band geometry
+  // are untouched.
+  const cursorT = effectiveCursor();
+  const nowT = nowFromSnapshot();
+  tsFigure.setShapes({
+    cursorSec: cursorT ? toEpochSec(cursorT) : null,
+    nowSec: nowT && !isHistorical() ? toEpochSec(nowT) : null,
+  });
 }
 
 function onPlotlyHover(ev) {
