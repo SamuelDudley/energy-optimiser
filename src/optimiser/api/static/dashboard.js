@@ -25,15 +25,15 @@
 
 import { SLOT_MS, nearestSlotAt, toNemDate, toEpochSec } from "./time-utils.js";
 import {
-  DECISION, DECISION_COLORS, DECISION_LABELS, MODE, MODE_COLORS, MODE_LABELS,
+  DECISION, MODE, MODE_COLORS,
   DEADBAND_KW, MODE_SWITCH_HYSTERESIS_KW,
   decisionFor, decisionFromTelemetry, modeFromSlot, modeFromTelemetry,
 } from "./classify.js";
 import {
-  mergePriceForecasts, mergePVForecasts, pickPriceAt, coalesce, priceLogToInterval,
+  mergePriceForecasts, mergePVForecasts, pickPriceAt, coalesce,
 } from "./price-merge.js";
 import {
-  LOAD_PALETTE, colorForLoadId, hexToRgba, marginalCost,
+  colorForLoadId, hexToRgba, marginalCost,
 } from "./derive.js";
 import { buildUnionX, alignSeries } from "./timeline.js";
 import { bandColumns } from "./bands.js";

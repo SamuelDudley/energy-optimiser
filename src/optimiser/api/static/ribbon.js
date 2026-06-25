@@ -9,8 +9,11 @@
  * All category data + colour/label/glyph mappings arrive via opts — this module has
  * no knowledge of DECISION or MODE categories.
  *
+ * x-coordinates are read from u.data[0] (the live x series) on each draw so that
+ * after update() grows unionX the rectangles are positioned against the current data,
+ * not a stale captured array.
+ *
  * @param {object}   opts
- * @param {number[]} opts.unionX     - x-axis timestamps (one per data slot)
  * @param {function} opts.getCats    - () => number[]  category index per slot (called each draw)
  * @param {function} opts.colorOf    - (cat) => string  CSS colour string
  * @param {function} opts.labelOf    - (cat) => string  human-readable label
@@ -18,7 +21,7 @@
  * @param {Element}  [opts.tooltipEl]- DOM element to write cursor label into
  * @returns {object} uPlot plugin ({ hooks: { draw, setCursor } })
  */
-export function ribbonPlugin({ unionX, getCats, colorOf, labelOf, glyphOf, tooltipEl }) {
+export function ribbonPlugin({ getCats, colorOf, labelOf, glyphOf, tooltipEl }) {
   /** Returns the index just past the end of the run starting at i. */
   function runEnd(cats, i) {
     let j = i;
@@ -32,6 +35,10 @@ export function ribbonPlugin({ unionX, getCats, colorOf, labelOf, glyphOf, toolt
         const cats = getCats();
         if (!cats || cats.length === 0) return;
 
+        // Read the live x array from the uPlot instance so rect positions
+        // track the current data after update() grows the timeline.
+        const xs = u.data[0];
+
         const ctx = u.ctx;
         const { top, height } = u.bbox;
 
@@ -39,8 +46,8 @@ export function ribbonPlugin({ unionX, getCats, colorOf, labelOf, glyphOf, toolt
         try {
           for (let i = 0; i < cats.length; ) {
             const j = runEnd(cats, i);
-            const x0 = Math.round(u.valToPos(unionX[i], "x", true));
-            const x1 = Math.round(u.valToPos(unionX[Math.min(j, unionX.length - 1)], "x", true));
+            const x0 = Math.round(u.valToPos(xs[i], "x", true));
+            const x1 = Math.round(u.valToPos(xs[Math.min(j, xs.length - 1)], "x", true));
 
             ctx.fillStyle = colorOf(cats[i]);
             ctx.fillRect(x0, top, Math.max(1, x1 - x0), height);

@@ -38,6 +38,7 @@ import { ribbonPlugin } from "./ribbon.js";
 import {
   DECISION_COLORS, DECISION_LABELS, MODE_COLORS, MODE_LABELS,
 } from "./classify.js";
+import { hexToRgba } from "./derive.js";
 
 // Shared font stack — read once from the body so panels match the page.
 const FONT_FAMILY =
@@ -85,16 +86,8 @@ const lineDotted = (stroke, width) => ({
   scale: "y", stroke, width, dash: [3, 3], spanGaps: true, points: { show: false },
 });
 // Invisible bound series for a native band (so uPlot has data to fill between).
-const bandBound = () => ({ scale: "y", show: false, points: { show: false } });
-
-// Local rgba helper (same algorithm as derive.hexToRgba).
-function hexToRgbaLocal(hex, alpha) {
-  const h = hex.replace(/^#/, "");
-  const r = parseInt(h.slice(0, 2), 16);
-  const g = parseInt(h.slice(2, 4), 16);
-  const b = parseInt(h.slice(4, 6), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
+// show:true so uPlot's band machinery runs; width:0 + points.show:false hides the line itself.
+const bandBound = () => ({ scale: "y", show: true, width: 0, points: { show: false } });
 
 // ── per-panel spec builders ─────────────────────────────────────────────────
 //
@@ -142,20 +135,20 @@ function pricePanel(model, getState) {
   };
 }
 
-function ribbonPanel(key, unionX, getCats, tooltipEl) {
+function ribbonPanel(key, getCats, tooltipEl) {
   const isDecision = key === "decision";
   const colors = isDecision ? DECISION_COLORS : MODE_COLORS;
   const labels = isDecision ? DECISION_LABELS : MODE_LABELS;
   // One transparent placeholder series so uPlot has a data column.
   const series = [{ scale: "y", show: false, points: { show: false } }];
-  const dataFn = () => [unionX.map(() => 0)];
+  // dataFn returns a zeros column aligned to the current model's unionX.
+  const dataFn = (m) => [m.unionX.map(() => 0)];
   return {
     series, dataFn,
     scaleY: { range: [0, 1] },
     yAxisCfg: yAxisBlank(),
     plugins: [
       ribbonPlugin({
-        unionX,
         getCats,
         colorOf: (c) => colors[c] ?? "#21262d",
         labelOf: (c) => labels[c] ?? "—",
@@ -211,7 +204,7 @@ function loadPanel(model, getState) {
   for (const s of stacks) {
     series.push({
       scale: "y", stroke: s.color, width: 1, spanGaps: false,
-      paths: stepped, fill: hexToRgbaLocal(s.color, 0.5),
+      paths: stepped, fill: hexToRgba(s.color, 0.5),
       points: { show: false },
     });
   }
@@ -266,7 +259,7 @@ function costPanel(model, getState) {
   };
   return {
     series, dataFn,
-    scaleY: {}, showTime: true,
+    scaleY: {},
     plugins: [shapesPlugin({ getState, kind: "cost" })],
   };
 }
@@ -274,6 +267,7 @@ function costPanel(model, getState) {
 // ── makePanel — instantiate one uPlot from a spec ───────────────────────────
 
 function makePanel({ el, unionX, spec, model, showTime, peers, hub }) {
+  const hubOpts = hub.instanceOpts(peers);
   const opts = {
     width: (el && el.clientWidth) || 600,
     height: (el && el.clientHeight) || 80,
@@ -288,9 +282,11 @@ function makePanel({ el, unionX, spec, model, showTime, peers, hub }) {
     series: [{}, ...spec.series],
     bands: spec.bands || [],
     legend: { show: false },
-    cursor: { ...cursorDragOpts() },
+    // Merge drag opts with hub sync opts so both coexist. Spreading hubOpts
+    // wholesale would overwrite cursor with only { sync }, dropping drag.
+    cursor: { ...cursorDragOpts(), ...(hubOpts.cursor || {}) },
     plugins: spec.plugins || [],
-    ...hub.instanceOpts(peers),
+    hooks: hubOpts.hooks,
   };
   const data = [unionX, ...spec.dataFn(model)];
   return new uPlot(opts, data, el);
@@ -334,9 +330,9 @@ export function buildTsFigure(rootEl, model) {
   const specFor = (id) => {
     if (id === "prices") return pricePanel(model, getState);
     if (id === "ribbon")
-      return ribbonPanel("decision", model.unionX, () => cur.decisionCats || [], ribbonTooltip);
+      return ribbonPanel("decision", () => cur.decisionCats || [], ribbonTooltip);
     if (id === "mode")
-      return ribbonPanel("mode", model.unionX, () => cur.modeCats || [], ribbonTooltip);
+      return ribbonPanel("mode", () => cur.modeCats || [], ribbonTooltip);
     if (id === "solar") return pvPanel(model, getState);
     if (id === "soc")   return socPanel(model, getState);
     if (id === "load")  return loadPanel(model, getState);
