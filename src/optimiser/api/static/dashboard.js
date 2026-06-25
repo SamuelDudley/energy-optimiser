@@ -23,6 +23,8 @@
 
 "use strict";
 
+import { SLOT_MS, nearestSlotAt, toNemDate, toEpochSec } from "./time-utils.js";
+
 // ── Constants ──────────────────────────────────────────────────────
 
 const POLL_INTERVAL_MS = 15_000;
@@ -36,8 +38,6 @@ const HISTORY_REFRESH_MS = 150_000;
 const TOKEN_LS_KEY = "eo_dashboard_token";
 
 // Slot semantics — must stay in sync with optimiser/lp/constants.py.
-const SLOT_MINUTES = 5;
-const SLOT_MS = SLOT_MINUTES * 60 * 1000;
 const DEADBAND_KW = 0.1;
 const MODE_SWITCH_HYSTERESIS_KW = 0.05;
 
@@ -314,12 +314,6 @@ function toPlotlyTimeArr(arr) {
 // daily-spend cursor: spend bars are bucketed by nem_date in the API, so
 // the time-series cursor maps to a spend bar by adding 10h and taking
 // the YYYY-MM-DD prefix of the resulting UTC clock time.
-function toNemDate(d) {
-  if (d == null) return null;
-  const t = d instanceof Date ? +d : +new Date(d);
-  if (!Number.isFinite(t)) return null;
-  return new Date(t + 10 * 3_600_000).toISOString().slice(0, 10);
-}
 function showError(msg) {
   const bar = document.getElementById("error-bar");
   bar.textContent = msg;
@@ -662,12 +656,6 @@ function snapToNow() {
   renderCursorReadout();
   redrawCursorLine();
   redrawSpendCursor();
-}
-
-function nearestSlotAt(time) {
-  // Round `time` down to the start of the 5-min slot it falls in.
-  const t = time instanceof Date ? time.getTime() : +time;
-  return new Date(Math.floor(t / SLOT_MS) * SLOT_MS);
 }
 
 // ── Status strip ───────────────────────────────────────────────────
