@@ -85,12 +85,15 @@ export const registry = {
    * Resize every visible registered instance to match its container.
    * Hidden charts (no offsetParent or zero clientWidth) are skipped so they
    * resize lazily on next tab activation.
+   * Size is read from the PARENT of u.root — uPlot pins u.root to its
+   * build-time size, but the parent container flexes with the viewport.
    */
   resizeAll() {
     for (const [, u] of _instances) {
       const el = u.root;
-      if (!el || !el.offsetParent || el.clientWidth === 0) continue;
-      u.setSize({ width: el.clientWidth, height: el.clientHeight });
+      const box = el && el.parentElement; // the flexing container we mounted into
+      if (!box || !box.offsetParent || box.clientWidth === 0) continue;
+      u.setSize({ width: box.clientWidth, height: box.clientHeight });
     }
   },
 };
@@ -98,6 +101,17 @@ export const registry = {
 // Resize all charts whenever the breakpoint changes (50 ms debounce to let
 // the browser finish reflowing the layout).
 onBreakpointChange(() => setTimeout(() => registry.resizeAll(), 50));
+
+// Resize all charts on every window resize (debounced 100 ms), not just on
+// breakpoint crossings.  Restores Plotly's `responsive:true` behaviour.
+// Guarded so the module imports cleanly in node/Vitest environments.
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  let _resizeT;
+  window.addEventListener("resize", () => {
+    clearTimeout(_resizeT);
+    _resizeT = setTimeout(() => registry.resizeAll(), 100);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Mobile drag options
