@@ -65,10 +65,12 @@ header.strip {
   scrollbar-width: thin;
 }
 .cursor-strip-now { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+/* Match the page's standard button style (range-bar / tab buttons). */
 .cursor-strip-now #cursor-now-btn {
+  font: inherit;
   font-size: 11px;
-  padding: 2px 8px;
-  background: var(--bg);
+  padding: 3px 9px;
+  background: var(--bg-soft);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -328,6 +330,8 @@ main {
   pointer-events: none;
   z-index: 3;
 }
+/* The price panel has a TOP time axis — drop its title below the time labels. */
+#ts-figure .uplot-panel[data-panel="prices"] .panel-title { top: 24px; }
 #ts-figure .ribbon-tooltip {
   position: absolute;
   top: 0;

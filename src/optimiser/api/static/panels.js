@@ -94,6 +94,9 @@ const xAxisHidden = () => ({
 });
 // Bottom (COST) panel shows the time labels.
 const xAxisShown = () => baseAxis({ scale: "x", size: 34, space: X_SPACE });
+// Top time axis (PRICE panel) — time VALUES above the plot so the time is
+// readable at the top of the tall stack too, not only at the bottom.
+const xAxisTop = () => baseAxis({ scale: "x", side: 0, size: 20, space: X_SPACE });
 
 const yAxis = (extra = {}) => baseAxis({ scale: "y", size: gutter(), ...extra });
 // A y-axis with explicit named ticks (for the arcsinh price/cost/grid panels),
@@ -321,8 +324,11 @@ function costPanel(model, getState) {
 
 // ── makePanel — instantiate one uPlot from a spec ───────────────────────────
 
-function makePanel({ el, unionX, spec, model, showTime, peers, hub }) {
+function makePanel({ el, unionX, spec, model, xMode, peers, hub }) {
   const hubOpts = hub.instanceOpts(peers);
+  const xAxis = xMode === "top" ? xAxisTop()
+              : xMode === "bottom" ? xAxisShown()
+              : xAxisHidden();
   const opts = {
     width: (el && el.clientWidth) || 600,
     height: (el && el.clientHeight) || 80,
@@ -338,7 +344,7 @@ function makePanel({ el, unionX, spec, model, showTime, peers, hub }) {
       y: spec.scaleY || {},
     },
     axes: [
-      showTime ? xAxisShown() : xAxisHidden(),
+      xAxis,
       spec.yAxisCfg || yAxis(),
     ],
     series: [{}, ...spec.series],
@@ -422,7 +428,8 @@ export function buildTsFigure(rootEl, model) {
     if (!spec) continue;
     const u = makePanel({
       el, unionX: model.unionX, spec, model,
-      showTime: id === "cost", peers, hub,
+      xMode: id === "cost" ? "bottom" : id === "prices" ? "top" : "grid",
+      peers, hub,
     });
     // v1 a11y hygiene (spec §10.2): give each main canvas a role + label so
     // screen readers can identify the chart. Full offscreen data-table deferred.
