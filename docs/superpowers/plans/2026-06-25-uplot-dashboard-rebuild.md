@@ -118,7 +118,9 @@ curl -fsSL https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css -o uplot
 head -c 120 uplot.esm.js   # sanity: should be minified JS, not an HTML error page
 ```
 
-- [ ] **Step 2: Register both files in `_STATIC_FILES`** (`dashboard.py`)
+- [ ] **Step 2: Register uPlot AND all planned module filenames in `_STATIC_FILES`** (`dashboard.py`)
+
+> Pre-register every module the plan will create. The handler 404s for a name whose file does not exist yet (`read_text` → `FileNotFoundError`), so listing a not-yet-created file is harmless — and it means later static-only tasks need **no further backend change or rebuild** (the static dir is bind-mounted live; only this whitelist is baked into the image).
 
 ```python
 _STATIC_FILES: dict[str, str] = {
@@ -126,17 +128,29 @@ _STATIC_FILES: dict[str, str] = {
     "chart-utils.js": "application/javascript",
     "dashboard.js": "application/javascript",
     "ops.js": "application/javascript",
+    # vendored uPlot
     "uplot.esm.js": "application/javascript",
     "uplot.min.css": "text/css",
+    # new ESM modules (created in later tasks; 404 until they exist)
+    "time-utils.js": "application/javascript",
+    "classify.js": "application/javascript",
+    "price-merge.js": "application/javascript",
+    "derive.js": "application/javascript",
+    "timeline.js": "application/javascript",
+    "bands.js": "application/javascript",
+    "chart-core.js": "application/javascript",
+    "shapes.js": "application/javascript",
+    "ribbon.js": "application/javascript",
+    "panels.js": "application/javascript",
+    "cursor.js": "application/javascript",
+    "spend-chart.js": "application/javascript",
+    "ops-charts.js": "application/javascript",
+    "spike-detect.js": "application/javascript",
+    "spike-labels.js": "application/javascript",
 }
 ```
 
-- [ ] **Step 3: Make both files public in `_PUBLIC_PATHS`** (`server.py`) — append:
-
-```python
-    "/dashboard/static/uplot.esm.js",
-    "/dashboard/static/uplot.min.css",
-```
+- [ ] **Step 3: Make the same paths public in `_PUBLIC_PATHS`** (`server.py`) — append a `/dashboard/static/<name>` entry for each of the new names above (uplot.esm.js, uplot.min.css, time-utils.js, classify.js, price-merge.js, derive.js, timeline.js, bands.js, chart-core.js, shapes.js, ribbon.js, panels.js, cursor.js, spend-chart.js, ops-charts.js, spike-detect.js, spike-labels.js). These files carry no data (the in-page JS still prompts for the bearer token), so they are public like the existing dashboard assets.
 
 - [ ] **Step 4: Link the uPlot stylesheet in `dashboard.html`** (after the existing `dashboard.css` link, keep the Plotly `<script>`):
 
@@ -149,10 +163,10 @@ _STATIC_FILES: dict[str, str] = {
 Run: `cd /home/dudley/code/energy-optimiser && uv run pytest tests/ -q`
 Expected: same pass count as before this task (no failures).
 
-- [ ] **Step 6: Verify assets serve** (service is bind-mounted; static edits need no rebuild)
+- [ ] **Step 6: Confirm the vendored files exist on disk** (live-serve verification is a controller deploy step — the `_STATIC_FILES`/`_PUBLIC_PATHS` edits are Python, baked into the image, so they need a container rebuild to take effect; the controller deploys after this task)
 
-Run: `curl -fsS http://localhost:8080/dashboard/static/uplot.esm.js | head -c 60`
-(Adjust host/port to the deployed dashboard.) Expected: minified JS bytes, HTTP 200.
+Run: `ls -l src/optimiser/api/static/uplot.esm.js src/optimiser/api/static/uplot.min.css`
+Expected: both files present, non-zero size. Do NOT curl the live service yet (the whitelist change is not deployed until the controller rebuilds).
 
 - [ ] **Step 7: Commit**
 
