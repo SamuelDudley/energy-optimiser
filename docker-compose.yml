@@ -3,6 +3,13 @@ services:
     build: .
     container_name: energy-optimiser
     restart: unless-stopped
+    # Give the service room to finish its in-flight tick and run the
+    # clean-shutdown path (set_fallback + close the snapshot writer)
+    # before Docker escalates SIGTERM to SIGKILL. The default 10 s can
+    # expire mid-snapshot-write on a redeploy; the writer is crash-safe
+    # either way (truncate-on-error + startup recovery), but a clean
+    # close avoids leaving a torn tail to recover on the next boot.
+    stop_grace_period: 30s
     volumes:
       - ./config.toml:/etc/energy-optimiser/config.toml:ro
       - optimiser-data:/var/lib/energy-optimiser

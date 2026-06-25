@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from optimiser.logging_utils import SnapshotWriter
 
@@ -181,23 +184,36 @@ def test_recover_torn_gzip_preserves_big_member_with_internal_magic_bytes(
     big member.
     """
     import gzip as _gzip
-    import os
+    import io
+    import random
+
+    def _has_internal_magic(raw: bytes) -> bool:
+        return any(raw[i] == 0x1F and raw[i + 1] == 0x8B for i in range(2, len(raw) - 1))
+
+    # Deterministically find a 200-line member whose *compressed* bytes
+    # contain an internal 0x1f8b sequence: walk fixed RNG seeds until one
+    # qualifies. ``mtime=0`` keeps the header deterministic so the search
+    # result is reproducible. This replaces an earlier os.urandom fixture
+    # that only produced internal magic ~50% of the time (flaky).
+    raw = b""
+    lines: list[bytes] = []
+    for seed in range(2000):
+        rng = random.Random(seed)
+        lines = [
+            json.dumps({"i": i, "blob": rng.randbytes(64).hex()}).encode("utf-8")
+            for i in range(200)
+        ]
+        bio = io.BytesIO()
+        with _gzip.GzipFile(fileobj=bio, mode="wb", mtime=0) as f:
+            for ln in lines:
+                f.write(ln)
+                f.write(b"\n")
+        raw = bio.getvalue()
+        if _has_internal_magic(raw):
+            break
+    assert _has_internal_magic(raw), "no seed produced internal magic bytes"
 
     path = tmp_path / "2026-04-24.ndjson.gz"
-    # 200 lines of varied bytes — a few internal 0x1f8b sequences are
-    # near-certain at this size; not relying on luck, just on volume.
-    lines = [json.dumps({"i": i, "blob": os.urandom(64).hex()}).encode("utf-8") for i in range(200)]
-    with _gzip.open(path, "wb") as f:
-        for ln in lines:
-            f.write(ln)
-            f.write(b"\n")
-
-    raw = path.read_bytes()
-    n_internal_magic = sum(
-        1 for i in range(2, len(raw) - 1) if raw[i] == 0x1F and raw[i + 1] == 0x8B
-    )
-    assert n_internal_magic >= 1, "test fixture failed to produce internal magic bytes"
-
     # Append a deliberately corrupt "second member" so the file fails
     # the multi-member probe and triggers recovery.
     bad = b"\x1f\x8b" + b"\x00" * 14
@@ -320,3 +336,67 @@ def test_tick_snapshot_active_modes_round_trip(tmp_path: Path) -> None:
     assert len(row["active_modes"]) == 1
     assert row["active_modes"][0]["kind"] == "buy"
     assert row["active_modes"][0]["params"]["ceiling_c_per_kwh"] == 12.0
+
+
+def test_concurrent_writes_do_not_interleave(tmp_path: Path) -> None:
+    """Two writers appending to the same daily file concurrently — the
+    redeploy-overlap scenario where the old process is still ticking as
+    the new one starts — must never interleave their gzip members into a
+    corrupt byte span. The advisory flock around each append serialises
+    them so every member stays whole and the file decodes end-to-end.
+
+    This is the failure that ate 2026-06-25: a ~3.6 KB garbled member
+    mid-file, good data on both sides, that no startup recovery re-ran
+    against because it only heals *today's* file."""
+    ts = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    path = tmp_path / "2026-04-24.ndjson.gz"
+    n_per = 40
+
+    def writer() -> None:
+        w = SnapshotWriter(tmp_path)
+        for i in range(n_per):
+            w.write(_snap(ts.replace(minute=i)))
+
+    t1 = threading.Thread(target=writer)
+    t2 = threading.Thread(target=writer)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # The whole multi-member stream must decode without error (no torn or
+    # interleaved member) and yield exactly 2*n_per intact JSON lines.
+    data = gzip.decompress(path.read_bytes())
+    lines = [json.loads(ln) for ln in data.splitlines() if ln.strip()]
+    assert len(lines) == 2 * n_per
+
+
+def test_failed_write_leaves_no_partial_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure anywhere in the append path (here: fsync raising) must
+    leave the file byte-identical to before the attempt — never a
+    half-written member that the *next* append chains onto, producing a
+    corrupt span in the middle of the file that recovery can only paper
+    over after the fact."""
+    import optimiser.logging_utils as lu
+
+    w = SnapshotWriter(tmp_path)
+    ts = datetime(2026, 4, 24, 12, 0, tzinfo=UTC)
+    for i in range(3):
+        w.write(_snap(ts.replace(minute=i)))
+    path = tmp_path / "2026-04-24.ndjson.gz"
+    before = path.read_bytes()
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(lu.os, "fsync", _boom)
+    with pytest.raises(OSError):
+        w.write(_snap(ts.replace(minute=3)))
+
+    # File is unchanged: the partial member was truncated away.
+    assert path.read_bytes() == before
+    # And it still decodes cleanly end-to-end with exactly the 3 originals.
+    data = gzip.decompress(path.read_bytes())
+    assert len([ln for ln in data.splitlines() if ln.strip()]) == 3

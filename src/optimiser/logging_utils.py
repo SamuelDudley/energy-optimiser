@@ -6,9 +6,11 @@ Tick snapshots are written to NDJSON files.
 
 from __future__ import annotations
 
+import fcntl
 import gzip
 import json
 import logging
+import os
 import sys
 import uuid
 import zlib
@@ -216,6 +218,37 @@ def _decode_one_gzip_member(blob: bytes, start: int) -> tuple[list[bytes], int] 
     return lines, end
 
 
+@contextmanager
+def _snapshot_write_lock(directory: Path) -> Iterator[None]:
+    """Serialise snapshot appends and in-place heals across processes.
+
+    A redeploy briefly runs two service processes at once (the old one
+    finishing its shutdown while the new one starts ticking). Without
+    coordination their gzip-member appends to *today's* file interleave
+    at the byte level and leave a garbled member in the middle of the
+    file — good data on both sides — which no startup recovery ever
+    re-runs against, because recovery only heals today's file once at
+    boot. An advisory ``flock`` on a per-directory lock file serialises
+    every append and every heal so members are always written whole.
+
+    The lock file is a stable sidecar (never the snapshot file itself,
+    whose inode an atomic-rename heal replaces) so the lock survives a
+    rewrite. ``flock`` is released automatically if the holder dies, so a
+    crash mid-append can never wedge the next writer.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / ".snapshot-write.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def recover_torn_gzip(path: Path) -> int | None:
     """Heal a torn multi-member gzip in place; return recovered line count.
 
@@ -241,55 +274,60 @@ def recover_torn_gzip(path: Path) -> int | None:
     """
     if not path.exists():
         return None
-    blob = path.read_bytes()
-    if not blob:
-        return None
-    # Probe: ``gzip.decompress`` walks every member in a multi-member
-    # stream and raises on any corruption — that's the property we want.
-    # ``zlib.decompress(..., wbits=MAX_WBITS|32)`` only handles single-
-    # member auto-detect and silently stops after the first member, so a
-    # corrupt tail wouldn't trip it.
-    try:
-        gzip.decompress(blob)
-        return None
-    except (OSError, EOFError, zlib.error):
-        pass
+    # Hold the per-directory append lock across the read+rewrite so a
+    # live writer (today's file during a redeploy) cannot append a member
+    # between our read and the atomic rename — which would silently drop
+    # that member when the recovered file replaces the inode.
+    with _snapshot_write_lock(path.parent):
+        blob = path.read_bytes()
+        if not blob:
+            return None
+        # Probe: ``gzip.decompress`` walks every member in a multi-member
+        # stream and raises on any corruption — that's the property we want.
+        # ``zlib.decompress(..., wbits=MAX_WBITS|32)`` only handles single-
+        # member auto-detect and silently stops after the first member, so a
+        # corrupt tail wouldn't trip it.
+        try:
+            gzip.decompress(blob)
+            return None
+        except (OSError, EOFError, zlib.error):
+            pass
 
-    recovered: list[bytes] = []
-    n_corrupt = 0
-    pos = 0
-    while pos < len(blob) - 1:
-        magic = blob.find(b"\x1f\x8b", pos)
-        if magic < 0:
-            if pos < len(blob):
+        recovered: list[bytes] = []
+        n_corrupt = 0
+        pos = 0
+        while pos < len(blob) - 1:
+            magic = blob.find(b"\x1f\x8b", pos)
+            if magic < 0:
+                if pos < len(blob):
+                    n_corrupt += 1
+                break
+            if magic > pos:
                 n_corrupt += 1
-            break
-        if magic > pos:
-            n_corrupt += 1
-        result = _decode_one_gzip_member(blob, magic)
-        if result is None:
-            n_corrupt += 1
-            pos = magic + 2
-            continue
-        lines, end = result
-        recovered.extend(lines)
-        pos = end
+            result = _decode_one_gzip_member(blob, magic)
+            if result is None:
+                n_corrupt += 1
+                pos = magic + 2
+                continue
+            lines, end = result
+            recovered.extend(lines)
+            pos = end
 
-    if n_corrupt == 0:
-        return None
-    tmp = path.with_suffix(path.suffix + ".recovered")
-    with gzip.open(tmp, "wb") as f:
-        for line in recovered:
-            f.write(line)
-            f.write(b"\n")
-    tmp.replace(path)
-    logger.warning(
-        "recovered torn gzip %s: kept %d lines, dropped %d corrupt spans",
-        path,
-        len(recovered),
-        n_corrupt,
-    )
-    return len(recovered)
+        if n_corrupt == 0:
+            return None
+        tmp = path.with_suffix(path.suffix + ".recovered")
+        with gzip.open(tmp, "wb") as f:
+            for line in recovered:
+                f.write(line)
+                f.write(b"\n")
+        tmp.replace(path)
+        logger.warning(
+            "recovered torn gzip %s: kept %d lines, dropped %d corrupt spans",
+            path,
+            len(recovered),
+            n_corrupt,
+        )
+        return len(recovered)
 
 
 class SnapshotWriter:
@@ -321,11 +359,37 @@ class SnapshotWriter:
         return self._dir / f"{d.isoformat()}.ndjson.gz"
 
     def write(self, snapshot: TickSnapshot) -> None:
-        """Append a snapshot to today's NDJSON file as its own gzip member."""
+        """Append a snapshot to today's NDJSON file as its own gzip member.
+
+        The whole member is built in memory first, then appended in one
+        write under the per-directory ``flock`` (so a concurrent writer
+        during a redeploy cannot interleave bytes into a corrupt member).
+        If anything in the append path fails, the file is truncated back
+        to its pre-write length: a partial member is never left on disk
+        for the next append to chain onto — that mid-file corruption is
+        the failure mode recovery can only repair after the fact.
+        """
         path = self._path_for(snapshot.timestamp.date())
         line = json.dumps(asdict(snapshot), default=_serialise) + "\n"
-        with gzip.open(path, "ab") as f:
-            f.write(line.encode("utf-8"))
+        # One self-contained gzip member. ``mtime=0`` keeps the bytes
+        # deterministic (no embedded wall-clock); concatenated members
+        # form a standard multi-member gzip.
+        member = gzip.compress(line.encode("utf-8"), mtime=0)
+        with _snapshot_write_lock(self._dir), open(path, "ab") as f:
+            start = f.tell()
+            try:
+                f.write(member)
+                f.flush()
+                os.fsync(f.fileno())
+            except BaseException:
+                # Roll the file back to exactly where it was so no
+                # half-written member survives the failure.
+                try:
+                    f.flush()
+                    f.truncate(start)
+                except OSError:
+                    logger.exception("snapshot rollback failed for %s", path)
+                raise
 
     def close(self) -> None:
         # Each write is self-contained; nothing to flush on shutdown.

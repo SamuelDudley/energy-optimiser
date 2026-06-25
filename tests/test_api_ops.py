@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -186,6 +186,42 @@ class TestOpsSolve:
             "feasible": 1,
             "timeout": 1,
         }
+
+    async def test_self_heals_midfile_corrupt_member(self, tmp_path: Path) -> None:
+        """A single garbled gzip member mid-file (the 2026-06-25 redeploy
+        corruption) makes DuckDB fail the whole day. The handler must heal
+        the file in place and return the surrounding solves rather than
+        skipping the entire file."""
+        probe = _fresh_probe(tmp_path)
+        now = datetime.now(UTC).replace(microsecond=0)
+        # Four separate appends → four gzip members, so there is an inter-
+        # member boundary to splice garbage into.
+        for i in range(4):
+            _write_snapshots(
+                probe.snapshot_dir,
+                now,
+                [_minimal_snapshot(now - timedelta(minutes=i), 100.0 + i)],
+            )
+        path = probe.snapshot_dir / f"{now.date().isoformat()}.ndjson.gz"
+        blob = path.read_bytes()
+        boundary = blob.find(b"\x1f\x8b", 2)
+        assert boundary > 0, "fixture needs ≥2 members"
+        bad = b"\x1f\x8b" + b"\x00" * 14
+        path.write_bytes(blob[:boundary] + bad + blob[boundary:])
+
+        async with await _client(probe) as c:
+            r = await c.get("/ops/solve?window_h=1")
+            assert r.status == 200
+            body = await r.json()
+
+        # Healed, not skipped: every member's solve is back.
+        assert body["count"] == 4
+        assert "skipped_files" not in body
+        # File is now clean on disk (idempotent — a second read finds nothing
+        # to heal).
+        from optimiser.logging_utils import recover_torn_gzip
+
+        assert recover_torn_gzip(path) is None
 
     async def test_window_filters_old_snapshots(self, tmp_path: Path) -> None:
         probe = _fresh_probe(tmp_path)

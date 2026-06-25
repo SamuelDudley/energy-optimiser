@@ -28,10 +28,12 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
+from ...logging_utils import recover_torn_gzip
 from ..probe import API_CONFIG_KEY, SERVICE_PROBE_KEY
 
 logger = logging.getLogger(__name__)
@@ -198,9 +200,29 @@ def _run_solve(
             try:
                 cur.execute(sql, [path, since_naive])
                 rows.extend(cur.fetchall())
-            except Exception as exc:
-                # Torn gzip / truncated last member — skip this file
-                # rather than fail the whole window.
+            except Exception:
+                # A torn or mid-file-corrupt gzip member makes DuckDB fail
+                # the *whole* file, so a single bad member (e.g. a redeploy
+                # interleave) hides an entire day. Heal in place — drops
+                # the bad span, keeps every readable member — and retry
+                # once. recover_torn_gzip is idempotent and flock-
+                # coordinated with the live writer, so it is safe even on
+                # today's file, and only past-day files normally need it
+                # (startup recovery only heals today's). Without this, a
+                # corrupt past-day file stays invisible until it ages out.
+                healed = None
+                try:
+                    healed = recover_torn_gzip(Path(path))
+                except Exception:
+                    logger.exception("ops/solve heal failed for %s", path)
+                if healed is not None:
+                    try:
+                        cur.execute(sql, [path, since_naive])
+                        rows.extend(cur.fetchall())
+                        logger.warning("ops/solve healed %s (%d lines recovered)", path, healed)
+                        continue
+                    except Exception as exc2:
+                        exc = exc2
                 logger.warning("ops/solve skipping %s: %s", path, str(exc)[:120])
                 skipped.append({"path": path, "reason": str(exc)[:200]})
                 continue
