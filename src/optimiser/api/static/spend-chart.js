@@ -271,6 +271,12 @@ export function buildSpendChart(el) {
     const h = el.clientHeight || 260;
     const opts = buildOpts(w, h);
     u = new uPlot(opts, EMPTY_DATA, el);
+    // v1 a11y hygiene (spec §10.2).
+    const canvas = u.ctx && u.ctx.canvas;
+    if (canvas) {
+      canvas.setAttribute("role", "img");
+      canvas.setAttribute("aria-label", "Daily spend, AUD per day");
+    }
     registry.register("spend-figure", u);
   }
 

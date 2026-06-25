@@ -281,6 +281,9 @@ function buildSolveSeries(containerId, solveData) {
   el.appendChild(tooltip);
 
   const u = new uPlot(opts, data, el);
+  // v1 a11y hygiene (spec §10.2).
+  const cvs0 = u.ctx && u.ctx.canvas;
+  if (cvs0) { cvs0.setAttribute("role", "img"); cvs0.setAttribute("aria-label", "Solve time series, ms"); }
   registry.register(containerId, u);
   return u;
 }
@@ -354,6 +357,9 @@ function buildHistogram(containerId, solveData) {
 
   el.innerHTML = "";
   const u = new uPlot(opts, [xData, counts], el);
+  // v1 a11y hygiene (spec §10.2).
+  const cvs1 = u.ctx && u.ctx.canvas;
+  if (cvs1) { cvs1.setAttribute("role", "img"); cvs1.setAttribute("aria-label", "Solve time histogram"); }
   registry.register(containerId, u);
   return u;
 }
@@ -446,6 +452,9 @@ function buildStatusBars(containerId, solveData) {
 
   el.innerHTML = "";
   const u = new uPlot(opts, [xData, yData], el);
+  // v1 a11y hygiene (spec §10.2).
+  const cvs2 = u.ctx && u.ctx.canvas;
+  if (cvs2) { cvs2.setAttribute("role", "img"); cvs2.setAttribute("aria-label", "Solve status counts"); }
   registry.register(containerId, u);
   return u;
 }
@@ -578,6 +587,9 @@ function buildModbusWrites(containerId, modbusData) {
 
   el.innerHTML = "";
   const u = new uPlot(opts, [xData, okData, errData], el);
+  // v1 a11y hygiene (spec §10.2).
+  const cvs3 = u.ctx && u.ctx.canvas;
+  if (cvs3) { cvs3.setAttribute("role", "img"); cvs3.setAttribute("aria-label", "Modbus write health by register"); }
   registry.register(containerId, u);
   return u;
 }

@@ -1,5 +1,5 @@
 /* eslint-disable no-console */
-// Energy Optimiser dashboard — vanilla JS + Plotly.
+// Energy Optimiser dashboard — vanilla JS + uPlot.
 //
 // Hard rule: every value rendered comes from a real API response. When a
 // field is null/missing, render "—" or a gap. No fabricated values, no

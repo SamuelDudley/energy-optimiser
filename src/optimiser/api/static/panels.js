@@ -305,6 +305,18 @@ function makePanel({ el, unionX, spec, model, showTime, peers, hub }) {
 // Panel id -> builder. Order MUST match PANEL_LAYOUT in dashboard.js.
 const PANEL_ORDER = ["prices", "ribbon", "mode", "solar", "soc", "load", "grid", "cost"];
 
+// Concise aria-label for each panel's main canvas (spec §10.2 v1 a11y hygiene).
+const PANEL_ARIA_LABEL = {
+  prices: "Price, c/kWh time series",
+  ribbon: "Battery decision ribbon",
+  mode:   "Mode ribbon",
+  solar:  "Solar PV, kW time series",
+  soc:    "State of charge, % time series",
+  load:   "Load, kW time series",
+  grid:   "Grid power, kW time series",
+  cost:   "Cost, c/h time series",
+};
+
 /**
  * Build the 8 synced uPlot panels into rootEl's per-panel child divs.
  *
@@ -358,6 +370,13 @@ export function buildTsFigure(rootEl, model) {
       el, unionX: model.unionX, spec, model,
       showTime: id === "cost", peers, hub,
     });
+    // v1 a11y hygiene (spec §10.2): give each main canvas a role + label so
+    // screen readers can identify the chart. Full offscreen data-table deferred.
+    const canvas = u.ctx && u.ctx.canvas;
+    if (canvas) {
+      canvas.setAttribute("role", "img");
+      canvas.setAttribute("aria-label", PANEL_ARIA_LABEL[id] || id);
+    }
     registry.register(`ts-${id}`, u);
     instances.push(u);
     specs.push(spec);
