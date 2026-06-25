@@ -119,7 +119,7 @@ function pricePanel(model, getState) {
   ];
   const yAxisCfg = yAxis({
     splits: (u, _a, min, max) => PRICE_SPLITS.filter((v) => v >= min && v <= max),
-    values: (u, splits) => splits.map((v) => String(v)),
+    values: (u, splits) => splits.map((v) => (v == null || !Number.isFinite(v)) ? "" : String(v)),
   });
   const dataFn = (m) => {
     const p = m.price;
