@@ -332,6 +332,17 @@ main {
 }
 /* The price panel has a TOP time axis — drop its title below the time labels. */
 #ts-figure .uplot-panel[data-panel="prices"] .panel-title { top: 24px; }
+/* Cursor crosshair: the synced VERTICAL line (.u-cursor-x) stays on every panel
+   for time alignment, but the HORIZONTAL rule (.u-cursor-y) only makes sense on
+   the panel under the pointer. uPlot leaves the horizontal line visible on all
+   synced peers; gate it to the hovered panel only. (Ribbons opt out entirely via
+   cursor.y:false in panels.js, so they're covered even on hover.) */
+#ts-figure .u-cursor-y { display: none; }
+/* :not(.u-off) so uPlot's own off-plot hide still wins — without it, hovering
+   the panel's axis/title band (inside .uplot but outside the .u-over plot area,
+   where uPlot parks the crosshair off-screen via .u-off) would force a stray
+   horizontal line visible. */
+#ts-figure .uplot:hover .u-cursor-y:not(.u-off) { display: block; }
 #ts-figure .ribbon-tooltip {
   position: absolute;
   top: 0;

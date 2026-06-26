@@ -184,4 +184,73 @@ describe("panels.js buildTsFigure", () => {
       expect(opts.series.length).toBe(data.length);
     }
   });
+
+  // Helper: build once, return panels keyed by id.
+  async function buildByPanel(mutate) {
+    const { buildTsFigure } = await import("../src/optimiser/api/static/panels.js");
+    const model = makeModel();
+    if (mutate) mutate(model);
+    const root = makeEl("ts-figure");
+    const ids = ["prices", "ribbon", "mode", "solar", "soc", "load", "grid", "cost"];
+    for (const id of ids) { const c = makeEl(); c.dataset.panel = id; root.children.push(c); }
+    buildTsFigure(root, model);
+    const byPanel = {};
+    captured.forEach((c, i) => { byPanel[ids[i]] = c; });
+    return byPanel;
+  }
+
+  it("arcsinh y-axes supply their own label filter + stringifying values", async () => {
+    // Regression: for distr:4 (asinh) uPlot installs a default log filter that
+    // blanks any split whose mantissa isn't "nice" — it collapsed the price axis
+    // [5,10,15,20,40] to only "10","15". namedAxis must supply its OWN filter
+    // (which wins over the distr default) so the niceness-blanking is gone; that
+    // filter re-adds overlap thinning (see thinByPixelGap test).
+    const byPanel = await buildByPanel();
+    for (const id of ["prices", "grid", "cost"]) {
+      const yAxis = byPanel[id].opts.axes[1];
+      expect(byPanel[id].opts.scales.y.distr).toBe(4);   // asinh scale
+      expect(typeof yAxis.filter).toBe("function");
+      // With well-spaced positions, the filter keeps EVERY named split (no
+      // niceness-blanking). Fake u.valToPos returns 40px-apart positions.
+      const fakeU = { valToPos: (v) => v * 40 };
+      const sample = [-50, -10, 0, 5, 15, 20, 200];
+      expect(yAxis.filter(fakeU, sample)).toEqual(sample);
+      // values stringifies finite splits and blanks thinned (null) ones.
+      expect(yAxis.values(null, [5, null, 20])).toEqual(["5", "", "20"]);
+    }
+  });
+
+  it("thinByPixelGap blanks labels closer than the min gap, keeps spaced ones", async () => {
+    const { thinByPixelGap } = await import("../src/optimiser/api/static/panels.js");
+    // Ascending splits; positions bunch near zero (6-12px), 50 is far. minGap=13.
+    const splits = [-20, -10, 0, 10, 20, 50];
+    const positions = [100, 94, 88, 80, 66, 20];
+    // -20 anchors; -10(6px) & 0(12px) blanked; 10(20px from -20) kept; 20(14px
+    // from 10) kept; 50 far kept. → no two kept labels within 13px.
+    expect(thinByPixelGap(splits, positions, 13)).toEqual([-20, null, null, 10, 20, 50]);
+    // Well-spaced input keeps everything; nulls pass through as nulls.
+    expect(thinByPixelGap([1, 2, 3], [60, 40, 20], 13)).toEqual([1, 2, 3]);
+    expect(thinByPixelGap([1, null, 3], [60, 50, 40], 13)).toEqual([1, null, 3]);
+  });
+
+  it("decision/mode ribbons disable the horizontal cursor crosshair", async () => {
+    const byPanel = await buildByPanel();
+    expect(byPanel.ribbon.opts.cursor.y).toBe(false);
+    expect(byPanel.mode.opts.cursor.y).toBe(false);
+    // Data panels keep the crosshair available (CSS gates it to :hover).
+    expect(byPanel.soc.opts.cursor.y).not.toBe(false);
+    expect(byPanel.prices.opts.cursor.y).not.toBe(false);
+  });
+
+  it("price panel has a top, single-line time axis (no clipping date row)", async () => {
+    const byPanel = await buildByPanel();
+    const xAxis = byPanel.prices.opts.axes[0];
+    expect(xAxis.side).toBe(0);                  // top
+    expect(typeof xAxis.values).toBe("function");
+    // Single line: the formatter never emits a second-tier date (no newline).
+    const out = xAxis.values(null, [0, 3 * 3600, 6 * 3600]);
+    expect(out.every((s) => typeof s === "string" && !s.includes("\n"))).toBe(true);
+    // The bottom (cost) axis keeps uPlot's default two-tier time+date values.
+    expect(byPanel.cost.opts.axes[0].values).toBeUndefined();
+  });
 });

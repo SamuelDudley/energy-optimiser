@@ -92,18 +92,67 @@ const xAxisHidden = () => ({
   grid: { stroke: GRID_STROKE, width: 1 },
   space: X_SPACE,
 });
-// Bottom (COST) panel shows the time labels.
-const xAxisShown = () => baseAxis({ scale: "x", size: 34, space: X_SPACE });
+// Single-line clock formatter ("12pm", "3pm", "6:30pm") — browser-local, matching
+// the bottom axis's time tier. Used for the PRICE top axis so it shows only the
+// time (no second-tier date row): that date row was overflowing the panel top and
+// colliding with the PRICE title. Day context lives on the bottom (COST) axis.
+const clockVals = (u, splits) => splits.map((s) => {
+  if (s == null || !Number.isFinite(s)) return "";  // guard, matching namedAxis.values
+  const d = new Date(s * 1000);
+  let h = d.getHours();
+  const m = d.getMinutes();
+  const ap = h < 12 ? "am" : "pm";
+  h = h % 12 || 12;
+  return m === 0 ? `${h}${ap}` : `${h}:${String(m).padStart(2, "0")}${ap}`;
+});
+// Bottom (COST) panel shows the full two-tier time+date labels. size must clear
+// BOTH tiers (time line + date line) or the date row clips off the panel bottom;
+// 38 fits both at the 12px font without over-reserving the short panel's height.
+const xAxisShown = () => baseAxis({ scale: "x", size: 38, space: X_SPACE });
 // Top time axis (PRICE panel) — time VALUES above the plot so the time is
-// readable at the top of the tall stack too, not only at the bottom.
-const xAxisTop = () => baseAxis({ scale: "x", side: 0, size: 20, space: X_SPACE });
+// readable at the top of the tall stack too, not only at the bottom. Time-only
+// (clockVals), single line, so it fits in a thin band without clipping.
+const xAxisTop = () => baseAxis({ scale: "x", side: 0, size: 20, space: X_SPACE, values: clockVals });
 
 const yAxis = (extra = {}) => baseAxis({ scale: "y", size: gutter(), ...extra });
+// Minimum vertical gap (px) between two RENDERED y-labels. ~ the 12px axis font
+// plus a hair of breathing room, so labels never touch on a compressed range.
+const MIN_LABEL_GAP_PX = 13;
+
+// Pure label-thinning: walk splits in order and blank (null) any whose pixel
+// position is within `minGap` of the previously KEPT split. Exported for unit
+// testing. Keeps labels dense where the axis has room and thins only where the
+// arcsinh squeeze bunches them (the near-zero cluster on cost/grid).
+export function thinByPixelGap(splits, positions, minGap) {
+  let lastPos = null;
+  return splits.map((v, i) => {
+    if (v == null) return null;
+    const pos = positions[i];
+    if (lastPos == null || Math.abs(pos - lastPos) >= minGap) {
+      lastPos = pos;
+      return v;
+    }
+    return null;
+  });
+}
+
 // A y-axis with explicit named ticks (for the arcsinh price/cost/grid panels),
 // filtered to the visible range, null-safe so a threshold-coincident split
 // never prints "null".
+//
+// The custom `filter` is LOAD-BEARING and does TWO jobs the diff must keep
+// together: (1) for distr:4 (asinh) uPlot installs a default `log10AxisValsFilt`
+// that blanks any split whose mantissa digit isn't in a space-derived regex — it
+// collapsed our [5,10,15,20,40] to just "10","15" (mantissa "1"). Supplying our
+// own filter wins over the distr default (`axis.filter = fnOrSelf(axis.filter ||
+// logFilt)`), killing the niceness-blanking so every named split is eligible.
+// (2) That default filter was ALSO uPlot's only y-label overlap protection
+// (uPlot does no downstream collision detection); a pure identity filter would
+// let bunched asinh labels overlap on a compressed range (cost evening peak).
+// So we re-add overlap thinning by pixel spacing via thinByPixelGap.
 const namedAxis = (splits) => yAxis({
   splits: (u, _a, min, max) => splits.filter((v) => v >= min && v <= max),
+  filter: (u, sp) => thinByPixelGap(sp, sp.map((v) => u.valToPos(v, "y")), MIN_LABEL_GAP_PX),
   values: (u, sp) => sp.map((v) => (v == null || !Number.isFinite(v)) ? "" : String(v)),
 });
 // Tight range for the arcsinh scales. uPlot's default asinh range-padding is
@@ -199,6 +248,8 @@ function ribbonPanel(key, getCats, tooltipEl) {
     series, dataFn,
     scaleY: { range: [0, 1] },
     yAxisCfg: yAxisBlank(),
+    // A horizontal crosshair makes no sense on a categorical lane — never draw it.
+    cursor: { y: false },
     plugins: [
       ribbonPlugin({
         getCats,
@@ -352,7 +403,9 @@ function makePanel({ el, unionX, spec, model, xMode, peers, hub }) {
     legend: { show: false },
     // Merge drag opts with hub sync opts so both coexist. Spreading hubOpts
     // wholesale would overwrite cursor with only { sync }, dropping drag.
-    cursor: { ...cursorDragOpts(), ...(hubOpts.cursor || {}) },
+    // spec.cursor (e.g. { y: false } for ribbons) is applied last so a panel can
+    // opt out of the horizontal crosshair entirely.
+    cursor: { ...cursorDragOpts(), ...(hubOpts.cursor || {}), ...(spec.cursor || {}) },
     plugins: spec.plugins || [],
     hooks: hubOpts.hooks,
   };
