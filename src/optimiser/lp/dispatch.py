@@ -121,12 +121,14 @@ def dispatch_from_slot(
     *,
     current_soc_pct: float,
     measured_pv_kw: float | None = None,
+    buy_active: bool = False,
 ) -> LPDispatch:
     """Turn the LP's slot-0 decision into an inverter-ready dispatch.
 
     Mapping:
       |battery_kw| < DEADBAND_KW       → SELF_CONSUME (mode 2), cap = 0
-      battery_kw > 0, grid-dominant    → CHARGE_GRID_FIRST (mode 3), cap = battery_kw
+      battery_kw > 0, grid-dominant    → CHARGING_PV_FIRST (mode 4), cap = battery_kw
+                                          (buy_active → cap = max_ac + max_dc, "take it all")
       battery_kw > 0, PV-dominant      → SELF_CONSUMPTION (mode 2), cap = battery_kw (LP rate)
       battery_kw < 0, PV > threshold   → DISCHARGE_PV_FIRST (mode 5), cap = max_discharge_kw
       battery_kw < 0, PV ≤ threshold   → DISCHARGE_ESS_FIRST (mode 6), cap = max_discharge_kw
@@ -187,18 +189,28 @@ def dispatch_from_slot(
 
     if battery_kw > 0:
         # Charging. Read grid contribution directly from the LP solution
-        # (no inference). When grid > pv we want explicit mode-3 grid
-        # charging so the cap (40032) is honoured; when pv ≥ grid (or
-        # pv-only), use mode 2 with adaptive trim so the inverter charges
-        # from PV at a rate that lets surplus also flow to export rather
-        # than cascade-saturating the battery first.
-        if (
-            slot_0.grid_to_battery_kw
-            > slot_0.pv_to_battery_kw + MODE_SWITCH_HYSTERESIS_KW
-        ):
+        # (no inference). When grid > pv this is a grid-dominant charge;
+        # when pv ≥ grid (or pv-only), use mode 2 with adaptive trim so the
+        # inverter charges from PV at a rate that lets surplus also flow to
+        # export rather than cascade-saturating the battery first.
+        if slot_0.grid_to_battery_kw > slot_0.pv_to_battery_kw + MODE_SWITCH_HYSTERESIS_KW:
+            # Mode 4 (PV-first), not mode 3: grid tops the charge up to the
+            # cap while PV keeps generating and feeds the battery first.
+            # Mode 3 curtails PV on this hardware (operator-observed); at
+            # PV≈0 the two are equivalent (both grid-charge to the cap), so
+            # mode 4 is used unconditionally. In buy mode the cap is full
+            # AC+DC so the inverter pulls its max grid (AC-limited to 10kW)
+            # plus all available PV — "take it all", bounded by the price
+            # ceiling (LP zeroes grid charge above it) and the SOC-cutoff
+            # auto-exit. Otherwise the cap is the LP's planned total.
+            cap_kw = (
+                battery_config.max_ac_charge_kw + battery_config.max_dc_charge_kw
+                if buy_active
+                else battery_kw
+            )
             return LPDispatch(
-                mode=RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST,
-                cap_kw=battery_kw,
+                mode=RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST,
+                cap_kw=cap_kw,
                 signed_intent_kw=battery_kw,
                 kind=DispatchKind.CHARGE,
             )
@@ -214,9 +226,7 @@ def dispatch_from_slot(
     pv_signal_kw = (
         measured_pv_kw
         if measured_pv_kw is not None
-        else (
-            slot_0.pv_to_house_kw + slot_0.pv_to_battery_kw + slot_0.pv_to_export_kw
-        )
+        else (slot_0.pv_to_house_kw + slot_0.pv_to_battery_kw + slot_0.pv_to_export_kw)
     )
     if pv_signal_kw > PV_PRODUCING_THRESHOLD_KW:
         discharge_mode = RemoteEMSControlMode.COMMAND_DISCHARGING_PV_FIRST

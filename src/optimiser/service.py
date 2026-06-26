@@ -1183,11 +1183,15 @@ class Service:
             await self._lp_fallback(FallbackReason.LP_ERROR)
             return None, None
 
+        # Buy mode at the current slot makes grid-charge "take it all"
+        # (full AC+DC cap). buy_active_at is per-slot; slot 0 is now.
+        buy_active_now = bool(mode_overrides.buy_active_at and mode_overrides.buy_active_at[0])
         dispatch = dispatch_from_slot(
             solution.slot_0,
             self._config.battery,
             current_soc_pct=state.soc_pct,
             measured_pv_kw=state.pv_power_kw,
+            buy_active=buy_active_now,
         )
         return solution, dispatch
 

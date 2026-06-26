@@ -42,6 +42,16 @@ def _charge_dispatch(kw: float = 3.0) -> LPDispatch:
     )
 
 
+def _pv_first_charge_dispatch(kw: float = 5.0) -> LPDispatch:
+    """Grid-dominant charge now emits mode 4 (PV-first) so PV stays on."""
+    return LPDispatch(
+        mode=RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST,
+        cap_kw=kw,
+        signed_intent_kw=kw,
+        kind=DispatchKind.CHARGE,
+    )
+
+
 def _discharge_dispatch(kw: float = 4.0) -> LPDispatch:
     return LPDispatch(
         mode=RemoteEMSControlMode.COMMAND_DISCHARGING_ESS_FIRST,
@@ -123,6 +133,26 @@ class TestWriteOrdering:
             "u16",
             REG_REMOTE_EMS_CONTROL_MODE,
             RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST.value,
+        )
+
+    async def test_pv_first_charge_writes_cap_before_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mode 4 (PV-first charge) writes the cap to 40032 (the charge
+        limit, same register as mode 3) then the mode register."""
+        ctrl = _controller()
+        rec = _WriteRecorder()
+        _install_recorder(ctrl, monkeypatch, rec)
+
+        assert await ctrl.apply_lp_dispatch(_pv_first_charge_dispatch(kw=5.0))
+
+        assert len(rec.calls) == 2
+        assert rec.calls[0] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 5000)
+        assert rec.calls[1] == (
+            "u16",
+            REG_REMOTE_EMS_CONTROL_MODE,
+            RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST.value,
         )
 
     async def test_discharge_writes_cap_before_mode(
@@ -222,17 +252,22 @@ class TestWriteOrdering:
         async def _read_state():
             return SystemState(
                 timestamp=datetime.now(UTC),
-                soc_pct=50.0, battery_power_kw=0.0,
-                pv_power_kw=3.0,        # below export cap
-                grid_power_kw=-2.5, house_load_kw=0.5,
-                ems_mode=2, outdoor_temp_c=None, occupied=True,
+                soc_pct=50.0,
+                battery_power_kw=0.0,
+                pv_power_kw=3.0,  # below export cap
+                grid_power_kw=-2.5,
+                house_load_kw=0.5,
+                ems_mode=2,
+                outdoor_temp_c=None,
+                occupied=True,
             )
 
         monkeypatch.setattr("asyncio.sleep", _no_sleep)
         monkeypatch.setattr(ctrl, "read_state", _read_state)
 
         assert await ctrl.apply_lp_dispatch(
-            _self_consume_dispatch(), export_cap_kw=5.0,
+            _self_consume_dispatch(),
+            export_cap_kw=5.0,
         )
 
         # Phase-B writes 0 — no surplus over export cap
@@ -274,9 +309,7 @@ class TestWriteFailureSafety:
         )
         _install_recorder(ctrl, monkeypatch, rec)
 
-        result = await ctrl.apply_lp_dispatch(
-            _mode2_charge_dispatch(), export_cap_kw=0.0
-        )
+        result = await ctrl.apply_lp_dispatch(_mode2_charge_dispatch(), export_cap_kw=0.0)
 
         assert result is False
         # Only the 40032 attempt happened — no mode write
@@ -329,9 +362,7 @@ class TestMode2Adaptive:
             occupied=True,
         )
 
-    async def test_phase_b_trims_pv_minus_export_cap(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_phase_b_trims_pv_minus_export_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """pv=9, export_cap=5, headroom=0.5 → trim = 3.5 kW. Trim
         formula uses PV alone (not pv-house) — the cascade serves house
         at priority 1 from PV automatically; including house in the
@@ -372,9 +403,7 @@ class TestMode2Adaptive:
         # pv 9 - export 5 - headroom 0.5 = 3.5 kW → 3500
         assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 3500)
 
-    async def test_phase_b_lp_rate_is_trim_floor(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_phase_b_lp_rate_is_trim_floor(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If measured surplus is below LP rate, trim collapses to the
         LP rate — protects against transient PV droop during Phase A."""
         ctrl = _controller()
@@ -398,9 +427,7 @@ class TestMode2Adaptive:
         # max(LP_rate=4, max(0, 1-5) - 0.5) = 4 → 4000
         assert rec.calls[2] == ("u32", REG_ESS_MAX_CHARGING_LIMIT, 4000)
 
-    async def test_phase_b_clamped_to_max_dc_charge(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_phase_b_clamped_to_max_dc_charge(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Trim never exceeds the physical DC charge limit, even with
         absurdly high measured surplus."""
         ctrl = _controller()
@@ -444,7 +471,8 @@ class TestMode2Adaptive:
         monkeypatch.setattr(ctrl, "read_state", _read_state)
 
         assert await ctrl.apply_lp_dispatch(
-            _mode2_charge_dispatch(), export_cap_kw=5.0,
+            _mode2_charge_dispatch(),
+            export_cap_kw=5.0,
         )
 
         # Phase A only: 40032=max, mode=2. No Phase-B trim.
@@ -578,9 +606,7 @@ class TestMeasureUncappedPV:
         assert result.saturated is False
         assert result.pv_kw == 11.0
 
-    async def test_telemetry_failure_returns_pv_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_telemetry_failure_returns_pv_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Modbus blip during settle → caller falls back to Solcast."""
         ctrl = _controller()
         rec = _WriteRecorder()
@@ -604,9 +630,7 @@ class TestMeasureUncappedPV:
         assert result.pv_kw is None
         assert result.saturated is False  # never asserted
 
-    async def test_uncap_write_failure_returns_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_uncap_write_failure_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Failed 40032 write → returns None (hard failure, distinct
         from telemetry-blind which returns PVProbeResult(pv_kw=None)).
         Caller MUST treat as abort and trigger fallback."""
@@ -673,10 +697,14 @@ class TestApplyDispatchPrefetched:
         monkeypatch.setattr(ctrl, "read_state", _read_state)
 
         prefetched = PVProbeResult(
-            pv_kw=9.0, saturated=False,
-            bat_kw=8.5, bat_avail_kw=13.0,
-            grid_export_kw=0.0, export_cap_kw=5.0,
-            house_kw=0.5, soc_pct=50.0,
+            pv_kw=9.0,
+            saturated=False,
+            bat_kw=8.5,
+            bat_avail_kw=13.0,
+            grid_export_kw=0.0,
+            export_cap_kw=5.0,
+            house_kw=0.5,
+            soc_pct=50.0,
         )
         assert await ctrl.apply_lp_dispatch(
             _mode2_charge_dispatch(signed_intent_kw=1.0),
@@ -710,10 +738,14 @@ class TestApplyDispatchPrefetched:
         monkeypatch.setattr("asyncio.sleep", _sleep)
 
         blind = PVProbeResult(
-            pv_kw=None, saturated=False,
-            bat_kw=None, bat_avail_kw=None,
-            grid_export_kw=None, export_cap_kw=5.0,
-            house_kw=None, soc_pct=None,
+            pv_kw=None,
+            saturated=False,
+            bat_kw=None,
+            bat_avail_kw=None,
+            grid_export_kw=None,
+            export_cap_kw=5.0,
+            house_kw=None,
+            soc_pct=None,
         )
         assert await ctrl.apply_lp_dispatch(
             _mode2_charge_dispatch(signed_intent_kw=1.0),
@@ -730,9 +762,7 @@ class TestAssertSOCLimits:
     re-assertion (discharge-side only, skipping 40047 so it doesn't
     fight §3.3's tick-managed charge cutoff)."""
 
-    async def test_startup_writes_all_three_limits(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_startup_writes_all_three_limits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctrl = _controller()
         rec = _WriteRecorder()
         _install_recorder(ctrl, monkeypatch, rec)
@@ -763,9 +793,7 @@ class TestAssertSOCLimits:
         assert REG_BACKUP_SOC in addresses
         assert len(rec.calls) == 2
 
-    async def test_periodic_propagates_write_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_periodic_propagates_write_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctrl = _controller()
         rec = _WriteRecorder(u16_returns={REG_BACKUP_SOC: False})
         _install_recorder(ctrl, monkeypatch, rec)
