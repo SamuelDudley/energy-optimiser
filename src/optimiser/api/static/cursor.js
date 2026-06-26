@@ -115,6 +115,41 @@ function pickValFromEnd(u, skipLast, rowIdx) {
   return null;
 }
 
+// Formatted value HTML for one panel at rowIdx — the per-panel on-chart hover
+// tooltip. Mirrors updateReadout's per-panel logic. Returns null when there's
+// no value to show (so the tooltip stays hidden). Exported for unit testing.
+export function panelValueHtml(u, spec, rowIdx, model) {
+  if (rowIdx == null) return null;
+  // Decision / mode ribbons — the category label + its colour dot.
+  if (spec.catField) {
+    const cats   = spec.catField === "decision" ? (model && model.decisionCats) : (model && model.modeCats);
+    const labels = spec.catField === "decision" ? DECISION_LABELS : MODE_LABELS;
+    const colors = spec.catField === "decision" ? DECISION_COLORS : MODE_COLORS;
+    const c = cats && rowIdx < cats.length ? cats[rowIdx] : null;
+    if (c == null) return null;
+    return `<span style="color:${colors[c] ?? "#8b949e"}">&#9679;</span> ${labels[c] ?? "—"}`;
+  }
+  // Price — import & export, realised preferred then predicted.
+  if (spec.importIdx != null) {
+    const imp = pickVal(u, spec.importIdx, spec.importPredIdx, rowIdx);
+    const exp = pickVal(u, spec.exportIdx, spec.exportPredIdx, rowIdx);
+    if (imp == null && exp == null) return null;
+    const impStr = imp != null ? fmtValue(imp, 1) : "—";
+    const expStr = exp != null ? fmtValue(exp, 1) : "—";
+    return `imp <b>${impStr}</b> / exp <b>${expStr}</b> c/kWh`;
+  }
+  // Load — scan from the right for the envelope.
+  if (spec.scanFromEnd) {
+    const v = pickValFromEnd(u, 1, rowIdx) ?? pickValFromEnd(u, 0, rowIdx);
+    return v != null ? `<b>${fmtValue(v, 2)}</b> ${spec.unit}` : null;
+  }
+  // Everything else — dataIdx with altIdx (and grid's end-scan) fallback.
+  let v = pickVal(u, spec.dataIdx, spec.altIdx, rowIdx);
+  if (v == null && spec.endAlt) v = pickValFromEnd(u, 0, rowIdx);
+  if (v == null) return null;
+  return spec.unit ? `<b>${fmtValue(v, 2)}</b> ${spec.unit}` : `<b>${fmtValue(v, 2)}</b>`;
+}
+
 /**
  * wireCursor(instances, getModel, { setCursor, nearestSlotAt })
  *
@@ -287,6 +322,49 @@ export function wireCursor(instances, getModel, { setCursor, nearestSlotAt }) {
         lastPinnedIdx = idx;
         setCursor(slot, { pinned: true });  // → dashboard re-renders via renderAt
       }
+    });
+  }
+
+  // Per-panel on-chart hover tooltip: each panel shows ITS OWN value at the
+  // cursor, right next to the crosshair. The setCursor hook fires on every synced
+  // instance so all tooltips are filled, but CSS reveals only the hovered panel's
+  // (#ts-figure .uplot:hover ~ .panel-tip.has-value) — mirroring the crosshair
+  // gating. This complements the top readout strip (which shows all panels at
+  // once) by putting the value where the pointer is, even when scrolled down.
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  for (let i = 0; i < instances.length && i < PANEL_READOUT.length; i++) {
+    const u = instances[i];
+    const spec = PANEL_READOUT[i];
+    const panelEl = u.root && u.root.parentElement;
+    if (!panelEl) continue;
+    let tip = panelEl.querySelector(".panel-tip");
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.className = "panel-tip";
+      panelEl.appendChild(tip);
+    }
+    const tipEl = tip;
+    (u.hooks.setCursor ||= []).push(() => {
+      const idx = u.cursor.idx;
+      const html = idx == null ? null : panelValueHtml(u, spec, idx, getModel());
+      if (!html) { tipEl.classList.remove("has-value"); return; }
+      tipEl.innerHTML = html;
+      tipEl.classList.add("has-value");
+      // u.cursor.left is plot-area-relative; u.bbox.left/dpr is the plot's left
+      // offset within the panel (the y-axis gutter). Add it so the tip tracks the
+      // cursor. Read width LIVE (a window resize calls setSize without re-running
+      // wireCursor, so a cached width would go stale and break the edge flip); the
+      // tip is absolutely positioned so this is cheap. Only measure the tip near
+      // the right edge, where the flip-left actually matters.
+      const overLeft = (u.bbox && u.bbox.left ? u.bbox.left : 0) / dpr;
+      const base = u.cursor.left + overLeft;
+      const w = panelEl.clientWidth || 1;
+      let ttLeft = base + 10;
+      if (base > w * 0.6) {
+        const ttW = tipEl.offsetWidth || 80;
+        if (base + 10 + ttW > w) ttLeft = base - ttW - 8;
+      }
+      tipEl.style.left = Math.max(0, ttLeft) + "px";
     });
   }
 

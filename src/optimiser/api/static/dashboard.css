@@ -332,6 +332,30 @@ main {
 }
 /* The price panel has a TOP time axis — drop its title below the time labels. */
 #ts-figure .uplot-panel[data-panel="prices"] .panel-title { top: 24px; }
+/* Per-panel on-chart hover tooltip (cursor.js). Hidden by default; revealed only
+   on the panel under the pointer (sibling of .uplot, gated by :hover like the
+   horizontal crosshair) so the synced peers don't all show theirs at once. */
+#ts-figure .panel-tip {
+  position: absolute;
+  top: 3px;
+  display: none;
+  pointer-events: none;
+  background: rgba(13, 17, 23, 0.85);
+  border: 1px solid #444c56;
+  border-radius: 4px;
+  padding: 2px 7px;
+  font: 11px var(--font, system-ui, sans-serif);
+  color: #e8edf2;
+  white-space: nowrap;
+  z-index: 5;
+}
+#ts-figure .uplot:hover ~ .panel-tip.has-value { display: block; }
+/* The price panel's title sits at top:24 — drop its hover tip below the title. */
+#ts-figure .uplot-panel[data-panel="prices"] .panel-tip { top: 40px; }
+/* The decision/mode ribbons are ~17px lanes — anchor the tip to the BOTTOM so it
+   grows upward into the lane instead of spilling below the panel. */
+#ts-figure .uplot-panel[data-panel="ribbon"] .panel-tip,
+#ts-figure .uplot-panel[data-panel="mode"] .panel-tip { top: auto; bottom: 2px; }
 /* Cursor crosshair: the synced VERTICAL line (.u-cursor-x) stays on every panel
    for time alignment, but the HORIZONTAL rule (.u-cursor-y) only makes sense on
    the panel under the pointer. uPlot leaves the horizontal line visible on all
