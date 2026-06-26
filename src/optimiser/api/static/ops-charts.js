@@ -29,7 +29,6 @@ const COLOR_OK  = "#3fb950";  // green
 const COLOR_ERR = "#f85149";  // red
 const COLOR_HIST = "#58a6ff"; // blue
 
-const PANEL_BG   = "#161b22";
 const GRID_STROKE = "#21262d";
 const AXIS_STROKE = "#c9d1d9";
 const TICK_STROKE = "#21262d";
@@ -44,18 +43,86 @@ function axisFont() {
   return "12px " + body;
 }
 
+// Left-gutter convention matched to the Energy panels (panels.js): the y-axis
+// SIZE is the entire left gutter and padding-left is 0. The earlier ops charts
+// doubled up (padding.left 48 + y-axis size 48 = ~96px of wasted left space);
+// this is the "excess left padding" the data ran far in from the panel edge.
+// Narrow stays at 48 (not tighter): a numeric uPlot axis.size is a FIXED
+// reservation and the solve-series y-axis shows ms — up to 5 digits ("20000" at
+// the ~20s solver timeout). 48px clears that; 40 clipped the leading digit on
+// mobile. Removing the OLD doubled gutter (padding-left 36 + size 48 = 84px) is
+// still the win — mobile drops 84 → 48.
+const GUTTER_WIDE = 52, GUTTER_NARROW = 48;
+const opsGutter = () => (isNarrow() ? GUTTER_NARROW : GUTTER_WIDE);
+// [top, right, bottom] — left is always 0 (the gutter is the y-axis size). Top
+// clears the absolutely-positioned overlay legend (top:4 + ~15px tall) so it
+// doesn't graze the data; bottom carries the x-axis category/time labels.
+function opsMargin() {
+  return isNarrow()
+    ? { top: 14, right: 8,  bottom: 30 }
+    : { top: 16, right: 16, bottom: 34 };
+}
+// Shared y-axis spec (the left gutter). Used by every ops chart so the gutter
+// width and font are defined once.
+function opsYAxis() {
+  return {
+    scale: "y",
+    size:  opsGutter(),
+    stroke: AXIS_STROKE,
+    grid:  { stroke: GRID_STROKE },
+    ticks: { stroke: TICK_STROKE },
+    font:  axisFont(),
+  };
+}
+
+// Reusable hover-value tooltip for an ops chart. `formatAt(u, idx)` returns the
+// inner HTML for the hovered x-index, or null/"" to hide. Creates one absolutely-
+// positioned `.ops-tooltip` inside `el` and follows the cursor, flipping left of
+// it near the right edge. Mirrors the original solve-series tooltip so all four
+// ops charts now surface their values on hover.
+function tooltipPlugin(el, formatAt) {
+  let tip = null;
+  return {
+    hooks: {
+      init: [() => {
+        el.style.position = "relative";
+        tip = document.createElement("div");
+        tip.className = "ops-tooltip";
+        el.appendChild(tip);
+      }],
+      setCursor: [(u) => {
+        if (!tip) return;
+        const idx = u.cursor.idx;
+        const html = idx == null ? null : formatAt(u, idx);
+        if (!html) { tip.style.display = "none"; return; }
+        tip.innerHTML = html;
+        tip.style.display = "block";
+        // u.cursor.left is relative to the plot area (.u-over); the tooltip is
+        // positioned within `el`, whose left edge sits a y-axis gutter to the
+        // left of the plot. Add that offset so the tooltip tracks the actual
+        // cursor instead of landing gutter-px to its left.
+        const overLeft = u.over.getBoundingClientRect().left - el.getBoundingClientRect().left;
+        const base = u.cursor.left + overLeft;
+        const elW = el.clientWidth;
+        const ttW = tip.offsetWidth || 120;
+        const ttLeft = base + 12 + ttW > elW ? base - ttW - 8 : base + 12;
+        tip.style.left = Math.max(0, ttLeft) + "px";
+        tip.style.top  = "8px";
+      }],
+    },
+  };
+}
+
 /** Build standard uPlot opts common to all ops bar charts. */
 function baseBarOpts(containerId, width, height, extra) {
-  const narrow = isNarrow();
-  const margin = narrow
-    ? { top: 22, left: 36, right: 6,  bottom: 32 }
-    : { top: 26, left: 48, right: 12, bottom: 36 };
+  const margin = opsMargin();
   return Object.assign(
     {
       id: containerId,
       width,
       height,
-      padding: [margin.top, margin.right, margin.bottom, margin.left],
+      // left:0 — the gutter IS the y-axis size (Energy north star).
+      padding: [margin.top, margin.right, margin.bottom, 0],
       scales: {
         x: { time: false, range: (u, min, max) => [min - 0.5, max + 0.5] },
         y: { range: (u, min, max) => [0, max <= 0 ? 1 : max * 1.1] },
@@ -69,18 +136,12 @@ function baseBarOpts(containerId, width, height, extra) {
           ticks: { stroke: TICK_STROKE },
           font:  axisFont(),
         },
-        // y axis
-        {
-          scale: "y",
-          size:  48,
-          stroke: AXIS_STROKE,
-          grid:  { stroke: GRID_STROKE },
-          ticks: { stroke: TICK_STROKE },
-          font:  axisFont(),
-        },
+        opsYAxis(),
       ],
       legend: { show: false },
-      cursor: { show: false },
+      // Hover enabled (per-chart value tooltip); vertical crosshair only, no drag
+      // (small charts, mobile-friendly).
+      cursor: { show: true, y: false, drag: { x: false, y: false, setScale: false } },
     },
     extra || {},
   );
@@ -180,16 +241,29 @@ function buildSolveSeries(containerId, solveData) {
 
   const width  = el.clientWidth  > 0 ? el.clientWidth  : 500;
   const height = el.clientHeight > 0 ? el.clientHeight : 220;
-  const narrow = isNarrow();
-  const margin = narrow
-    ? { top: 22, left: 36, right: 6,  bottom: 32 }
-    : { top: 26, left: 48, right: 12, bottom: 36 };
+  const margin = opsMargin();
+
+  // Tooltip content for the hovered x-index: one line per status with its ms.
+  function solveFormatAt(u, idx) {
+    const lines = [];
+    for (let si = 0; si < statusKeys.length; si++) {
+      const val = u.data[si + 1][idx];
+      if (val == null) continue;
+      const s = statusKeys[si];
+      const color = STATUS_COLOR[s] || "#8b949e";
+      lines.push(`<span style="color:${color}">&#9679;</span> ${s}: <b>${val.toFixed(0)} ms</b>`);
+    }
+    if (lines.length === 0) return null;
+    const tsSec = u.data[0][idx];
+    const tsLabel = tsSec != null ? new Date(tsSec * 1000).toLocaleTimeString() : "";
+    return (tsLabel ? `<div class="tt-title">${tsLabel}</div>` : "") + lines.join("<br>");
+  }
 
   const opts = {
     id: containerId,
     width,
     height,
-    padding: [margin.top, margin.right, margin.bottom, margin.left],
+    padding: [margin.top, margin.right, margin.bottom, 0],
     scales: {
       x: { time: true },
       y: {
@@ -206,15 +280,7 @@ function buildSolveSeries(containerId, solveData) {
         ticks: { stroke: TICK_STROKE },
         font:  axisFont(),
       },
-      // y: ms
-      {
-        scale: "y",
-        size:  48,
-        stroke: AXIS_STROKE,
-        grid:  { stroke: GRID_STROKE },
-        ticks: { stroke: TICK_STROKE },
-        font:  axisFont(),
-      },
+      opsYAxis(),  // y: ms — shared left gutter
     ],
     // One series per status — points only (no line)
     series: [
@@ -231,86 +297,15 @@ function buildSolveSeries(containerId, solveData) {
     legend: { show: false },   // custom overlay legend added after construction
     cursor: {
       show: true,
+      y: false,   // vertical crosshair only
       // no drag (ops charts are small; mobile compat)
       drag: { x: false, y: false, setScale: false },
     },
-    plugins: [
-      {
-        hooks: {
-          setCursor: [
-            (u) => {
-              const idx = u.cursor.idx;
-              if (idx == null || statusKeys.length === 0) {
-                tooltip.style.display = "none";
-                return;
-              }
-
-              // Collect non-null values at this x index
-              const lines = [];
-              for (let si = 0; si < statusKeys.length; si++) {
-                const val = u.data[si + 1][idx];
-                if (val == null) continue;
-                const s = statusKeys[si];
-                const color = STATUS_COLOR[s] || "#8b949e";
-                lines.push(
-                  `<span style="color:${color}">&#9679;</span> ${s}: <b>${val.toFixed(0)} ms</b>`
-                );
-              }
-
-              if (lines.length === 0) {
-                tooltip.style.display = "none";
-                return;
-              }
-
-              // Format the timestamp
-              const tsSec = u.data[0][idx];
-              const tsLabel = tsSec != null
-                ? new Date(tsSec * 1000).toLocaleTimeString()
-                : "";
-
-              tooltip.innerHTML =
-                (tsLabel ? `<div style="color:#8b949e;margin-bottom:2px">${tsLabel}</div>` : "") +
-                lines.join("<br>");
-              tooltip.style.display = "block";
-
-              // Position the tooltip: follow cursor, avoid right-edge overflow
-              const left = u.cursor.left;
-              const chartW = u.over.clientWidth;
-              const ttW = tooltip.offsetWidth || 120;
-              const ttLeft = left + 12 + ttW > chartW
-                ? left - ttW - 8
-                : left + 12;
-              tooltip.style.left = Math.max(0, ttLeft) + "px";
-              tooltip.style.top  = "8px";
-            },
-          ],
-        },
-      },
-    ],
+    plugins: [tooltipPlugin(el, solveFormatAt)],
   };
 
-  // Build tooltip overlay (absolute-positioned over the chart canvas).
-  const tooltip = document.createElement("div");
-  tooltip.style.cssText = [
-    "position:absolute",
-    "pointer-events:none",
-    "display:none",
-    `background:${PANEL_BG}`,
-    "border:1px solid #444c56",
-    "border-radius:4px",
-    "padding:6px 10px",
-    "font:12px sans-serif",
-    "color:#e8edf2",
-    "z-index:10",
-    "white-space:nowrap",
-    "line-height:1.6",
-  ].join(";");
-
-  // Clear container and mount (tooltip first so uPlot's canvas stacks on top,
-  // but z-index:10 keeps the tooltip visible above the canvas).
   el.innerHTML = "";
   el.style.position = "relative";
-  el.appendChild(tooltip);
 
   const u = new uPlot(opts, data, el);
   // v1 a11y hygiene (spec §10.2).
@@ -367,14 +362,7 @@ function buildHistogram(containerId, solveData) {
         splits: (u) => xData,
         values: (u, splits) => splits.map(i => labels[i] ?? ""),
       },
-      {
-        scale: "y",
-        size:  48,
-        stroke: AXIS_STROKE,
-        grid:  { stroke: GRID_STROKE },
-        ticks: { stroke: TICK_STROKE },
-        font:  axisFont(),
-      },
+      opsYAxis(),
     ],
     series: [
       {}, // x
@@ -387,6 +375,12 @@ function buildHistogram(containerId, solveData) {
         points: { show: false },
       },
     ],
+    plugins: [tooltipPlugin(el, (u, idx) => {
+      const label = labels[idx];
+      const count = u.data[1][idx];
+      if (label == null || count == null) return null;
+      return `<div class="tt-title">${label}</div><b>${count}</b> solve${count === 1 ? "" : "s"}`;
+    })],
   });
 
   el.innerHTML = "";
@@ -451,14 +445,7 @@ function buildStatusBars(containerId, solveData) {
         splits: (u) => xData,
         values: (u, splits) => splits.map(i => ordered[i] ?? ""),
       },
-      {
-        scale: "y",
-        size:  48,
-        stroke: AXIS_STROKE,
-        grid:  { stroke: GRID_STROKE },
-        ticks: { stroke: TICK_STROKE },
-        font:  axisFont(),
-      },
+      opsYAxis(),
     ],
     series: [
       {}, // x
@@ -482,6 +469,13 @@ function buildStatusBars(containerId, solveData) {
         points: { show: false },
       },
     ],
+    plugins: [tooltipPlugin(el, (u, idx) => {
+      const label = ordered[idx];
+      const count = u.data[1][idx];
+      if (label == null || count == null) return null;
+      const color = STATUS_COLOR[label] || "#8b949e";
+      return `<span style="color:${color}">&#9679;</span> <b>${label}</b>: ${count}`;
+    })],
   });
 
   el.innerHTML = "";
@@ -588,14 +582,7 @@ function buildModbusWrites(containerId, modbusData) {
         splits: (u) => xData,
         values: (u, splits) => splits.map(i => regs[i] ?? ""),
       },
-      {
-        scale: "y",
-        size:  48,
-        stroke: AXIS_STROKE,
-        grid:  { stroke: GRID_STROKE },
-        ticks: { stroke: TICK_STROKE },
-        font:  axisFont(),
-      },
+      opsYAxis(),
     ],
     series: [
       {}, // x
@@ -617,6 +604,14 @@ function buildModbusWrites(containerId, modbusData) {
       },
     ],
     legend: { show: false },   // custom overlay legend added after construction
+    plugins: [tooltipPlugin(el, (u, idx) => {
+      const reg = regs[idx];
+      if (reg == null) return null;
+      const ok = u.data[1][idx], err = u.data[2][idx];
+      return `<div class="tt-title">reg ${reg}</div>` +
+        `<span style="color:${COLOR_OK}">&#9679;</span> ok: <b>${ok ?? 0}</b><br>` +
+        `<span style="color:${COLOR_ERR}">&#9679;</span> err: <b>${err ?? 0}</b>`;
+    })],
   });
 
   el.innerHTML = "";

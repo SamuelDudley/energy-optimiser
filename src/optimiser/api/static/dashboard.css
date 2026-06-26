@@ -387,6 +387,24 @@ main {
 .chart-legend-item .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: 0 0 auto; }
 .chart-legend-item.off { opacity: 0.4; text-decoration: line-through; }
 
+/* Hover-value tooltip for the ops charts (added by ops-charts.js tooltipPlugin).
+   Absolutely positioned inside the chart container, follows the cursor. */
+.ops-tooltip {
+  position: absolute;
+  pointer-events: none;
+  display: none;
+  background: var(--bg-elev, #161b22);
+  border: 1px solid #444c56;
+  border-radius: 4px;
+  padding: 6px 10px;
+  font: 12px var(--font, system-ui, sans-serif);
+  color: #e8edf2;
+  z-index: 10;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+.ops-tooltip .tt-title { color: var(--muted, #8b949e); margin-bottom: 2px; }
+
 .panel-loads  { grid-column: 1 / span 1; }
 .panel-events { grid-column: 2 / span 1; }
 .loads-grid {
@@ -697,8 +715,11 @@ main {
 /* Grid placement — share the energy `main` 2-col grid. Full-width
    panels stack at the top; bottom row splits API table + state events
    side by side, matching the loads/events row in the energy view. */
-.panel-ops-solve  { grid-column: 1 / span 2; }
-.panel-ops-modbus { grid-column: 1 / span 2; }
+/* Chart panels use a tight inset (like .panel-charts on the Energy tab) so the
+   graphs run close to the panel edge; the text-heavy api/state panels keep the
+   default .panel padding for readability. */
+.panel-ops-solve  { grid-column: 1 / span 2; padding: 6px; }
+.panel-ops-modbus { grid-column: 1 / span 2; padding: 6px; }
 .panel-ops-api    { grid-column: 1 / span 1; }
 .panel-ops-state  { grid-column: 2 / span 1; }
 
