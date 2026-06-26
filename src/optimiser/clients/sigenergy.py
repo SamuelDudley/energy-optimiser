@@ -1073,7 +1073,13 @@ class SigenergyController:
                 prefetched_probe=prefetched_probe,
             )
 
-        if mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST:
+        if mode in (
+            RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST,
+            RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST,
+        ):
+            # Both charge modes cap the charge leg via 40032. Mode 4
+            # (PV-first) is the live grid-charge path — grid tops the
+            # charge up to the cap while PV keeps generating.
             cap_raw = max(0, int(round(dispatch.cap_kw * 1000)))
             if not await self._write_u32(REG_ESS_MAX_CHARGING_LIMIT, cap_raw):
                 return False

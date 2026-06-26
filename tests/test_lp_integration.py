@@ -96,12 +96,12 @@ class TestDispatchFromSlot:
             # Cutoff = current + 0.1% buffer (per the probe-mandated clamp)
             assert d.target_soc_pct == 60.1
 
-    def test_charge_grid_dominant_picks_mode_3(self) -> None:
-        # 5 kW charge with grid contributing more than PV → mode 3,
-        # cap = total intended rate. No cutoff write (mode 3 doesn't
-        # consult 40047).
+    def test_charge_grid_dominant_picks_mode_4(self) -> None:
+        # 5 kW charge with grid contributing more than PV → mode 4
+        # (PV-first, grid tops up) so PV keeps generating instead of being
+        # curtailed. cap = total intended rate (not buy mode).
         d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=1.0, grid_to_battery_kw=4.0))
-        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
+        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
         assert d.kind == DispatchKind.CHARGE
         assert d.cap_kw == 5.0
         assert d.signed_intent_kw == 5.0
@@ -140,10 +140,12 @@ class TestDispatchFromSlot:
         assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
         assert d.target_soc_pct == 68.0
 
-    def test_charge_grid_only_picks_mode_3(self) -> None:
-        # No PV available (e.g. overnight cheap charging) → grid-first
+    def test_charge_grid_only_picks_mode_4(self) -> None:
+        # No PV available (e.g. overnight cheap charging) → mode 4. With
+        # PV≈0, mode 4 grid-charges to the cap — equivalent to the old
+        # mode 3, so one mode covers night and day.
         d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0))
-        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
+        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
 
     def test_charge_grid_lead_below_hysteresis_stays_on_mode_2(self) -> None:
         # HiGHS routinely returns near-equal charge-source decompositions
@@ -162,9 +164,9 @@ class TestDispatchFromSlot:
         assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
         assert d.kind == DispatchKind.CHARGE
 
-    def test_charge_grid_lead_past_hysteresis_picks_mode_3(self) -> None:
+    def test_charge_grid_lead_past_hysteresis_picks_mode_4(self) -> None:
         # Same shape, but grid now leads PV by more than the hysteresis
-        # margin → mode 3 fires.
+        # margin → grid-dominant charge → mode 4.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=4.0,
@@ -172,12 +174,13 @@ class TestDispatchFromSlot:
                 grid_to_battery_kw=2.06,  # grid leads by 60 W > 50 W hysteresis
             )
         )
-        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_GRID_FIRST
+        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
 
     def test_charge_equal_split_prefers_pv(self) -> None:
-        # Tie-breaker: when grid == pv, prefer the mode-2 (PV) path.
-        # Slightly under-executes the grid portion but avoids mode 4's
-        # grid-draw hazard.
+        # Tie-breaker: grid must lead pv by the hysteresis margin to be
+        # "grid-dominant". At an equal split, stay on the mode-2 PV /
+        # adaptive-trim path so surplus can also flow to export rather than
+        # cascade-saturating the battery first.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=4.0,

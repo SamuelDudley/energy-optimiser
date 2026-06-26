@@ -41,19 +41,22 @@ keep PV generating *while* importing, so the hardware supports it.
 
 Two parts, both at the **dispatch** layer. No LP-formulation change.
 
-### Part 1 — All grid-charging keeps PV on (mode 3 → mode 4)
+### Part 1 — All grid-charging uses mode 4 (retire mode 3 from live path)
 
 In `dispatch_from_slot`, the grid-dominant charge branch
-(`grid_to_battery > pv_to_battery + MODE_SWITCH_HYSTERESIS_KW`):
+(`grid_to_battery > pv_to_battery + MODE_SWITCH_HYSTERESIS_KW`) emits
+**mode 4** (`COMMAND_CHARGING_PV_FIRST`) unconditionally, cap =
+`battery_kw` (the LP's planned total). PV is consumed first; grid tops up
+to the total.
 
-- **PV producing** (`pv_signal_kw > PV_PRODUCING_THRESHOLD_KW`, reusing the
-  same `measured_pv_kw`-with-LP-fallback signal the discharge path already
-  uses): emit **mode 4** (`COMMAND_CHARGING_PV_FIRST`), cap = `battery_kw`
-  (the LP's planned total). PV is consumed first; grid tops up to the
-  total. Mirrors the existing mode 5/6 discharge gating on live PV.
-- **PV ≈ 0** (night/heavy cloud): keep **mode 3**, cap = `battery_kw`.
-  Mode 3 is the documented grid-charge path and mode 4 with no PV is
-  untested; nothing to keep on anyway.
+No PV-threshold gating on the charge side: at PV≈0, mode 4 collapses to
+"grid-charge to the cap" — functionally identical to mode 3 — so there is
+nothing to gate. Mode 4 is `≥` mode 3 in every case (equal at night,
+keeps PV during the day). Dropping the branch removes a mode-3↔4 flap risk
+at the dawn/dusk PV threshold and captures PV the instant it appears.
+
+`COMMAND_CHARGING_GRID_FIRST` (mode 3) stays in `RemoteEMSControlMode`
+for historical-snapshot replay but is no longer emitted on the live path.
 
 ### Part 2 — Buy mode "take it all"
 
@@ -98,20 +101,27 @@ mode-2 PV adaptive-trim path.
 - `measured_pv_kw is None` (replay/tests): fall back to the LP's planned
   PV flows (same pattern as the discharge branch, `dispatch.py:214-220`).
 
-## Hardware verification (REQUIRED before deploy)
+## Hardware verification (operator live test, then doc update)
 
-Mode behaviour is hardware/firmware-specific and `SIGENERGY-MODES.md`
-mandates re-probing. Two unproven assumptions:
+Mode behaviour is hardware/firmware-specific. Two unproven assumptions:
 
-1. Mode 3 curtails PV during grid-charge (operator-observed, not probed).
-2. Mode 4 with a high cap pulls full grid **and** keeps full PV (probed
-   only at SOC 77 %, cap 13 kW — not under a "grid-charge while PV high"
-   regime).
+1. Mode 4 grid-charges to the cap at **PV≈0** (i.e. "PV-first" is not
+   "PV-only"). The 2026-04-23 probe imported 3.36 kW to hit a cap PV
+   couldn't reach, strongly implying yes — but PV=0 is the untested corner.
+2. Mode 4 with a high cap pulls full grid **and** keeps full PV during the
+   day (probed at SOC 77 %, cap 13 kW, not under "grid-charge while PV
+   high").
 
-Plan: run a probe (pattern: `probe_mode4.py`) confirming both on current
-firmware; update `SIGENERGY-MODES.md` (mode 3 section + a "grid-charge
-with PV" subsection + the mode-selection summary table). Probe preflight:
-PV ≥ 6 kW, SOC ∈ [25, 85]; ~3 min service downtime.
+Verification: the operator runs it **live overnight** (a cheap-window
+grid-charge with PV≈0 — exactly assumption 1). **What to watch:** the
+battery should grid-charge during the buy window. If it does *not*
+charge overnight, mode 4 needs PV present and we revert the grid-dominant
+branch to mode 3 at PV≈0. The fault mode is safe (grid-charge only — no
+discharge risk; SOC ceiling 40047 bounds over-charge). Daytime PV-keeping
+is confirmed by watching PV stay up during a daytime grid-charge.
+
+After a clean overnight + daytime run, update `SIGENERGY-MODES.md`
+(mode 3/4 sections + mode-selection summary table) with the live findings.
 
 ## Testing
 
