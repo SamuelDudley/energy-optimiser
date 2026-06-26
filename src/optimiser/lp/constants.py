@@ -273,6 +273,32 @@ BUY_SOC_DELTA_INCENTIVE_PER_PCT: float = 1e3
 # than the hard fallback path.
 SOLVER_TIMEOUT_S: int = 20
 
+# Relative MIP gap handed to HiGHS. The solver stops once it can prove the
+# incumbent is within this fraction of the optimum, instead of grinding to
+# gap=0 (full optimality proof). The expensive tail of a solve is *proving*
+# optimality, not finding a good solution — for the hot-water block MILP
+# (one contiguous ~5 h / 60-slot block placed against 5-min evening prices)
+# closing the last few percent means branching through hundreds of
+# near-equal-cost placements, which blew past the wall-clock timeout (→
+# SELF_CONSUME fallback).
+#
+# 0.20 is a worst-case *ceiling*, NOT the realized cost. The 300-tick evening
+# window (2026-06-24 06–10 UTC) was replayed at gap=0.05 and 0.20: aggregate
+# cost was identical at both (3.62c total / 1.30c max single-tick vs the
+# gap=0 live solutions, 0 slot-0 actions changed) — the solver finds the
+# optimum fast and just stops *proving* it sooner. The value is chosen for
+# SOLVE TIME, not cost: the hardest ticks (08:01–08:04 UTC / ~18:01–18:04
+# local) run ~12s at gap=0.05 and barely better at 0.10 (~10–12s) — thin
+# margin under the 20s timeout, risky on harder days — but drop to ~4.4s at
+# gap=0.20, with the whole window's worst solve ≤4.8s (0 ticks >10s). 0.20 is
+# the knee for those ticks: 0.40 gives no further speed-up (and on the
+# hardest ticks 0.40 was still $0-delta). The thing being approximated is HW
+# block timing (a 0.9 kW load, cents at most) and the alternative is a full
+# fallback, so the loose-looking ceiling is heavily favourable. NB: the tight
+# UC (Rajan–Takriti) reformulation was spiked and measured ~1.9× *slower* —
+# gap, not formulation strength, is the lever here.
+MIP_REL_GAP: float = 0.20
+
 # Mixed-integer treatment: only slot 0 binaries are integer-constrained
 # (the decision we commit to this tick). Future-slot binaries are
 # LP-relaxed since we re-solve every tick anyway. This keeps the problem

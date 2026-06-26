@@ -28,6 +28,7 @@ from ..types import (
 )
 from .constants import (
     BUY_SOC_DELTA_INCENTIVE_PER_PCT,
+    MIP_REL_GAP,
     NUMERIC_EPS,
     SOC_BOUND_PENALTY,
     SOLVER_TIMEOUT_S,
@@ -171,7 +172,7 @@ def _solver(timeout_s: float):
     was never actually reachable in production.
     """
     try:
-        return pulp.HiGHS(msg=False, timeLimit=timeout_s)
+        return pulp.HiGHS(msg=False, timeLimit=timeout_s, gapRel=MIP_REL_GAP)
     except Exception:
         logger.exception("HiGHS solver unavailable — is highspy installed?")
         return None
