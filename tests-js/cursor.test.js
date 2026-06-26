@@ -32,11 +32,40 @@ describe("panelValueHtml", () => {
     expect(html).toContain("%");
   });
 
-  it("load panel scans from the end for the envelope", () => {
-    // [x, stackA, stackB, measuredEnv(3.5), plannedEnv] → scanFromEnd skipLast=1
+  it("load panel uses the measured envelope (past slot), not a stack", () => {
+    // [x, stackA, stackB, measuredEnv(3.5), plannedEnv(4)]
     const cols = [[0], [1], [2], [3.5], [4]];
     const spec = { scanFromEnd: true, unit: "kW" };
-    expect(panelValueHtml(fakeU(cols), spec, 0, null)).toContain("3.50");
+    const html = panelValueHtml(fakeU(cols), spec, 0, null);
+    expect(html).toContain("3.50");
+    expect(html).not.toContain("4.00");
+  });
+
+  it("load panel shows the PLANNED envelope (not a stack) in the future", () => {
+    // future: measuredEnv is null → must return plannedEnv(1.38), NOT the stack
+    // (0.90). This is the regression: scanFromEnd fell into the stack column.
+    const cols = [[0], [0.9], [null], [1.38]]; // [x, stack(0.9), measuredEnv(null), plannedEnv(1.38)]
+    const spec = { scanFromEnd: true, unit: "kW" };
+    const html = panelValueHtml(fakeU(cols), spec, 0, null);
+    expect(html).toContain("1.38");
+    expect(html).not.toContain("0.90");
+  });
+
+  it("load panel hides (null over wrong) when both envelopes are null even if a stack has a value", () => {
+    // grid-sensor-offline past slot: house load unknown so both envelopes are
+    // null, but a managed-load stack still carries its value. Showing the stack
+    // as the TOTAL would understate true load — return null instead.
+    const cols = [[0], [0.9], [null], [null]];
+    const spec = { scanFromEnd: true, unit: "kW" };
+    expect(panelValueHtml(fakeU(cols), spec, 0, null)).toBeNull();
+  });
+
+  it("normalises negative zero (tiny negative planned cost) to 0.00, not -0.00", () => {
+    const cols = [[0], [null], [-0.0009]]; // realised null → planned -0.0009 → "-0.00"
+    const spec = { dataIdx: 1, altIdx: 2, unit: "c/h" };
+    const html = panelValueHtml(fakeU(cols), spec, 0, null);
+    expect(html).toContain("0.00");
+    expect(html).not.toContain("-0.00");
   });
 
   it("decision ribbon shows the category LABEL, not a raw number", () => {

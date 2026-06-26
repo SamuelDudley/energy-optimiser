@@ -66,7 +66,9 @@ const PANEL_READOUT = [
 function fmtValue(v, dp = 1) {
   if (v == null || !Number.isFinite(v)) return "—";
   // toLocaleString handles thousands-sep; fix decimal places with toFixed.
-  const n = parseFloat(v.toFixed(dp));
+  // `|| 0` normalises negative zero (a tiny negative planned cost rounds to
+  // "-0.00" otherwise) without affecting any real value.
+  const n = parseFloat(v.toFixed(dp)) || 0;
   return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 }
 
@@ -115,6 +117,23 @@ function pickValFromEnd(u, skipLast, rowIdx) {
   return null;
 }
 
+// The LOAD envelope lives in the last TWO data columns: measuredEnv (n-2,
+// populated for past slots) then plannedEnv (n-1, populated for future slots).
+// The columns BEFORE them are per-category stacks — components, NOT the total.
+// Read the two envelope columns directly: the old `scanFromEnd` walked from the
+// end and, when measuredEnv was null (every future slot), fell through into a
+// stack column and returned that (often 0) instead of the planned total.
+function pickLoadEnvelope(u, rowIdx) {
+  if (rowIdx == null) return null;
+  const n = u.data.length;
+  if (n < 3) return null;  // need [x, measuredEnv, plannedEnv]; never read data[0] (x)
+  const measured = u.data[n - 2]?.[rowIdx];
+  if (measured != null && Number.isFinite(measured)) return measured;
+  const planned = u.data[n - 1]?.[rowIdx];
+  if (planned != null && Number.isFinite(planned)) return planned;
+  return null;
+}
+
 // Formatted value HTML for one panel at rowIdx — the per-panel on-chart hover
 // tooltip. Mirrors updateReadout's per-panel logic. Returns null when there's
 // no value to show (so the tooltip stays hidden). Exported for unit testing.
@@ -138,9 +157,9 @@ export function panelValueHtml(u, spec, rowIdx, model) {
     const expStr = exp != null ? fmtValue(exp, 1) : "—";
     return `imp <b>${impStr}</b> / exp <b>${expStr}</b> c/kWh`;
   }
-  // Load — scan from the right for the envelope.
+  // Load — the measured (past) or planned (future) envelope, never a stack.
   if (spec.scanFromEnd) {
-    const v = pickValFromEnd(u, 1, rowIdx) ?? pickValFromEnd(u, 0, rowIdx);
+    const v = pickLoadEnvelope(u, rowIdx);
     return v != null ? `<b>${fmtValue(v, 2)}</b> ${spec.unit}` : null;
   }
   // Everything else — dataIdx with altIdx (and grid's end-scan) fallback.
@@ -224,11 +243,10 @@ export function wireCursor(instances, getModel, { setCursor, nearestSlotAt }) {
         continue;
       }
 
-      // LOAD panel — scan from right to find the envelope.
+      // LOAD panel — the measured (past) or planned (future) envelope. The
+      // columns before them are per-category stacks, not the total.
       if (spec.scanFromEnd) {
-        // The last two data columns in loadPanel are measuredEnv, plannedEnv.
-        // Try measuredEnv first (second-to-last), then plannedEnv (last).
-        const v = pickValFromEnd(u, 1, rowIdx) ?? pickValFromEnd(u, 0, rowIdx);
+        const v = pickLoadEnvelope(u, rowIdx);
         cell.textContent = v != null ? `${fmtValue(v, 2)} ${spec.unit}` : "—";
         continue;
       }
