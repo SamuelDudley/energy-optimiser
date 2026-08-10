@@ -91,6 +91,7 @@ def main() -> None:
     p.add_argument("--pv-actual-mult", type=float, default=1.0)
     p.add_argument("--import-price-mult", type=float, default=1.0)
     p.add_argument("--export-price-mult", type=float, default=1.0)
+    p.add_argument("--load-profile-mult", type=float, default=1.0)
     p.add_argument(
         "--output",
         "-o",
@@ -116,6 +117,7 @@ def main() -> None:
         actual_pv_multiplier=args.pv_actual_mult,
         import_price_multiplier=args.import_price_mult,
         export_price_multiplier=args.export_price_mult,
+        load_profile_multiplier=args.load_profile_mult,
         name=args.label,
     )
 

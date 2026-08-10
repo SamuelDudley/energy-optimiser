@@ -131,3 +131,9 @@ lp_wall_clock_timeout_s = 12.0              # Outer timeout on the LP solve thre
 lp_scenario_weight_p10 = 0.20
 lp_scenario_weight_p50 = 0.60
 lp_scenario_weight_p90 = 0.20
+# Per-slot aggregation for the historical load profile the LP plans
+# against. "mean" matches realised daily energy; "median" under-forecasts
+# right-skewed (winter) load because it discards recurring peak mass —
+# single-outlier-day protection comes from smoothing + the SOC floor.
+lp_load_statistic = "mean"
+lp_load_smoothing_slots = 3

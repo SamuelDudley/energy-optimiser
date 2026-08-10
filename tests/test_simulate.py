@@ -21,7 +21,6 @@ from optimiser.simulate import (
     simulate,
 )
 
-
 # ── Physics step ─────────────────────────────────────────────────
 
 
@@ -30,8 +29,8 @@ class TestPhysicsStep:
         """Battery charging from PV reduces grid export."""
         soc_end, gi, ge = _physics_step(
             soc_pct=50.0,
-            battery_kw=3.0,        # charging at 3 kW
-            pv_actual_kw=5.0,      # plenty of PV
+            battery_kw=3.0,  # charging at 3 kW
+            pv_actual_kw=5.0,  # plenty of PV
             house_load_kw=1.0,
             battery_config=BatteryConfig(),
             export_limit_kw=5.0,
@@ -47,8 +46,8 @@ class TestPhysicsStep:
         """Battery discharging covers house load + exports surplus."""
         soc_end, gi, ge = _physics_step(
             soc_pct=70.0,
-            battery_kw=-6.0,       # discharging at 6 kW
-            pv_actual_kw=0.0,      # no PV (evening)
+            battery_kw=-6.0,  # discharging at 6 kW
+            pv_actual_kw=0.0,  # no PV (evening)
             house_load_kw=1.0,
             battery_config=BatteryConfig(),
             export_limit_kw=5.0,
@@ -77,7 +76,7 @@ class TestPhysicsStep:
         """No SOC drift past [0, 100]%."""
         soc_end, _, _ = _physics_step(
             soc_pct=99.0,
-            battery_kw=20.0,        # absurd charge rate
+            battery_kw=20.0,  # absurd charge rate
             pv_actual_kw=20.0,
             house_load_kw=0.0,
             battery_config=BatteryConfig(),
@@ -100,9 +99,7 @@ class TestPhysicsStep:
 # ── Scenario modifier ────────────────────────────────────────────
 
 
-def _make_minimal_snapshot_dict(
-    ts: datetime, soc: float = 50.0, pv: float = 0.0
-) -> dict:
+def _make_minimal_snapshot_dict(ts: datetime, soc: float = 50.0, pv: float = 0.0) -> dict:
     """Build a snapshot JSON dict suitable for the reconstruction
     path. Matches the schema the production service emits."""
     iso = lambda t: t.isoformat()  # noqa: E731
@@ -200,6 +197,7 @@ class TestScenarioModifier:
         mod = ScenarioModifier()
         ts = datetime(2026, 4, 1, 0, 0, tzinfo=UTC)
         from optimiser.replay import _reconstruct_snapshot
+
         snap = _reconstruct_snapshot(_make_minimal_snapshot_dict(ts, pv=2.5))
         out = mod.apply_to_snapshot(snap)
         assert out.system_state.pv_power_kw == snap.system_state.pv_power_kw
@@ -209,18 +207,30 @@ class TestScenarioModifier:
         mod = ScenarioModifier(actual_pv_multiplier=0.3)
         ts = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
         from optimiser.replay import _reconstruct_snapshot
+
         snap = _reconstruct_snapshot(_make_minimal_snapshot_dict(ts, pv=10.0))
         out = mod.apply_to_snapshot(snap)
         assert out.system_state.pv_power_kw == pytest.approx(3.0, abs=0.001)
 
+    def test_load_profile_multiplier_scales_planned_profile_only(self) -> None:
+        """The load-profile multiplier lifts what the LP plans against,
+        while the realised house load driving the physics stays untouched."""
+        mod = ScenarioModifier(load_profile_multiplier=1.35)
+        ts = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+        from optimiser.replay import _reconstruct_snapshot
+
+        snap = _reconstruct_snapshot(_make_minimal_snapshot_dict(ts, pv=5.0))
+        out = mod.apply_to_snapshot(snap)
+        assert out.load_profile.slots == pytest.approx([s * 1.35 for s in snap.load_profile.slots])
+        assert out.system_state.house_load_kw == snap.system_state.house_load_kw
+
     def test_forecast_multiplier_independent_of_actual(self) -> None:
         """The two multipliers cover different fields — make sure
         they don't bleed into each other."""
-        mod = ScenarioModifier(
-            pv_forecast_multiplier=2.0, actual_pv_multiplier=0.5
-        )
+        mod = ScenarioModifier(pv_forecast_multiplier=2.0, actual_pv_multiplier=0.5)
         ts = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
         from optimiser.replay import _reconstruct_snapshot
+
         snap = _reconstruct_snapshot(_make_minimal_snapshot_dict(ts, pv=5.0))
         out = mod.apply_to_snapshot(snap)
         # actual scaled by 0.5
@@ -256,7 +266,10 @@ class TestEndToEnd:
         path = tmp_path / "snap.ndjson.gz"
         start = datetime(2026, 4, 1, 18, 0, tzinfo=UTC)  # evening
         _write_snapshot_file(
-            path, n_steps=120, start=start, soc_at_start=18.0,
+            path,
+            n_steps=120,
+            start=start,
+            soc_at_start=18.0,
             pv_pattern=[0.0],  # no PV (evening)
         )
         result = simulate(
@@ -272,9 +285,7 @@ class TestEndToEnd:
         import in physics)."""
         path = tmp_path / "snap.ndjson.gz"
         start = datetime(2026, 4, 1, 9, 0, tzinfo=UTC)  # mid-morning, PV up
-        _write_snapshot_file(
-            path, n_steps=60, start=start, pv_pattern=[5.0, 5.5, 6.0]
-        )
+        _write_snapshot_file(path, n_steps=60, start=start, pv_pattern=[5.0, 5.5, 6.0])
         baseline = simulate(
             snapshots=[path],
             battery_config=BatteryConfig(),
@@ -292,9 +303,7 @@ class TestEndToEnd:
         """Explicit initial_soc_pct overrides the snapshot's SOC."""
         path = tmp_path / "snap.ndjson.gz"
         start = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
-        _write_snapshot_file(
-            path, n_steps=12, start=start, soc_at_start=80.0
-        )
+        _write_snapshot_file(path, n_steps=12, start=start, soc_at_start=80.0)
         result = simulate(
             snapshots=[path],
             battery_config=BatteryConfig(),
@@ -308,6 +317,7 @@ class TestEndToEnd:
         time. Locks in backward-compat for the optimisation that lets
         the data-gen tool skip re-parsing the archive per anchor."""
         from optimiser.simulate import _load_indexed_snapshots
+
         path = tmp_path / "snap.ndjson.gz"
         start = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
         _write_snapshot_file(path, n_steps=12, start=start, soc_at_start=50.0)
@@ -324,19 +334,20 @@ class TestEndToEnd:
             initial_soc_pct=40.0,
         )
         assert len(via_paths.steps) == len(via_index.steps)
-        assert via_paths.total_cost_cents == pytest.approx(
-            via_index.total_cost_cents, abs=1e-6
-        )
+        assert via_paths.total_cost_cents == pytest.approx(via_index.total_cost_cents, abs=1e-6)
 
     def test_simulate_rejects_both_snapshots_and_index(self, tmp_path: Path) -> None:
         """Passing both `snapshots` and `snapshot_index` is ambiguous —
         must raise rather than silently picking one."""
         path = tmp_path / "snap.ndjson.gz"
         _write_snapshot_file(
-            path, n_steps=4,
-            start=datetime(2026, 4, 1, 12, 0, tzinfo=UTC), soc_at_start=50.0,
+            path,
+            n_steps=4,
+            start=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+            soc_at_start=50.0,
         )
         from optimiser.simulate import _load_indexed_snapshots
+
         index = _load_indexed_snapshots([path])
         with pytest.raises(ValueError, match="exactly one"):
             simulate(

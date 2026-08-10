@@ -90,6 +90,13 @@ class ScenarioModifier:
         respective price field in every `PriceInterval`. Useful for
         sweeping price-sensitivity.
 
+    `load_profile_multiplier`: applied to `load_profile.slots` — the
+        baseload curve the LP plans against. The realised
+        `system_state.house_load_kw` driving physics is untouched, so
+        this isolates "what if the LP expected more/less load" from
+        what the house actually drew. Approximates a profile-statistic
+        change (the baked snapshot profiles are fixed at tick time).
+
     Identity ScenarioModifier (all multipliers = 1.0) leaves the
     historical stream unchanged."""
 
@@ -97,6 +104,7 @@ class ScenarioModifier:
     actual_pv_multiplier: float = 1.0
     import_price_multiplier: float = 1.0
     export_price_multiplier: float = 1.0
+    load_profile_multiplier: float = 1.0
     name: str = "history"
 
     def apply_to_snapshot(self, snap: TickSnapshot) -> TickSnapshot:
@@ -154,11 +162,20 @@ class ScenarioModifier:
             snap.system_state,
             pv_power_kw=snap.system_state.pv_power_kw * self.actual_pv_multiplier,
         )
+        profile = (
+            dataclasses.replace(
+                snap.load_profile,
+                slots=[s * self.load_profile_multiplier for s in snap.load_profile.slots],
+            )
+            if self.load_profile_multiplier != 1.0
+            else snap.load_profile
+        )
         return dataclasses.replace(
             snap,
             system_state=state,
             price_forecast=prices,
             pv_forecast=pv,
+            load_profile=profile,
         )
 
 
