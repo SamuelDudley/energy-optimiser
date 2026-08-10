@@ -10,13 +10,14 @@ at 192.168.2.220, 40 kWh battery, 13 kW PV array). Firmware version not
 recorded at the probe timestamp — if firmware is updated, re-run the
 probes before trusting this document.
 
-**Mode 4 retired from the dispatch path 2026-04-24** (commit `acea3f5`,
-the §3.3 cutoff dispatch). Mode 4's grid-draw hazard documented below
-was the rationale; PV-dominant charge now uses mode 2 with the adaptive
-trim on register 40032 (see SPEC-ENERGY-01.md §5.4). The mode 4 sections
-in this document are retained as the empirical record that drove the
-decision. Mode 4 stays in `RemoteEMSControlMode` for historical-snapshot
-replay only.
+**Mode 4 is the live grid-charge mode** (reinstated 2026-06-26, commit
+`c012ae6`). Any dispatch with a material planned `grid_to_battery_kw`
+(at or above 250 W) emits mode 4; its "40032 is a setpoint, not a
+ceiling" behaviour documented below is exactly what makes it work with
+or without PV. PV-only charge uses mode 2 with the adaptive trim on
+register 40032 (see SPEC-ENERGY-01.md §5.4). The 2026-04-24 retirement
+(commit `acea3f5`) treated the grid-draw behaviour as a hazard; the
+buy-PV-passthrough design re-adopted it deliberately.
 
 **Charge-cutoff register (40047) retired from the tick path 2026-04-25**
 (commit `1f363a7`). It's now pinned at `soc_ceiling_pct` by

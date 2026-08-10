@@ -1,9 +1,11 @@
 // Classification helpers for decision and mode categories.
 // Extracted from dashboard.js for reusability and testing.
 
-// Slot semantics — must stay in sync with optimiser/lp/constants.py.
+// Slot semantics — must stay in sync with optimiser/lp/dispatch.py.
 export const DEADBAND_KW = 0.1;
-export const MODE_SWITCH_HYSTERESIS_KW = 0.05;
+// Mode 2 cannot import from grid: a grid_to_battery term at or above this
+// threshold dispatches through mode 4, below it is solver rounding noise.
+export const GRID_CHARGE_MATERIAL_KW = 0.25;
 
 // Decision categories driving the ribbon.
 export const DECISION = {
@@ -69,10 +71,10 @@ export function decisionFor(slot) {
   if (b == null || !Number.isFinite(b)) return DECISION.UNKNOWN;
   if (Math.abs(b) < DEADBAND_KW) return DECISION.IDLE;
   if (b < 0) return DECISION.DISCHARGE;
-  // Charging — split by grid-vs-PV contribution, matching dispatch_from_slot.
+  // Charging — a material grid component classifies as a grid charge,
+  // matching dispatch_from_slot.
   const g = slot.grid_to_battery_kw ?? 0;
-  const p = slot.pv_to_battery_kw ?? 0;
-  if (g > p + MODE_SWITCH_HYSTERESIS_KW) return DECISION.CHARGE_GRID;
+  if (g >= GRID_CHARGE_MATERIAL_KW) return DECISION.CHARGE_GRID;
   return DECISION.CHARGE_PV;
 }
 
@@ -110,8 +112,7 @@ export function modeFromSlot(slot) {
   if (Math.abs(b) < DEADBAND_KW) return MODE.M2_IDLE;
   if (b > 0) {
     const g = slot.grid_to_battery_kw ?? 0;
-    const p = slot.pv_to_battery_kw ?? Math.max(0, b - g);
-    if (g > p + MODE_SWITCH_HYSTERESIS_KW) return MODE.M3_CHARGE;
+    if (g >= GRID_CHARGE_MATERIAL_KW) return MODE.M3_CHARGE;
     return MODE.M2_CHARGE;
   }
   // Discharge — mode 5 if PV producing, else mode 6.

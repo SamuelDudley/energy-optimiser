@@ -10,6 +10,8 @@ describe("decisionFor", () => {
     expect(decisionFor({ battery_kw: 3, grid_to_battery_kw: 2.5, pv_to_battery_kw: 0.5 })).toBe(DECISION.CHARGE_GRID));
   it("charge-pv when pv dominates", () =>
     expect(decisionFor({ battery_kw: 3, grid_to_battery_kw: 0.2, pv_to_battery_kw: 2.8 })).toBe(DECISION.CHARGE_PV));
+  it("charge-grid when grid component is material even if pv dominates", () =>
+    expect(decisionFor({ battery_kw: 3, grid_to_battery_kw: 0.5, pv_to_battery_kw: 2.5 })).toBe(DECISION.CHARGE_GRID));
   it("unknown on null/non-finite", () => {
     expect(decisionFor(null)).toBe(DECISION.UNKNOWN);
     expect(decisionFor({ battery_kw: null })).toBe(DECISION.UNKNOWN);

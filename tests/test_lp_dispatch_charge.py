@@ -69,9 +69,38 @@ def test_buy_active_charge_caps_at_full_ac_plus_dc() -> None:
     assert d.cap_kw == _BAT.max_ac_charge_kw + _BAT.max_dc_charge_kw
 
 
-def test_pv_dominant_charge_stays_mode2() -> None:
-    """Regression guard: PV-dominant charge is unchanged (mode 2 trim)."""
+def test_pv_dominant_charge_with_material_grid_component_uses_mode4() -> None:
+    """A planned grid component must dispatch through a mode that can
+    import from grid. Mode 2's cascade only charges from PV, so routing a
+    mixed charge there silently drops the grid purchase."""
     slot = _charge_slot(battery_kw=8.0, grid_to_battery_kw=2.0, pv_to_battery_kw=6.0)
+    d = dispatch_from_slot(slot, _BAT, current_soc_pct=50.0)
+    assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
+    assert d.kind == DispatchKind.CHARGE
+    assert d.cap_kw == 8.0
+
+
+def test_buy_active_forces_grid_capable_mode_when_pv_dominant() -> None:
+    """Buy mode with any planned grid charge dispatches mode 4 at the full
+    AC+DC cap, even when PV dominates the planned mix."""
+    slot = _charge_slot(battery_kw=6.5, grid_to_battery_kw=0.5, pv_to_battery_kw=6.0)
+    d = dispatch_from_slot(slot, _BAT, current_soc_pct=50.0, buy_active=True)
+    assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
+    assert d.cap_kw == _BAT.max_ac_charge_kw + _BAT.max_dc_charge_kw
+
+
+def test_pv_only_charge_stays_mode2() -> None:
+    """Pure PV charge keeps the mode-2 adaptive-trim path."""
+    slot = _charge_slot(battery_kw=8.0, grid_to_battery_kw=0.0, pv_to_battery_kw=8.0)
+    d = dispatch_from_slot(slot, _BAT, current_soc_pct=50.0)
+    assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
+    assert d.cap_kw == 8.0
+
+
+def test_negligible_grid_component_stays_mode2() -> None:
+    """A grid component below the material threshold is LP rounding noise,
+    not a purchase — the PV path keeps the export split."""
+    slot = _charge_slot(battery_kw=8.0, grid_to_battery_kw=0.1, pv_to_battery_kw=7.9)
     d = dispatch_from_slot(slot, _BAT, current_soc_pct=50.0)
     assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
     assert d.cap_kw == 8.0

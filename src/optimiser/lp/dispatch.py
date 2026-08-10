@@ -37,13 +37,14 @@ PV_PRODUCING_THRESHOLD_KW: float = 0.2
 # Hysteresis margin for the mode-3-vs-mode-2 charge-source split. The LP
 # decomposes a charge into `grid_to_battery_kw` and `pv_to_battery_kw`;
 # their relative magnitudes pick the dispatch path (grid-dominant ⇒ mode
-# 3, otherwise mode 2 + adaptive trim). HiGHS often returns near-equal
-# decompositions where the two values differ by sub-watt numerical
-# noise — without a margin, two ticks with effectively identical inputs
-# can flip mode and change the entire write path. Require grid to lead
-# PV by at least this margin before switching to mode 3; ties (and
-# near-ties) stay on mode 2.
-MODE_SWITCH_HYSTERESIS_KW: float = 0.05
+# Mode 2's cascade charges the battery from PV surplus only — it cannot
+# import from grid. Any slot-0 plan with a grid_to_battery component at or
+# above this threshold must therefore dispatch through mode 4, or the
+# purchase silently never executes. Below the threshold the grid term is
+# solver rounding noise (sub-250 W ≈ 20 Wh per slot) and the PV path's
+# adaptive export split is worth keeping; the margin also stops sub-watt
+# HiGHS noise from flipping the write path between ticks.
+GRID_CHARGE_MATERIAL_KW: float = 0.25
 
 # Buffer above current SOC, retained for backwards compatibility on the
 # advisory `target_soc_pct` field (snapshot / metrics consumers). No
@@ -127,9 +128,9 @@ def dispatch_from_slot(
 
     Mapping:
       |battery_kw| < DEADBAND_KW       → SELF_CONSUME (mode 2), cap = 0
-      battery_kw > 0, grid-dominant    → CHARGING_PV_FIRST (mode 4), cap = battery_kw
+      battery_kw > 0, grid ≥ material  → CHARGING_PV_FIRST (mode 4), cap = battery_kw
                                           (buy_active → cap = max_ac + max_dc, "take it all")
-      battery_kw > 0, PV-dominant      → SELF_CONSUMPTION (mode 2), cap = battery_kw (LP rate)
+      battery_kw > 0, grid < material  → SELF_CONSUMPTION (mode 2), cap = battery_kw (LP rate)
       battery_kw < 0, PV > threshold   → DISCHARGE_PV_FIRST (mode 5), cap = max_discharge_kw
       battery_kw < 0, PV ≤ threshold   → DISCHARGE_ESS_FIRST (mode 6), cap = max_discharge_kw
 
@@ -189,11 +190,12 @@ def dispatch_from_slot(
 
     if battery_kw > 0:
         # Charging. Read grid contribution directly from the LP solution
-        # (no inference). When grid > pv this is a grid-dominant charge;
-        # when pv ≥ grid (or pv-only), use mode 2 with adaptive trim so the
-        # inverter charges from PV at a rate that lets surplus also flow to
-        # export rather than cascade-saturating the battery first.
-        if slot_0.grid_to_battery_kw > slot_0.pv_to_battery_kw + MODE_SWITCH_HYSTERESIS_KW:
+        # (no inference). A material grid component needs a mode that can
+        # import (mode 4); PV-only (or noise-level grid) charge uses mode 2
+        # with adaptive trim so the inverter charges from PV at a rate that
+        # lets surplus also flow to export rather than cascade-saturating
+        # the battery first.
+        if slot_0.grid_to_battery_kw >= GRID_CHARGE_MATERIAL_KW:
             # Mode 4 (PV-first), not mode 3: grid tops the charge up to the
             # cap while PV keeps generating and feeds the battery first.
             # Mode 3 curtails PV on this hardware (operator-observed); at

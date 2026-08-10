@@ -796,3 +796,26 @@ the default once the loss/win shows in the data.
 maximally, exports up to cap" principle. Revisit driven by either
 measured export-revenue regression in the snapshot data or load model
 maturity, not by hypothetical analysis.
+
+### ~~26. Dispatch dropped planned grid buys in PV-dominant slots~~ — Resolved
+**File:** `lp/dispatch.py`, `api/static/classify.js`
+**Symptom:** From 2026-06-27 to 2026-08-10 no planned grid purchase
+executed. The LP planned buys every day (342 kWh in July, 115 kWh in
+August at slot 0 alone) and every one was dispatched as `charge_pv`.
+Manual buy mode was equally affected: the mode-4 "take it all" cap only
+applied when the mode-selection gate already chose the grid path.
+Downstream effect: battery reached the SOC floor on 39 of 72 winter
+days and evenings ran 2-3 kW of unplanned grid import.
+**Root cause:** the buy-PV-passthrough change (`c012ae6`) gated the
+grid-capable mode on grid leading PV (`grid > pv + 0.05`). Mixed
+charges with a PV-dominant split routed to mode 2, whose cascade
+charges from PV only and cannot import. June's overcast slots were
+grid-dominant so buys still executed; July's PV recovery made every
+planned buy PV-dominant and execution stopped entirely.
+**Fix:** the gate is now materiality, not dominance:
+`grid_to_battery_kw >= GRID_CHARGE_MATERIAL_KW` (250 W) dispatches
+mode 4 with the cap at the LP total (buy mode: full AC+DC). Below the
+threshold the grid term is solver rounding noise and the mode-2
+adaptive-trim path keeps the export split. Dashboard classification
+(`classify.js`) matches. Tests pin both layers, including the
+buy-forces-mode-4 case.

@@ -107,16 +107,16 @@ class TestDispatchFromSlot:
         assert d.signed_intent_kw == 5.0
         assert d.target_soc_pct is None
 
-    def test_charge_pv_dominant_picks_mode_2_with_cutoff(self) -> None:
-        # 5 kW charge, PV contributes more than grid → mode 2 with the LP
-        # rate as `cap_kw` (used as the trim floor under the adaptive
+    def test_charge_pv_with_noise_grid_picks_mode_2_with_cutoff(self) -> None:
+        # 5 kW charge, grid term below the material threshold → mode 2 with
+        # the LP rate as `cap_kw` (used as the trim floor under the adaptive
         # dispatch). target_soc_pct is advisory (snapshot/metrics) and
         # carries the planned end-of-slot SOC.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=5.0,
-                pv_to_battery_kw=4.0,
-                grid_to_battery_kw=1.0,
+                pv_to_battery_kw=4.9,
+                grid_to_battery_kw=0.1,
                 soc_pct_end=72.0,
             ),
             current_soc_pct=60.0,
@@ -147,16 +147,16 @@ class TestDispatchFromSlot:
         d = dispatch_from_slot(_slot(battery_kw=5.0, pv_to_battery_kw=0.0, grid_to_battery_kw=5.0))
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
 
-    def test_charge_grid_lead_below_hysteresis_stays_on_mode_2(self) -> None:
-        # HiGHS routinely returns near-equal charge-source decompositions
-        # at flat midday prices. A bare `>` flips mode 2 ↔ mode 3 from
-        # tick to tick on sub-watt noise; the hysteresis margin (50 W)
-        # keeps the dispatch on mode 2 unless grid genuinely leads PV.
+    def test_charge_grid_below_material_threshold_stays_on_mode_2(self) -> None:
+        # HiGHS routinely returns small nonzero grid terms at flat midday
+        # prices. Below the material threshold (250 W) the write path stays
+        # on mode 2 — sub-watt solver noise cannot flip the mode between
+        # ticks because the margin dwarfs it.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=4.0,
-                pv_to_battery_kw=2.0,
-                grid_to_battery_kw=2.04,  # grid leads by 40 W < 50 W hysteresis
+                pv_to_battery_kw=3.8,
+                grid_to_battery_kw=0.2,  # 200 W < 250 W material threshold
                 soc_pct_end=70.0,
             ),
             current_soc_pct=60.0,
@@ -164,23 +164,22 @@ class TestDispatchFromSlot:
         assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
         assert d.kind == DispatchKind.CHARGE
 
-    def test_charge_grid_lead_past_hysteresis_picks_mode_4(self) -> None:
-        # Same shape, but grid now leads PV by more than the hysteresis
-        # margin → grid-dominant charge → mode 4.
+    def test_charge_grid_at_material_threshold_picks_mode_4(self) -> None:
+        # Same shape, but the grid term is a real planned purchase → mode 4,
+        # the only charge mode that can import from grid.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=4.0,
-                pv_to_battery_kw=2.0,
-                grid_to_battery_kw=2.06,  # grid leads by 60 W > 50 W hysteresis
+                pv_to_battery_kw=3.7,
+                grid_to_battery_kw=0.3,  # 300 W ≥ 250 W material threshold
             )
         )
         assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
 
-    def test_charge_equal_split_prefers_pv(self) -> None:
-        # Tie-breaker: grid must lead pv by the hysteresis margin to be
-        # "grid-dominant". At an equal split, stay on the mode-2 PV /
-        # adaptive-trim path so surplus can also flow to export rather than
-        # cascade-saturating the battery first.
+    def test_charge_equal_split_uses_grid_capable_mode(self) -> None:
+        # An equal PV/grid split carries a 2 kW planned purchase. Mode 2
+        # cannot import from grid, so the split must dispatch mode 4 or the
+        # grid half silently never executes.
         d = dispatch_from_slot(
             _slot(
                 battery_kw=4.0,
@@ -190,8 +189,8 @@ class TestDispatchFromSlot:
             ),
             current_soc_pct=60.0,
         )
-        assert d.mode == RemoteEMSControlMode.MAXIMUM_SELF_CONSUMPTION
-        assert d.target_soc_pct == 70.0
+        assert d.mode == RemoteEMSControlMode.COMMAND_CHARGING_PV_FIRST
+        assert d.kind == DispatchKind.CHARGE
 
     def test_pv_charge_cutoff_clamped_above_current_soc(self) -> None:
         # Mandatory clamp from the 2026-04-24 probe: cutoff at or below
