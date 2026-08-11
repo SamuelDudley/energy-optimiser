@@ -173,7 +173,7 @@ def _reconstruct_load_profile(d: dict) -> LoadProfile:
 def _reconstruct_active_mode(d: dict) -> ActiveModeRecord:
     return ActiveModeRecord(
         kind=d["kind"],
-        end_at=parse_iso(d["end_at"]),
+        end_at=parse_iso(d["end_at"]) if d.get("end_at") is not None else None,
         params=dict(d.get("params") or {}),
     )
 

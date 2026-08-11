@@ -448,3 +448,51 @@ class TestSocCutoffOverridesField:
         slots = [NOW + timedelta(minutes=5 * i) for i in range(6)]
         o = mgr.to_overrides(NOW, slots)
         assert o.buy_soc_cutoff_pct is None
+
+
+class TestIndefiniteConserve:
+    def _conserve(self, end_at: datetime | None) -> ActiveMode:
+        return ActiveMode(
+            kind="conserve",
+            end_at=end_at,
+            params={"floor_c_per_kwh": 30.0},
+            activated_at=NOW,
+            source="dashboard",
+        )
+
+    def test_none_end_at_round_trips_dict(self) -> None:
+        m = self._conserve(None)
+        d = m.to_dict()
+        assert d["end_at"] is None
+        assert ActiveMode.from_dict(d).end_at is None
+
+    def test_none_end_at_survives_disk(self, tmp_path) -> None:
+        path = tmp_path / "modes.json"
+        ModeManager(path).activate(self._conserve(None))
+        reloaded = ModeManager(path)
+        modes = reloaded.active(NOW + timedelta(days=365))
+        assert len(modes) == 1
+        assert modes[0].end_at is None
+
+    def test_none_end_at_never_prunes(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "modes.json")
+        mgr.activate(self._conserve(None))
+        mgr.activate(
+            ActiveMode(
+                kind="buy",
+                end_at=NOW + timedelta(hours=1),
+                params={"ceiling_c_per_kwh": 12.0},
+                activated_at=NOW,
+                source="dashboard",
+            )
+        )
+        modes = mgr.active(NOW + timedelta(hours=2))
+        assert [m.kind for m in modes] == ["conserve"]
+
+    def test_none_end_at_masks_full_horizon(self, tmp_path) -> None:
+        mgr = ModeManager(tmp_path / "modes.json")
+        mgr.activate(self._conserve(None))
+        slots = [NOW + timedelta(minutes=5 * i) for i in range(400)]
+        ov = mgr.to_overrides(NOW, slots)
+        assert all(ov.conserve_active_at)
+        assert ov.conserve_floor_c_per_kwh == 30.0

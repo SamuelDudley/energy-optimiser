@@ -32,15 +32,15 @@ _KINDS: tuple[ModeKind, ...] = ("buy", "conserve")
 class ActiveMode:
     """One currently-active user-strategy mode.
 
-    ``end_at`` is when the mode auto-expires. ``params`` carries the
-    per-mode threshold (``ceiling_c_per_kwh`` for buy,
-    ``floor_c_per_kwh`` for conserve). All datetimes are UTC; naive
-    datetimes are rejected at construction to avoid timezone bugs at
-    LP slot boundaries.
+    ``end_at`` is when the mode auto-expires; ``None`` means the mode
+    runs until the user cancels it. ``params`` carries the per-mode
+    threshold (``ceiling_c_per_kwh`` for buy, ``floor_c_per_kwh`` for
+    conserve). All datetimes are UTC; naive datetimes are rejected at
+    construction to avoid timezone bugs at LP slot boundaries.
     """
 
     kind: ModeKind
-    end_at: datetime
+    end_at: datetime | None
     params: dict[str, Any]
     activated_at: datetime
     source: str
@@ -49,13 +49,13 @@ class ActiveMode:
         if self.kind not in _KINDS:
             raise ValueError(f"kind must be one of {_KINDS}, got {self.kind!r}")
         for fname, dt in (("end_at", self.end_at), ("activated_at", self.activated_at)):
-            if dt.tzinfo is None:
+            if dt is not None and dt.tzinfo is None:
                 raise ValueError(f"{fname} must be UTC (tz-aware), got naive {dt!r}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind,
-            "end_at": self.end_at.isoformat(),
+            "end_at": self.end_at.isoformat() if self.end_at is not None else None,
             "params": dict(self.params),
             "activated_at": self.activated_at.isoformat(),
             "source": self.source,
@@ -63,9 +63,10 @@ class ActiveMode:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ActiveMode:
+        raw_end = d["end_at"]
         return cls(
             kind=d["kind"],
-            end_at=datetime.fromisoformat(d["end_at"]),
+            end_at=datetime.fromisoformat(raw_end) if raw_end is not None else None,
             params=dict(d["params"]),
             activated_at=datetime.fromisoformat(d["activated_at"]),
             source=d["source"],
@@ -155,7 +156,7 @@ class ModeManager:
             except (KeyError, ValueError):
                 logger.warning("dropping malformed mode entry %r", kind)
                 continue
-            if m.end_at <= now:
+            if m.end_at is not None and m.end_at <= now:
                 # Already expired at load — emit with the restart reason
                 # so audit can tell post-restart drops apart from normal
                 # window-end expiries. Don't add to live state.
@@ -190,7 +191,7 @@ class ModeManager:
                 "kind": mode.kind,
                 "params": dict(mode.params),
                 "source": mode.source,
-                "end_at": mode.end_at.isoformat(),
+                "end_at": mode.end_at.isoformat() if mode.end_at is not None else None,
                 "activated_at": mode.activated_at.isoformat(),
             },
         )
@@ -213,7 +214,9 @@ class ModeManager:
         between construction and now is a runtime expiry tagged
         ``window_ended``.
         """
-        expired = [kind for kind, m in self._modes.items() if m.end_at <= now]
+        expired = [
+            kind for kind, m in self._modes.items() if m.end_at is not None and m.end_at <= now
+        ]
         if not expired:
             return list(self._modes.values())
         for kind in expired:
@@ -233,8 +236,13 @@ class ModeManager:
         active = {m.kind: m for m in self.active(now)}
         buy = active.get("buy")
         conserve = active.get("conserve")
-        buy_mask = tuple((buy is not None and slot < buy.end_at) for slot in slots)
-        conserve_mask = tuple((conserve is not None and slot < conserve.end_at) for slot in slots)
+        buy_mask = tuple(
+            (buy is not None and (buy.end_at is None or slot < buy.end_at)) for slot in slots
+        )
+        conserve_mask = tuple(
+            (conserve is not None and (conserve.end_at is None or slot < conserve.end_at))
+            for slot in slots
+        )
         return ModeOverrides(
             buy_active_at=buy_mask,
             buy_ceiling_c_per_kwh=(buy.params["ceiling_c_per_kwh"] if buy else None),

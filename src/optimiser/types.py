@@ -433,7 +433,7 @@ class ActiveModeRecord:
     """Lightweight serialisable view of one active mode at snapshot time."""
 
     kind: str  # "buy" | "conserve"
-    end_at: datetime
+    end_at: datetime | None  # None runs until cancelled
     params: dict[str, float]
 
 
