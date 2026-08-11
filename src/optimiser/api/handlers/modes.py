@@ -28,13 +28,23 @@ def _parse_end_at(raw: Any) -> datetime:
     return end_at.astimezone(UTC)
 
 
-def _validate_end_at(end_at: datetime) -> str | None:
+# Grace for browser-vs-server clock skew: the dashboard computes
+# end_at from the browser clock, so its 48h preset lands past the
+# server's 48h limit whenever the browser runs ahead. Accept up to
+# the grace and clamp; reject beyond it.
+_CLOCK_SKEW_GRACE = timedelta(minutes=5)
+
+
+def _validate_end_at(end_at: datetime) -> tuple[datetime | None, str | None]:
+    """Return (normalised end_at, error). Values inside the grace
+    window clamp to now + MAX_WINDOW, so stored modes never end more
+    than 48h out."""
     now = datetime.now(UTC)
     if end_at <= now:
-        return "end_at must be strictly in the future"
-    if end_at > now + MAX_WINDOW:
-        return "end_at must be within 48h of now"
-    return None
+        return None, "end_at must be strictly in the future"
+    if end_at > now + MAX_WINDOW + _CLOCK_SKEW_GRACE:
+        return None, "end_at must be within 48h of now"
+    return min(end_at, now + MAX_WINDOW), None
 
 
 def _validate_threshold(value: float, name: str) -> str | None:
@@ -53,7 +63,7 @@ async def _activate_handler(request: web.Request, kind: str, param_name: str) ->
         end_at = _parse_end_at(body.get("end_at"))
     except ValueError as exc:
         return _bad(str(exc))
-    err = _validate_end_at(end_at)
+    end_at, err = _validate_end_at(end_at)
     if err:
         return _bad(err)
 

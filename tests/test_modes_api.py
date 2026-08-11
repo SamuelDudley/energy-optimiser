@@ -306,3 +306,31 @@ async def test_post_conserve_ignores_soc_cutoff(client_with_soc) -> None:
     assert resp.status == 200
     body = await resp.json()
     assert "soc_cutoff_pct" not in body["params"]
+
+
+async def test_post_conserve_clock_skew_past_48h_clamped(client) -> None:
+    """A browser clock slightly ahead of the server pushes the 48h
+    preset just past the limit. Within the grace window the activation
+    succeeds and the stored end_at is clamped to 48h out."""
+    resp = await client.post(
+        "/modes/conserve",
+        json={
+            "end_at": (datetime.now(UTC) + timedelta(hours=48, minutes=2)).isoformat(),
+            "floor_c_per_kwh": 30.0,
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    stored = datetime.fromisoformat(body["end_at"])
+    assert stored <= datetime.now(UTC) + timedelta(hours=48)
+
+
+async def test_post_conserve_rejects_beyond_grace(client) -> None:
+    resp = await client.post(
+        "/modes/conserve",
+        json={
+            "end_at": (datetime.now(UTC) + timedelta(hours=48, minutes=6)).isoformat(),
+            "floor_c_per_kwh": 30.0,
+        },
+    )
+    assert resp.status == 400
