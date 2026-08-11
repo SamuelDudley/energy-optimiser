@@ -259,24 +259,29 @@ class PlannerConfig:
     # max(operational floor, backup, cutoff) inside the LP, so it
     # cannot drop below the safety floor.
     lp_terminal_floor_override_pct: float | None = None
-    # Load profile statistic + smoothing. The LP's `house_base` is
-    # currently a deterministic per-slot baseline derived from the last
-    # 90 days of telemetry. Two known weaknesses, both addressed here:
+    # Per-slot aggregation for the load profile ("mean" | "median") and
+    # boxcar smoothing width (odd, 1 = off).
     #
-    # (1) `AVG` is pulled up by rare high-load days (one big-cook
-    #     evening lifts the slot's mean for the next 90 days). The LP
-    #     then reserves SOC for a peak that usually doesn't recur and
-    #     skips evening-export arbitrage. `median` is robust to single
-    #     outliers and is the better point estimate of a "typical day".
-    # (2) Sharp single-slot peaks encode a false precision about when
-    #     an event lands. A 3- or 5-slot boxcar redistributes that
-    #     mass across the window. Energy-preserving (daily total
-    #     unchanged), wraps around the day boundary.
-    #
-    # Defaults preserve historical behaviour. Flip via config.toml to
-    # A/B in /sim-sweep before changing defaults.
+    # Mean matches realised daily energy. Median under-forecasts
+    # right-skewed load (winter 2026: sum of slot medians planned
+    # 24-25 kWh/day against 37 realised) because it discards recurring
+    # peak mass. Single-outlier-day protection comes from smoothing
+    # plus the hard SOC floor, not the statistic. See the CLAUDE.md
+    # decision log entry for the sweep evidence.
     lp_load_statistic: str = "mean"
     lp_load_smoothing_slots: int = 1
+    # Manual nudge on the baseload forecast the LP plans against.
+    # Managed loads are separate LP variables and are not scaled.
+    # >1.0 reserves more (guests, cold snap, distrust of a young
+    # profile); <1.0 plans an emptier house (vacation).
+    lp_baseload_multiplier: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.2 <= self.lp_baseload_multiplier <= 3.0:
+            raise ValueError(
+                f"lp_baseload_multiplier must be between 0.2 and 3.0, "
+                f"got {self.lp_baseload_multiplier!r}"
+            )
 
     @property
     def lp_scenario_weights(self) -> dict[str, float]:

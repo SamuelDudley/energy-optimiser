@@ -137,3 +137,10 @@ lp_scenario_weight_p90 = 0.20
 # single-outlier-day protection comes from smoothing + the SOC floor.
 lp_load_statistic = "mean"
 lp_load_smoothing_slots = 3
+# Manual nudge on the baseload forecast the LP plans against. Managed
+# loads are planned exactly and are not scaled. >1.0 reserves more
+# (guests, cold snap); <1.0 plans an emptier house (vacation mode).
+# Stacks with presence detection: the away profile, when active, is
+# scaled too. Range 0.2-3.0, validated at startup. The profile context
+# is stamped (e.g. "cold+occ+wd x0.6") whenever the value is not 1.0.
+lp_baseload_multiplier = 1.0

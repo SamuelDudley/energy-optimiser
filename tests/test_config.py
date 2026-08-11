@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import tempfile
 
-from optimiser.config import load_config
+import pytest
+
+from optimiser.config import PlannerConfig, load_config
 from optimiser.types import LoadCategory
 
 MINIMAL_CONFIG = """
@@ -87,3 +89,16 @@ class TestConfigLoading:
         assert config.planner.lp_wall_clock_timeout_s == 12.0
         assert config.battery.round_trip_efficiency == 0.90
         assert config.occupancy.away_threshold_min == 30
+
+
+class TestBaseloadMultiplier:
+    def test_default_is_identity(self) -> None:
+        assert PlannerConfig().lp_baseload_multiplier == 1.0
+
+    def test_accepts_in_range(self) -> None:
+        assert PlannerConfig(lp_baseload_multiplier=1.3).lp_baseload_multiplier == 1.3
+
+    @pytest.mark.parametrize("bad", [0.1, 5.0, -1.0, 0.0])
+    def test_rejects_out_of_range(self, bad: float) -> None:
+        with pytest.raises(ValueError, match="lp_baseload_multiplier"):
+            PlannerConfig(lp_baseload_multiplier=bad)
