@@ -107,6 +107,7 @@ def _build(
     load_status: ManagedLoadStatus,
     daily_target_kwh: float = 4.0,
     draw_kw: float = 1.0,
+    profile_kw: float = 1.0,
 ) -> pulp.LpProblem:
     cfg = make_signal_load_config(
         daily_target_kwh=daily_target_kwh,
@@ -119,7 +120,7 @@ def _build(
             n_intervals=96,  # 48h coverage
         ),
         pv_forecast=None,
-        load_profile=_flat_profile(),
+        load_profile=_flat_profile(profile_kw),
         managed_loads=[load_status],
         lp_loads=[BinarySignalDrivenLoad(cfg)],
         battery_config=BatteryConfig(),
@@ -218,3 +219,18 @@ class TestTodayDeadlinePassed:
         rhs = _constraint_rhs_by_day(prob)
         assert 0 not in rhs
         assert rhs[1] == pytest.approx(4.0)
+
+
+class TestBaseloadNudgeExactness:
+    def test_profile_scale_does_not_change_managed_target(self) -> None:
+        """A nudged baseload forecast must not scale managed-load
+        demand: the daily-target constraint RHS is identical whatever
+        the profile says. Placement may shift; the delivered total may
+        not."""
+        rhs_base = _constraint_rhs_by_day(
+            _build(_state(NOW_MORNING), _hw_status(energy_today_kwh=0.0))
+        )
+        rhs_nudged = _constraint_rhs_by_day(
+            _build(_state(NOW_MORNING), _hw_status(energy_today_kwh=0.0), profile_kw=1.5)
+        )
+        assert rhs_nudged == rhs_base

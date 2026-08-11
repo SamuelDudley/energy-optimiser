@@ -71,9 +71,10 @@ code.
    named-field message; missing key defaults to 1.0.
 2. Service application: slots scaled, context stamped `x1.3`.
 3. Identity: at 1.0 slots and context are unchanged.
-4. Managed-load exactness: with a multiplier set, the managed-load plan
-   in the LP solution is unchanged versus multiplier 1.0 (pins the
-   baseload-only scope).
+4. Managed-load exactness: with a multiplier set, the managed-load
+   demand constraint (daily target) is unchanged versus multiplier
+   1.0. Placement within the window may shift; the delivered total
+   may not.
 
 ## Deploy
 
