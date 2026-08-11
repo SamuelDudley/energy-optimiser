@@ -26,8 +26,8 @@ from optimiser.lp.dispatch import DispatchKind
 from optimiser.lp.result import LPSolution, SlotDecision, SolveStatus
 from optimiser.lp.runtime import FallbackReason, LPRuntime
 from optimiser.modes import ModeManager
-from optimiser.service import Service
-from optimiser.types import EventType
+from optimiser.service import Service, apply_baseload_multiplier
+from optimiser.types import EventType, LoadProfile
 
 UTC = UTC
 NOW = datetime(2026, 4, 15, 12, 0, 0, tzinfo=UTC)
@@ -460,3 +460,16 @@ class TestMaybeRunPVProbe:
         result = await svc._maybe_run_pv_probe(self._state(pv_kw=5.0), "tick-1")
         assert result is None
         svc._sigenergy.measure_uncapped_pv.assert_awaited_once()
+
+
+class TestApplyBaseloadMultiplier:
+    def test_scales_slots_and_stamps_context(self) -> None:
+        profile = LoadProfile(slots=[1.0] * 48, maturity_level=3, context="cold+occ+wd")
+        out = apply_baseload_multiplier(profile, 1.3)
+        assert out.slots == pytest.approx([1.3] * 48)
+        assert out.context == "cold+occ+wd x1.3"
+        assert out.maturity_level == 3
+
+    def test_identity_returns_profile_unchanged(self) -> None:
+        profile = LoadProfile(slots=[1.0] * 48, maturity_level=3, context="cold+occ+wd")
+        assert apply_baseload_multiplier(profile, 1.0) is profile

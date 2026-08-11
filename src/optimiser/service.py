@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import time
@@ -49,6 +50,7 @@ from .types import (
     ActiveModeRecord,
     BatteryAction,
     EventType,
+    LoadProfile,
     LoadTelemetryRow,
     PriceInterval,
     PVForecast,
@@ -61,6 +63,22 @@ from .types import (
 from .validation import validate_telemetry
 
 logger = logging.getLogger(__name__)
+
+
+def apply_baseload_multiplier(profile: LoadProfile, multiplier: float) -> LoadProfile:
+    """Scale the non-managed baseload forecast by the operator's nudge.
+
+    Managed loads are separate LP variables and are unaffected. The
+    context stamp marks nudged plans in snapshots and /explain-plan.
+    """
+    if multiplier == 1.0:
+        return profile
+    return dataclasses.replace(
+        profile,
+        slots=[s * multiplier for s in profile.slots],
+        context=f"{profile.context} x{multiplier:g}",
+    )
+
 
 _VERSION = "0.2.0"
 
@@ -439,6 +457,9 @@ class Service:
             timestamp=now,
             statistic=self._config.planner.lp_load_statistic,
             smoothing_slots=self._config.planner.lp_load_smoothing_slots,
+        )
+        load_profile = apply_baseload_multiplier(
+            load_profile, self._config.planner.lp_baseload_multiplier
         )
 
         # 6. Run the LP (or use safe-default if disabled / latched / no prices).
