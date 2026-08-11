@@ -334,3 +334,25 @@ async def test_post_conserve_rejects_beyond_grace(client) -> None:
         },
     )
     assert resp.status == 400
+
+
+async def test_post_conserve_null_end_at_runs_until_cancelled(client) -> None:
+    resp = await client.post(
+        "/modes/conserve",
+        json={"end_at": None, "floor_c_per_kwh": 30.0},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["end_at"] is None
+
+
+async def test_post_buy_rejects_null_end_at(client) -> None:
+    """An unbounded forced buy pulls grid power until someone notices.
+    Buy keeps a mandatory expiry."""
+    resp = await client.post(
+        "/modes/buy",
+        json={"end_at": None, "ceiling_c_per_kwh": 12.0},
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "buy" in body["error"]

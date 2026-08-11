@@ -1687,7 +1687,8 @@ const ModesUI = (() => {
   async function refreshSuggestion({ overwriteThreshold = true } = {}) {
     if (!currentKind) return;
     const seq = ++suggestSeq;
-    const dur = durationSelect.value;
+    // Until-cancelled has no window; suggest over the max 48h instead.
+    const dur = durationSelect.value === "forever" ? 2880 : durationSelect.value;
     hint.textContent = "Computing suggestion…";
     try {
       const body = await apiFetch(
@@ -1718,6 +1719,10 @@ const ModesUI = (() => {
     thresholdLabel.textContent = thresholdLabelText(kind);
     // SOC cutoff is buy-mode only.
     socCutoffField.hidden = kind !== "buy";
+    // Until-cancelled is conserve-only; the server rejects it for buy.
+    const foreverOpt = document.getElementById("mode-duration-forever");
+    foreverOpt.hidden = kind !== "conserve";
+    foreverOpt.disabled = kind !== "conserve";
 
     if (editing) {
       // Prefill from the running mode: threshold + SOC cutoff + duration
@@ -1728,11 +1733,15 @@ const ModesUI = (() => {
       const cutoff = existing.params.soc_cutoff_pct;
       socCutoffInput.value =
         kind === "buy" && typeof cutoff === "number" ? cutoff : "";
-      const remainingMin = Math.max(
-        1,
-        Math.round((new Date(existing.end_at) - new Date()) / 60_000),
-      );
-      durationSelect.value = String(closestDurationPreset(remainingMin));
+      if (existing.end_at === null) {
+        durationSelect.value = "forever";
+      } else {
+        const remainingMin = Math.max(
+          1,
+          Math.round((new Date(existing.end_at) - new Date()) / 60_000),
+        );
+        durationSelect.value = String(closestDurationPreset(remainingMin));
+      }
       hint.textContent = "Editing the running mode. Submit replaces it with the values shown.";
     } else {
       thresholdInput.value = "";
@@ -1824,8 +1833,10 @@ const ModesUI = (() => {
       thresholdInput.focus();
       return;
     }
-    const minutes = parseInt(durationSelect.value, 10);
-    const endAt = new Date(Date.now() + minutes * 60_000).toISOString();
+    const endAt =
+      durationSelect.value === "forever"
+        ? null
+        : new Date(Date.now() + parseInt(durationSelect.value, 10) * 60_000).toISOString();
     const body = { end_at: endAt, [paramKey(currentKind)]: threshold };
     // Optional SOC cutoff for buy mode. Server-side validation handles
     // the "cutoff not above current SOC" case; we just forward the raw
@@ -1889,10 +1900,14 @@ const ModesUI = (() => {
       stateEl.textContent = "Active";
       inactiveBody.hidden = true;
       activeBody.hidden = false;
-      const end = new Date(m.end_at);
-      const minutes = Math.max(0, Math.round((end - now) / 60_000));
-      activeBody.querySelector('[data-field="countdown"]').textContent =
-        formatCountdown(minutes);
+      const countdownEl = activeBody.querySelector('[data-field="countdown"]');
+      if (m.end_at === null) {
+        countdownEl.textContent = "until cancelled";
+      } else {
+        const end = new Date(m.end_at);
+        const minutes = Math.max(0, Math.round((end - now) / 60_000));
+        countdownEl.textContent = formatCountdown(minutes);
+      }
       const v = m.params[paramKey(kind)];
       activeBody.querySelector('[data-field="threshold"]').textContent =
         `${v} c/kWh`;

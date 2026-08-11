@@ -59,13 +59,22 @@ async def _activate_handler(request: web.Request, kind: str, param_name: str) ->
     except Exception:
         return _bad("body must be JSON")
 
-    try:
-        end_at = _parse_end_at(body.get("end_at"))
-    except ValueError as exc:
-        return _bad(str(exc))
-    end_at, err = _validate_end_at(end_at)
-    if err:
-        return _bad(err)
+    raw_end = body.get("end_at")
+    if raw_end is None:
+        # Until-cancelled is conserve-only: an indefinite conserve just
+        # holds the battery back, an indefinite forced buy pulls grid
+        # power until someone notices.
+        if kind != "conserve":
+            return _bad("buy mode requires end_at; only conserve can run until cancelled")
+        end_at: datetime | None = None
+    else:
+        try:
+            end_at = _parse_end_at(raw_end)
+        except ValueError as exc:
+            return _bad(str(exc))
+        end_at, err = _validate_end_at(end_at)
+        if err:
+            return _bad(err)
 
     raw = body.get(param_name)
     if not isinstance(raw, (int, float)):
